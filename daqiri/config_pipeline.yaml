@@ -1,0 +1,74 @@
+%YAML 1.2
+---
+# DAQiri M4 config — socket loopback for the full pipeline benchmark.
+# Port 7778 (distinct from M3's 7777 so both can be run independently).
+# stream_type: socket, host memory.
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "socket"
+    master_core: 3
+    debug: false
+    log_level: "warn"
+
+    memory_regions:
+    - name: "MEM_TX"
+      kind: "host"
+      affinity: 0
+      num_bufs: 4096
+      buf_size: 131136          # covers 32768 samples × 4 B
+
+    - name: "MEM_RX"
+      kind: "host"
+      affinity: 0
+      num_bufs: 4096
+      buf_size: 131136
+
+    interfaces:
+    - name: "pipeline_server"
+      address: "127.0.0.1"
+      socket_config:
+        mode: server
+        local_addr: "tcp://127.0.0.1:7778"
+        max_payload_size: 131136
+      rx:
+        queues:
+        - name: "srv_rx_q"
+          id: 0
+          cpu_core: 9
+          batch_size: 1
+          memory_regions:
+            - "MEM_RX"
+      tx:
+        queues:
+        - name: "srv_tx_q"
+          id: 0
+          cpu_core: 9
+          batch_size: 1
+          memory_regions:
+            - "MEM_RX"
+
+    - name: "pipeline_client"
+      address: "127.0.0.1"
+      socket_config:
+        mode: client
+        local_addr: "tcp://127.0.0.1:7779"
+        remote_addr: "tcp://127.0.0.1:7778"
+        max_payload_size: 131136
+      tx:
+        queues:
+        - name: "cli_tx_q"
+          id: 0
+          cpu_core: 11
+          batch_size: 1
+          memory_regions:
+            - "MEM_TX"
+      rx:
+        queues:
+        - name: "cli_rx_q"
+          id: 0
+          cpu_core: 11
+          batch_size: 1
+          memory_regions:
+            - "MEM_TX"

@@ -1,0 +1,32 @@
+# Build outputs
+build/
+build_grpc/
+*.o
+*.obj
+*.so
+*.a
+*.exe
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Editor / OS
+.vscode/
+.DS_Store
+Thumbs.db
+
+# Temp / scratch
+tmp_*
+/tmp/
+*.log
+
+# Personal / local-only docs (not for the shared repo)
+RESULTS.md
+M9_REPORT.md
+PROGRESS.md
+ARCHITECTURE.md
+SHORTTERM_CONTEXT.md
+LONGTERM_CONTEXT.md

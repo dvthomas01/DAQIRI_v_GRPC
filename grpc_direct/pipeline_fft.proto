@@ -1,0 +1,45 @@
+// pipeline_fft.proto — Pipeline B: gRPC Direct → CUDA → cuFFT
+//
+// Client streams float32 buffers (grpc_direct.FloatArray for zero-copy transport).
+// Server accumulates H→D + cuFFT metrics and returns a summary.
+
+syntax = "proto3";
+package pipeline_fft;
+
+import "grpc_direct.proto";
+
+service PipelineFFTService {
+  // Client streams synthetic float32 buffers; server processes via GPU pipeline
+  // and responds with a performance summary when all buffers are received.
+  rpc StreamBuffers(stream BufferRequest) returns (PipelineSummary);
+}
+
+// One buffer of float32 samples sent by the client.
+message BufferRequest {
+  grpc_direct.FloatArray samples        = 1;  // float32 payload (zero-copy on Direct path)
+  int64                  send_timestamp_ns = 2; // sender wall-clock (CLOCK_REALTIME, ns)
+  int32                  seq_num        = 3;  // monotonically increasing sequence number
+  bytes                  raw_samples    = 4;  // float32 as raw bytes (standard gRPC path)
+}
+
+// Summary returned by the server after the full stream is processed.
+message PipelineSummary {
+  int32  buffers_received  = 1;
+  double e2e_p50_us        = 2;   // server: Read() done → FFT done
+  double e2e_p95_us        = 3;
+  double e2e_p99_us        = 4;
+  double e2e_mean_us       = 5;
+  double e2e_min_us        = 6;
+  double e2e_max_us        = 7;
+  double transfer_p50_us   = 8;   // H→D cudaMemcpy (CUDA events)
+  double transfer_p95_us   = 9;
+  double transfer_p99_us   = 10;
+  double fft_p50_us        = 11;  // cuFFT R2C (CUDA events)
+  double fft_p95_us        = 12;
+  double fft_p99_us        = 13;
+  double throughput_mb_s   = 14;
+  double cpu_util_pct      = 15;
+  double gpu_util_pct      = 16;
+  int32  dropped_buffers   = 17;
+  string csv_path          = 18;
+}

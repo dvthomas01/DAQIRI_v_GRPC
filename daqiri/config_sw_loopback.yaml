@@ -1,0 +1,81 @@
+%YAML 1.2
+---
+# DAQiri M3 config — socket loopback (TCP on 127.0.0.1)
+#
+# Uses the socket engine (stream_type: socket) which is available in this
+# build (DAQIRI_ENGINE_SOCKET=1). No DPDK / physical NIC needed.
+# Two interfaces: server (RX) and client (TX).
+# Memory is host (kind: host) — socket engine requires host memory.
+#
+# Run: ./build/daqiri/bench_daqiri --yaml daqiri/config_sw_loopback.yaml
+
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "socket"
+    master_core: 3
+    debug: false
+    log_level: "warn"
+
+    memory_regions:
+    - name: "MEM_TX"
+      kind: "host"
+      affinity: 0
+      num_bufs: 4096
+      buf_size: 131136
+
+    - name: "MEM_RX"
+      kind: "host"
+      affinity: 0
+      num_bufs: 4096
+      buf_size: 131136
+
+    interfaces:
+    # RX side — TCP server
+    - name: "sig_server"
+      address: "127.0.0.1"
+      socket_config:
+        mode: server
+        local_addr: "tcp://127.0.0.1:7777"
+        max_payload_size: 131136
+      rx:
+        queues:
+        - name: "srv_rx_q"
+          id: 0
+          cpu_core: 9
+          batch_size: 1
+          memory_regions:
+            - "MEM_RX"
+      tx:
+        queues:
+        - name: "srv_tx_q"
+          id: 0
+          cpu_core: 9
+          batch_size: 1
+          memory_regions:
+            - "MEM_RX"
+
+    # TX side — TCP client
+    - name: "sig_client"
+      address: "127.0.0.1"
+      socket_config:
+        mode: client
+        local_addr: "tcp://127.0.0.1:7778"
+        remote_addr: "tcp://127.0.0.1:7777"
+        max_payload_size: 131136
+      tx:
+        queues:
+        - name: "cli_tx_q"
+          id: 0
+          cpu_core: 11
+          batch_size: 1
+          memory_regions:
+            - "MEM_TX"
+      rx:
+        queues:
+        - name: "cli_rx_q"
+          id: 0
+          cpu_core: 11
+          batch_size: 1
+          memory_regions:
+            - "MEM_TX"
