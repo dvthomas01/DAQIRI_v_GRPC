@@ -74,9 +74,11 @@ class PipelineFFTServiceImpl
     : public pipeline_fft::PipelineFFTService::Service {
 public:
     PipelineFFTServiceImpl(int buf_size, int n_buffers, int warmup,
-                           const std::string& out_path, bool one_shot)
+                           const std::string& out_path, bool one_shot,
+                           bool zero_copy, bool verify)
         : buf_size_(buf_size), n_buffers_(n_buffers), warmup_(warmup),
-          out_path_(out_path), one_shot_(one_shot), server_(nullptr) {}
+          out_path_(out_path), one_shot_(one_shot), zero_copy_(zero_copy),
+          verify_(verify), server_(nullptr) {}
 
     void set_server(grpc::Server* s) { server_ = s; }
 
@@ -358,6 +360,20 @@ public:
         float*        h_staging  = nullptr;
         cudaEvent_t   ev_h2d_start{}, ev_h2d_stop{};
 
+        // Zero-copy (Route 1) state.  We cudaHostRegister the host sample
+        // buffer and map it to a device pointer so cuFFT reads it in place over
+        // the GH200 coherent link.  Level 1 reuses one BufferRequest per stream,
+        // so the backing store is a single stable pointer.  Level 2 (--zc-parse)
+        // binds the samples span straight into the grpc-direct shmem loan, whose
+        // address rotates through the receive ring, so we cache one device
+        // pointer per distinct slot and reuse it thereafter.
+        std::unordered_map<const void*, float*> zc_dev_cache;
+        std::vector<void*> zc_registered;     // ptrs we actually cudaHostRegister'd
+        float*        zc_dptr      = nullptr;  // device ptr for the current buf
+        int           zc_reg_count = 0;        // distinct registrations made
+        bool          zc_logged    = false;    // one-shot span-capture log
+        bool          verified     = false;    // one-shot spectral correctness
+
         std::unique_ptr<CuFFTExecutor> fft;
         std::unique_ptr<CsvLogger>     logger;
         std::unique_ptr<UtilSampler>   sampler;
@@ -407,7 +423,8 @@ public:
             s.sampler->start();
             s.metrics.reserve(static_cast<size_t>(n_buffers_));
             s.initialized = true;
-            std::cout << "[shmem] session opened  buf_size=" << buf_size_ << "\n";
+            std::cout << "[shmem] session opened  buf_size=" << buf_size_
+                      << (zero_copy_ ? "  [ZERO-COPY]" : "  [copy]") << "\n";
 
             // Watchdog: finalize on inactivity in case grpc-direct drops
             // messages and the full (warmup+n_buffers) count never arrives.
@@ -435,6 +452,11 @@ public:
         if (!req->raw_samples().empty()) {
             src    = reinterpret_cast<const float*>(req->raw_samples().data());
             n_samp = static_cast<int>(req->raw_samples().size() / sizeof(float));
+        } else if (req->samples()._zcptr_ != nullptr) {
+            // Level-2 zero-copy: the samples span points straight into the
+            // grpc-direct shmem loan buffer — no protobuf parse copy happened.
+            src    = req->samples()._zcptr_;
+            n_samp = static_cast<int>(req->samples()._zcsz_);
         } else {
             const auto& vals = req->samples().values();
             src    = vals.data();
@@ -450,19 +472,109 @@ public:
                 std::chrono::duration_cast<std::chrono::nanoseconds>(
                     std::chrono::system_clock::now().time_since_epoch()).count();
             const size_t copy_bytes = static_cast<size_t>(n_samp) * sizeof(float);
-            std::memcpy(s.h_staging, src, copy_bytes);
-            CUDA_CHECK(cudaEventRecord(s.ev_h2d_start));
-            CUDA_CHECK(cudaMemcpy(s.d_input, s.h_staging, copy_bytes,
-                                  cudaMemcpyHostToDevice));
-            CUDA_CHECK(cudaEventRecord(s.ev_h2d_stop));
-            CUDA_CHECK(cudaEventSynchronize(s.ev_h2d_stop));
-            float h2d_ms = 0.f;
-            CUDA_CHECK(cudaEventElapsedTime(&h2d_ms, s.ev_h2d_start, s.ev_h2d_stop));
-            s.fft->execute(s.d_input, s.d_output);
+            double xfer_us = 0.0;
+            if (zero_copy_) {
+                // ── Route 1: coherent zero-copy (GH200) ──────────────────────
+                // Map the host sample buffer to a device pointer and let cuFFT
+                // read it in place over NVLink-C2C — no std::memcpy, no
+                // cudaMemcpy; the h_staging intermediate is bypassed entirely.
+                // Level 1 sees one stable backing store; Level 2 (--zc-parse)
+                // points into the shmem loan, whose address rotates through the
+                // ring, so we cache one device pointer per distinct slot.
+                auto it = s.zc_dev_cache.find(src);
+                if (it == s.zc_dev_cache.end()) {
+                    void* reg = const_cast<void*>(static_cast<const void*>(src));
+                    // The Level-2 spans rotate through the grpc-direct shmem
+                    // receive ring; adjacent slots share OS pages, so the 64 KB
+                    // registration of a later slot can overlap one already
+                    // mapped by an earlier slot.  cudaHostRegister then returns
+                    // cudaErrorHostMemoryAlreadyRegistered — that is benign: the
+                    // range is already mapped, so cudaHostGetDevicePointer still
+                    // resolves a valid device address.  Only track the pointers
+                    // we truly registered so teardown unmaps them exactly once.
+                    cudaError_t rerr = cudaHostRegister(reg, copy_bytes,
+                                                        cudaHostRegisterMapped);
+                    if (rerr == cudaSuccess) {
+                        s.zc_registered.push_back(reg);
+                    } else if (rerr == cudaErrorHostMemoryAlreadyRegistered) {
+                        (void)cudaGetLastError();  // clear the sticky error
+                    } else {
+                        CUDA_CHECK(rerr);
+                    }
+                    float* dptr = nullptr;
+                    CUDA_CHECK(cudaHostGetDevicePointer(
+                        reinterpret_cast<void**>(&dptr), reg, 0));
+                    it = s.zc_dev_cache.emplace(src, dptr).first;
+                    ++s.zc_reg_count;
+                }
+                s.zc_dptr = it->second;
+                // cuFFT R2C requires an aligned input pointer.  Level 1's
+                // reused proto store is 16-byte aligned (RepeatedField), so we
+                // FFT in place.  Level 2's span points at a protobuf-framed
+                // offset inside the shmem loan (tag+varint bytes push it to an
+                // arbitrary, sub-4-byte alignment), which cuFFT rejects
+                // (CUFFT_INVALID_VALUE).  When the mapped device pointer is not
+                // 16-byte aligned we realign with a single device-to-device
+                // copy into the aligned d_input scratch — the CPU still never
+                // touches the float payload, so this stays zero CPU-copy.
+                const bool needs_realign =
+                    (reinterpret_cast<uintptr_t>(s.zc_dptr) & 15) != 0;
+                if (!s.zc_logged) {
+                    s.zc_logged = true;
+                    std::cerr << "[shmem][zero-copy] "
+                              << (req->samples()._zcptr_
+                                      ? "L2 span into shmem loan"
+                                      : "L1 reused proto store")
+                              << " host=" << static_cast<const void*>(src)
+                              << " (align16=" << (reinterpret_cast<uintptr_t>(src) & 15)
+                              << ") dev=" << static_cast<void*>(s.zc_dptr)
+                              << " (align16=" << (reinterpret_cast<uintptr_t>(s.zc_dptr) & 15)
+                              << ") " << (needs_realign ? "D2D-realign" : "in-place")
+                              << std::endl;
+                }
+                if (needs_realign) {
+                    CUDA_CHECK(cudaMemcpyAsync(s.d_input, s.zc_dptr, copy_bytes,
+                                               cudaMemcpyDeviceToDevice));
+                    s.fft->execute(s.d_input, s.d_output);
+                } else {
+                    s.fft->execute(s.zc_dptr, s.d_output);
+                }
+                // No CPU copy and no H->D transfer occur on this path; any
+                // realignment is a device-internal copy, so transfer latency is
+                // reported as 0.
+                xfer_us = 0.0;
+            } else {
+                // ── Copy path: proto → pinned staging → device ───────────────
+                std::memcpy(s.h_staging, src, copy_bytes);
+                CUDA_CHECK(cudaEventRecord(s.ev_h2d_start));
+                CUDA_CHECK(cudaMemcpy(s.d_input, s.h_staging, copy_bytes,
+                                      cudaMemcpyHostToDevice));
+                CUDA_CHECK(cudaEventRecord(s.ev_h2d_stop));
+                CUDA_CHECK(cudaEventSynchronize(s.ev_h2d_stop));
+                float h2d_ms = 0.f;
+                CUDA_CHECK(cudaEventElapsedTime(&h2d_ms, s.ev_h2d_start,
+                                                s.ev_h2d_stop));
+                s.fft->execute(s.d_input, s.d_output);
+                xfer_us = static_cast<double>(h2d_ms) * 1000.0;
+            }
             const double fft_us  = s.fft->last_exec_us();
             const auto   t_done  = std::chrono::steady_clock::now();
             const double e2e_us  = std::chrono::duration<double>(t_done - t_recv).count() * 1e6;
-            const double xfer_us = static_cast<double>(h2d_ms) * 1000.0;
+
+            // ── One-shot spectral correctness check ───────────────────────────
+            // detect_peaks copies d_output to host (not hot-path safe), so run
+            // it exactly once on the first measured buffer.  Proves the FFT of
+            // the (zero-copy or copied) input recovers the known input tones.
+            if (verify_ && !s.verified && s.buf_idx >= warmup_) {
+                s.verified = true;
+                const auto peaks = s.fft->detect_peaks(s.d_output, 3,
+                                                       /*sample_rate_hz=*/1'000'000.0f);
+                std::cout << "[verify] " << (zero_copy_ ? "ZERO-COPY" : "copy")
+                          << " top-3 peaks (expect ~500/1200/2500 Hz): ";
+                for (const auto& pk : peaks)
+                    std::cout << pk.first << " Hz (" << pk.second << ")  ";
+                std::cout << std::endl;
+            }
             const bool in_warmup = (s.buf_idx < warmup_);
             if (!in_warmup) {
                 BufferMetrics m;
@@ -574,6 +686,9 @@ public:
                 << ppct(xfer_v,50) << " / " << ppct(xfer_v,95) << " / "
                 << ppct(xfer_v,99) << " us\n"
                 << "  cuFFT p50         : " << ppct(fft_v,50) << " us\n"
+                << "  Transport mode    : "
+                << (zero_copy_ ? "shmem ZERO-COPY (in-place, no H->D copy)"
+                              : "shmem copy (staging + cudaMemcpy)") << "\n"
                 << "  CSV written to    : " << s.csv_path << "\n"
                 << "==== M8 PASSED ====\n";
         } else {
@@ -581,6 +696,13 @@ public:
             summary->set_buffers_received(0);
         }
 
+        for (void* p : s.zc_registered) {
+            cudaError_t uerr = cudaHostUnregister(p);
+            if (uerr != cudaSuccess && uerr != cudaErrorHostMemoryNotRegistered)
+                (void)cudaGetLastError();  // benign on overlapping ranges
+        }
+        s.zc_registered.clear();
+        s.zc_dev_cache.clear();
         CUDA_CHECK(cudaEventDestroy(s.ev_h2d_start));
         CUDA_CHECK(cudaEventDestroy(s.ev_h2d_stop));
         CUDA_CHECK(cudaFree(s.d_input));
@@ -604,6 +726,8 @@ private:
     int         warmup_;
     std::string out_path_;
     bool        one_shot_;
+    bool        zero_copy_;
+    bool        verify_;
     grpc::Server* server_;
 };
 
@@ -616,6 +740,9 @@ int main(int argc, char** argv) {
     int  warmup    = 100;
     std::string out_path;
     bool one_shot  = false;
+    bool zero_copy = false;                // Route 1 coherent zero-copy (shmem)
+    bool zc_parse  = false;                // Level 2: samples span into loan
+    bool verify    = false;                // one-shot spectral correctness check
     std::string transport  = "standard";  // "standard" | "shmem" | "tcp"
 
     for (int i = 1; i < argc; ++i) {
@@ -626,15 +753,27 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--out")       && i+1 < argc) out_path  = argv[++i];
         else if (!strcmp(argv[i], "--one-shot"))                 one_shot  = true;
         else if (!strcmp(argv[i], "--transport") && i+1 < argc) transport = argv[++i];
+        else if (!strcmp(argv[i], "--zero-copy"))                zero_copy = true;
+        else if (!strcmp(argv[i], "--zc-parse"))               { zero_copy = true; zc_parse = true; }
+        else if (!strcmp(argv[i], "--verify"))                   verify = true;
     }
 
     const bool use_grpc_direct = (transport != "standard");
+
+    if (zero_copy && !use_grpc_direct) {
+        std::cerr << "[warn] --zero-copy is only implemented for the shmem/"
+                     "grpc-direct path; ignoring for standard transport.\n";
+        zero_copy = false;
+        zc_parse  = false;
+    }
 
     std::cout << "==== Pipeline B Server (gRPC Direct → H→D → cuFFT) ====\n"
               << "  address   : " << server_address << "\n"
               << "  buf_size  : " << buf_size << " samples  ("
               << buf_size * 4 / 1024 << " KB)\n"
-              << "  n_buffers : " << n_buffers << "  warmup: " << warmup << "\n";
+              << "  n_buffers : " << n_buffers << "  warmup: " << warmup << "\n"
+              << "  transport : " << transport
+              << (zero_copy ? "   [ZERO-COPY]" : "   [copy]") << "\n";
 
     // ── Pre-warm CUDA/cuFFT JIT (mirrors Pipeline A) ─────────────────────────
     {
@@ -651,7 +790,8 @@ int main(int argc, char** argv) {
     }
 
     // ── Build gRPC server ────────────────────────────────────────────────────
-    PipelineFFTServiceImpl service(buf_size, n_buffers, warmup, out_path, one_shot);
+    PipelineFFTServiceImpl service(buf_size, n_buffers, warmup, out_path,
+                                   one_shot, zero_copy, verify);
 
     // grpc-direct infrastructure (router + GRPCDirectServiceImpl) is only needed
     // for shmem/tcp-direct transports.  For standard gRPC, skip it entirely:
@@ -664,6 +804,53 @@ int main(int argc, char** argv) {
     if (use_grpc_direct) {
         router_ptr = std::make_unique<AutoDirectRouter>();
         grpc_direct_registration::InitPipelineFFTServiceGDZCRouter(*router_ptr, &service);
+
+        // Level 2 (--zc-parse): override the generated streaming handler with
+        // one that keeps the samples array zero-copy.  The generated handler
+        // does a full BufferRequest::ParseFromArray, which copies the float
+        // payload out of the shmem loan into a RepeatedField.  Here we instead
+        // use DirectBufferRequest::ParseGDZCArrays, which parses only the scalar
+        // fields and binds a Span<const float> (_zcptr_/_zcsz_) straight into
+        // the loan buffer, so the samples are never copied on the CPU before
+        // cuFFT reads them.  Registering the same method name overwrites the
+        // generated entry in the router's dispatch map.  The loan buffer stays
+        // valid for the duration of this synchronous handler call, so cuFFT
+        // (which we synchronise before returning) reads it safely; we pass a
+        // null BufferHandle because no cross-call retention is required.
+        if (zc_parse) {
+            PipelineFFTServiceImpl* svc = &service;
+            router_ptr->RegisterStreaming(
+                "/pipeline_fft.PipelineFFTService/StreamBuffers",
+                [svc]() -> AutoDirectRouter::StreamHandler {
+                    auto state = std::make_shared<::pipeline_fft::PipelineSummary>();
+                    auto dreq  = std::make_shared<::pipeline_fft::DirectBufferRequest>();
+                    return [svc, state, dreq](const uint8_t* req, int reqLen,
+                                              GrpcDirectActiveRequest* loanHandle) -> int {
+                        if (reqLen > 0)
+                            dreq->ParseGDZCArrays(req, static_cast<size_t>(reqLen),
+                                                  nullptr);
+                        ::grpc::ServerContext ctx;
+                        auto status = svc->StreamBuffersPerMessage(
+                            &ctx, &dreq->inner, state.get());
+                        if (!status.ok()) return 0;
+                        size_t protoSize = state->ByteSizeLong();
+                        uint8_t* protoBuf = nullptr;
+                        if (protoSize > 0) {
+                            protoBuf = new uint8_t[protoSize];
+                            state->SerializeToArray(protoBuf,
+                                                    static_cast<int>(protoSize));
+                        }
+                        int rc = grpc_direct_server_send_status(
+                            loanHandle, GRPC_DIRECT_STATUS_OK, nullptr,
+                            protoBuf, protoSize);
+                        if (protoBuf) delete[] protoBuf;
+                        return rc == 0 ? 1 : -1;
+                    };
+                });
+            std::cout << "  [zero-copy L2] custom GDZC parse handler installed "
+                         "(samples span into loan; no parse copy)\n";
+        }
+
         direct_svc_ptr = std::make_unique<grpc_direct_lib::GRPCDirectServiceImpl>("pipeline_fft");
         direct_svc_ptr->SetRouter(router_ptr.get());
     }

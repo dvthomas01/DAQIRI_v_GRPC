@@ -210,8 +210,16 @@ add_executable(bench_grpc_server
 )
 add_dependencies(bench_grpc_server pipeline_proto_gen)
 target_include_directories(bench_grpc_server PRIVATE ${PIPELINE_INCS})
+# NOTE: libgrpc_direct_cpp.a is linked with --whole-archive so the zero-copy
+# parse-table patcher (grpc_direct_wkt_zc_parse.cc) is retained.  That object
+# has no externally-referenced symbols — it installs its TcParser patch via a
+# static initializer — so a normal archive link drops it and ParseGDZCArrays
+# silently falls back to a copy (samples._zcptr_ stays null).  Whole-archiving
+# forces the initializer in, enabling true zero-copy (--zc-parse / Level 2).
 target_link_libraries(bench_grpc_server PRIVATE
-    grpc_direct_cpp
+    -Wl,--whole-archive
+    "${GD_BUILD}/libgrpc_direct_cpp.a"
+    -Wl,--no-whole-archive
     grpc_stack
     signal_gen
     csv_logger
