@@ -43,6 +43,7 @@
 #include <iostream>
 #include <string>
 #include <thread>
+#include <unordered_map>
 #include <vector>
 
 #include <cuda_runtime.h>
@@ -78,6 +79,7 @@ static void pin_to_core(int core) {
 static void tx_worker(
     int                buf_size,
     int                n_to_send,
+    int                pace_us,   // per-buffer send pacing (us); 0 = unpaced
     std::atomic<bool>& stop,
     std::atomic<bool>& rx_ready,  // set by RX when server conn is up
     std::atomic<int>&  tx_count)
@@ -139,6 +141,8 @@ static void tx_worker(
         if (daqiri::send_tx_burst(msg) == daqiri::Status::SUCCESS) {
             ++sent;
             tx_count.store(sent, std::memory_order_relaxed);
+            if (pace_us > 0)
+                std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
         } else {
             daqiri::free_tx_metadata(msg);
         }
@@ -156,6 +160,7 @@ static void rx_pipeline_worker(
     int                        buf_size,
     int                        n_expected,
     int                        warmup,         // buffers to discard first
+    bool                       zero_copy,      // coherent in-place FFT (no H->D)
     std::atomic<bool>&         stop,
     std::atomic<bool>&         rx_ready,       // set after server conn is ready
     std::atomic<int>&          rx_count,
@@ -175,6 +180,15 @@ static void rx_pipeline_worker(
     CUDA_CHECK(cudaMalloc(&d_input,  static_cast<size_t>(payload_bytes)));
     CUDA_CHECK(cudaMalloc(&d_output,
                           static_cast<size_t>(fft_out_bins) * sizeof(cufftComplex)));
+
+    // ── Zero-copy state (coherent GH200) ─────────────────────────────────────
+    // Map each DAQiri receive-buffer host pointer to a device pointer so cuFFT
+    // reads it in place over NVLink-C2C — no cudaMemcpy.  The socket engine
+    // rotates payloads through a receive ring, so we cache one device pointer
+    // per distinct slot and tolerate overlapping-page re-registration.
+    std::unordered_map<const void*, float*> zc_dev_cache;
+    std::vector<void*> zc_registered;
+    bool zc_logged = false;
 
     cudaEvent_t ev_h2d_start, ev_h2d_stop;
     CUDA_CHECK(cudaEventCreate(&ev_h2d_start));
@@ -228,20 +242,71 @@ static void rx_pipeline_worker(
 
                 const auto t_rx = std::chrono::steady_clock::now();
 
-                // ── H→D transfer (timed via CUDA events) ────────────────────
-                CUDA_CHECK(cudaEventRecord(ev_h2d_start));
-                CUDA_CHECK(cudaMemcpy(d_input, src,
-                                      static_cast<size_t>(payload_bytes),
-                                      cudaMemcpyHostToDevice));
-                CUDA_CHECK(cudaEventRecord(ev_h2d_stop));
-                CUDA_CHECK(cudaEventSynchronize(ev_h2d_stop));
+                double transfer_us = 0.0;
+                if (zero_copy) {
+                    // ── Route 1: coherent zero-copy (GH200) ─────────────────
+                    // Map the DAQiri host buffer to a device pointer and let
+                    // cuFFT read it in place — no std::memcpy, no cudaMemcpy.
+                    auto it = zc_dev_cache.find(src);
+                    if (it == zc_dev_cache.end()) {
+                        void* reg = const_cast<void*>(
+                            static_cast<const void*>(src));
+                        cudaError_t rerr = cudaHostRegister(
+                            reg, static_cast<size_t>(payload_bytes),
+                            cudaHostRegisterMapped);
+                        if (rerr == cudaSuccess) {
+                            zc_registered.push_back(reg);
+                        } else if (rerr == cudaErrorHostMemoryAlreadyRegistered) {
+                            (void)cudaGetLastError();  // benign; already mapped
+                        } else {
+                            CUDA_CHECK(rerr);
+                        }
+                        float* dptr = nullptr;
+                        CUDA_CHECK(cudaHostGetDevicePointer(
+                            reinterpret_cast<void**>(&dptr), reg, 0));
+                        it = zc_dev_cache.emplace(src, dptr).first;
+                    }
+                    float* zc_dptr = it->second;
+                    // cuFFT R2C needs a 16-byte-aligned input; realign with a
+                    // device-to-device copy when the mapped pointer is not.
+                    const bool needs_realign =
+                        (reinterpret_cast<uintptr_t>(zc_dptr) & 15) != 0;
+                    if (!zc_logged) {
+                        zc_logged = true;
+                        std::cerr << "[daqiri][zero-copy] host="
+                                  << static_cast<const void*>(src)
+                                  << " dev=" << static_cast<void*>(zc_dptr)
+                                  << " (align16="
+                                  << (reinterpret_cast<uintptr_t>(zc_dptr) & 15)
+                                  << ") "
+                                  << (needs_realign ? "D2D-realign" : "in-place")
+                                  << std::endl;
+                    }
+                    if (needs_realign) {
+                        CUDA_CHECK(cudaMemcpyAsync(
+                            d_input, zc_dptr,
+                            static_cast<size_t>(payload_bytes),
+                            cudaMemcpyDeviceToDevice));
+                        fft.execute(d_input, d_output);
+                    } else {
+                        fft.execute(zc_dptr, d_output);
+                    }
+                    transfer_us = 0.0;  // coherent/in-place — no H->D copy
+                } else {
+                    // ── H→D transfer (timed via CUDA events) ────────────────
+                    CUDA_CHECK(cudaEventRecord(ev_h2d_start));
+                    CUDA_CHECK(cudaMemcpy(d_input, src,
+                                          static_cast<size_t>(payload_bytes),
+                                          cudaMemcpyHostToDevice));
+                    CUDA_CHECK(cudaEventRecord(ev_h2d_stop));
+                    CUDA_CHECK(cudaEventSynchronize(ev_h2d_stop));
 
-                float h2d_ms = 0.0f;
-                CUDA_CHECK(cudaEventElapsedTime(&h2d_ms, ev_h2d_start, ev_h2d_stop));
-                const double transfer_us = static_cast<double>(h2d_ms) * 1000.0;
+                    float h2d_ms = 0.0f;
+                    CUDA_CHECK(cudaEventElapsedTime(&h2d_ms, ev_h2d_start, ev_h2d_stop));
+                    transfer_us = static_cast<double>(h2d_ms) * 1000.0;
 
-                // ── cuFFT execute ────────────────────────────────────────────
-                fft.execute(d_input, d_output);
+                    fft.execute(d_input, d_output);
+                }
                 const double fft_us = static_cast<double>(fft.last_exec_us());
 
                 const auto t_done = std::chrono::steady_clock::now();
@@ -287,6 +352,11 @@ static void rx_pipeline_worker(
     }
 
 cleanup:
+    for (void* p : zc_registered) {
+        cudaError_t uerr = cudaHostUnregister(p);
+        if (uerr != cudaSuccess && uerr != cudaErrorHostMemoryNotRegistered)
+            (void)cudaGetLastError();  // benign on overlapping ranges
+    }
     CUDA_CHECK(cudaEventDestroy(ev_h2d_start));
     CUDA_CHECK(cudaEventDestroy(ev_h2d_stop));
     CUDA_CHECK(cudaFree(d_input));
@@ -321,12 +391,16 @@ int main(int argc, char** argv) {
     int buf_size  = 4096;
     int n_buffers = 1000;
     int warmup    = 100;   // discard first N buffers (cuFFT JIT + socket warm-up)
+    bool zero_copy = false;
+    int pace_us   = 0;     // per-buffer send pacing (us); 0 = native burst rate
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--yaml")      && i+1 < argc) yaml_path = argv[++i];
         else if (!strcmp(argv[i], "--bufsize")   && i+1 < argc) buf_size  = std::atoi(argv[++i]);
         else if (!strcmp(argv[i], "--n-buffers") && i+1 < argc) n_buffers = std::atoi(argv[++i]);
         else if (!strcmp(argv[i], "--warmup")    && i+1 < argc) warmup    = std::atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--zero-copy"))               zero_copy = true;
+        else if (!strcmp(argv[i], "--pace-us")   && i+1 < argc) pace_us   = std::atoi(argv[++i]);
         else if (!strcmp(argv[i], "--out")       && i+1 < argc) out_path  = argv[++i];
     }
 
@@ -342,6 +416,8 @@ int main(int argc, char** argv) {
               << buf_size * 4 / 1024 << " KB)\n"
               << "  warmup    : " << warmup << " buffers (discarded)\n"
               << "  n_buffers : " << n_buffers << " (measured)\n"
+              << "  transport : DAQiri socket   "
+              << (zero_copy ? "[ZERO-COPY]" : "[copy]") << "\n"
               << "  CSV out   : " << out_path << "\n\n";
 
     // ── Create output directory ───────────────────────────────────────────────
@@ -393,7 +469,7 @@ int main(int argc, char** argv) {
 
     // ── Launch threads ────────────────────────────────────────────────────────
     std::thread rx_thr(rx_pipeline_worker,
-                       buf_size, total_send, warmup,
+                       buf_size, total_send, warmup, zero_copy,
                        std::ref(stop),
                        std::ref(rx_ready),
                        std::ref(rx_count),
@@ -403,7 +479,7 @@ int main(int argc, char** argv) {
 
     // TX starts immediately — it will spin on rx_ready before connecting
     std::thread tx_thr(tx_worker,
-                       buf_size, total_send,
+                       buf_size, total_send, pace_us,
                        std::ref(stop),
                        std::ref(rx_ready),
                        std::ref(tx_count));
