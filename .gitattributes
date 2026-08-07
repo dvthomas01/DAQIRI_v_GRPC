@@ -1,0 +1,5 @@
+# Benchmark scripts run on Linux (DGX Spark / NI Linux RT).  Without this,
+# core.autocrlf on Windows rewrites them to CRLF on checkout and bash fails
+# with "\r: command not found".
+*.sh text eol=lf
+*.py text eol=lf

@@ -59,6 +59,27 @@ void CuFFTExecutor::execute(const float* d_input, cufftComplex* d_output) {
     last_exec_us_ = ms * 1000.0f;  // ms → µs
 }
 
+bool CuFFTExecutor::try_execute(const float* d_input, cufftComplex* d_output) {
+    CUDA_CHECK(cudaEventRecord(ev_start_));
+    cufftResult r = cufftExecR2C(plan_,
+                                 const_cast<cufftReal*>(d_input),
+                                 d_output);
+    if (r != CUFFT_SUCCESS) {
+        (void)cudaGetLastError();  // clear any sticky error the failure left
+        return false;
+    }
+    CUDA_CHECK(cudaEventRecord(ev_stop_));
+    cudaError_t serr = cudaEventSynchronize(ev_stop_);
+    if (serr != cudaSuccess) {
+        (void)cudaGetLastError();
+        return false;
+    }
+    float ms = 0.0f;
+    CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start_, ev_stop_));
+    last_exec_us_ = ms * 1000.0f;
+    return true;
+}
+
 std::vector<std::pair<float, float>> CuFFTExecutor::detect_peaks(
     const cufftComplex* d_output,
     int                 k,

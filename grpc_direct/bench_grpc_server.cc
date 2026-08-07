@@ -75,10 +75,13 @@ class PipelineFFTServiceImpl
 public:
     PipelineFFTServiceImpl(int buf_size, int n_buffers, int warmup,
                            const std::string& out_path, bool one_shot,
-                           bool zero_copy, bool verify)
+                           bool zero_copy, bool verify,
+                           bool stage_timing = false,
+                           bool zc_h2d = false, bool zc_align = false)
         : buf_size_(buf_size), n_buffers_(n_buffers), warmup_(warmup),
           out_path_(out_path), one_shot_(one_shot), zero_copy_(zero_copy),
-          verify_(verify), server_(nullptr) {}
+          verify_(verify), stage_timing_(stage_timing), zc_h2d_(zc_h2d),
+          zc_align_(zc_align), server_(nullptr) {}
 
     void set_server(grpc::Server* s) { server_ = s; }
 
@@ -374,6 +377,24 @@ public:
         bool          zc_logged    = false;    // one-shot span-capture log
         bool          verified     = false;    // one-shot spectral correctness
 
+        // ── Phase-0 residual attribution ────────────────────────────────────
+        // The 4 MB sweep shows gRPC's (e2e - fft_exec) residual growing with
+        // payload size (8.1 us at 16 KB -> 81.5 us at 4 MB) while DAQiri's
+        // stays flat at ~4.9 us.  These counters and stage timers attribute
+        // that residual.  If zc_reg_count ~= the measured buffer count then the
+        // cache is missing on every message and we re-pin the whole payload
+        // each time, which is the leading hypothesis.
+        long long     zc_cache_hits = 0;   // zc_dev_cache lookups that hit
+        long long     realign_count = 0;   // messages that needed the D2D copy
+
+        // How this session feeds cuFFT.  Decided once, on the first message,
+        // then reused.  kProbe means "not decided yet".
+        enum ZcMode { kProbe = 0, kInPlace = 1, kRealign = 2 };
+        ZcMode        zc_mode = kProbe;
+        std::vector<double> st_reg_us;     // cache lookup + cudaHostRegister
+        std::vector<double> st_realign_us; // D2D realign enqueue
+        std::vector<double> st_fftcall_us; // wall time of fft->execute()
+
         std::unique_ptr<CuFFTExecutor> fft;
         std::unique_ptr<CsvLogger>     logger;
         std::unique_ptr<UtilSampler>   sampler;
@@ -473,7 +494,13 @@ public:
                     std::chrono::system_clock::now().time_since_epoch()).count();
             const size_t copy_bytes = static_cast<size_t>(n_samp) * sizeof(float);
             double xfer_us = 0.0;
+            // Phase-0 stage timers.  Off by default so baseline runs are
+            // unperturbed; each steady_clock read is ~20 ns, negligible against
+            // the 8-81 us residual we are trying to attribute.
+            const bool st = stage_timing_;
+            std::chrono::steady_clock::time_point ts_a, ts_b, ts_c, ts_d;
             if (zero_copy_) {
+                if (st) ts_a = std::chrono::steady_clock::now();
                 // ── Route 1: coherent zero-copy (GH200) ──────────────────────
                 // Map the host sample buffer to a device pointer and let cuFFT
                 // read it in place over NVLink-C2C — no std::memcpy, no
@@ -506,21 +533,36 @@ public:
                         reinterpret_cast<void**>(&dptr), reg, 0));
                     it = s.zc_dev_cache.emplace(src, dptr).first;
                     ++s.zc_reg_count;
+                } else {
+                    ++s.zc_cache_hits;
                 }
                 s.zc_dptr = it->second;
-                // cuFFT R2C requires an aligned input pointer.  Level 1's
-                // reused proto store is 16-byte aligned (RepeatedField), so we
-                // FFT in place.  Level 2's span points at a protobuf-framed
-                // offset inside the shmem loan (tag+varint bytes push it to an
-                // arbitrary, sub-4-byte alignment), which cuFFT rejects
-                // (CUFFT_INVALID_VALUE).  When the mapped device pointer is not
-                // 16-byte aligned we realign with a single device-to-device
-                // copy into the aligned d_input scratch — the CPU still never
-                // touches the float payload, so this stays zero CPU-copy.
-                const bool needs_realign =
-                    (reinterpret_cast<uintptr_t>(s.zc_dptr) & 15) != 0;
-                if (!s.zc_logged) {
-                    s.zc_logged = true;
+                if (st) ts_b = std::chrono::steady_clock::now();
+
+                // ── Decide once how to feed cuFFT ────────────────────────────
+                // Phase 0 measured the protobuf backing store at align16=8, so
+                // the old hard-coded `(dptr & 15) != 0` rule sent EVERY message
+                // down the realign copy.  That copy cost ~77 µs at 4 MB (hidden
+                // inside the FFT's cudaEventSynchronize) and accounted for the
+                // whole gap against DAQiri.
+                //
+                // --zc-align (E2) stops guessing: if the pointer is not 16-byte
+                // aligned we ask cuFFT directly whether it will accept it.  If
+                // it does, the realign copy disappears entirely.
+                if (s.zc_mode == ShmemSession::kProbe) {
+                    const uintptr_t a = reinterpret_cast<uintptr_t>(s.zc_dptr);
+                    const char* why;
+                    if ((a & 15) == 0) {
+                        s.zc_mode = ShmemSession::kInPlace;  why = "16B aligned";
+                    } else if (zc_align_ &&
+                               s.fft->try_execute(s.zc_dptr, s.d_output)) {
+                        s.zc_mode = ShmemSession::kInPlace;
+                        why = "probe: cuFFT accepts this alignment";
+                    } else {
+                        s.zc_mode = ShmemSession::kRealign;
+                        why = zc_align_ ? "probe: cuFFT rejected it"
+                                        : "not 16B aligned";
+                    }
                     std::cerr << "[shmem][zero-copy] "
                               << (req->samples()._zcptr_
                                       ? "L2 span into shmem loan"
@@ -528,16 +570,42 @@ public:
                               << " host=" << static_cast<const void*>(src)
                               << " (align16=" << (reinterpret_cast<uintptr_t>(src) & 15)
                               << ") dev=" << static_cast<void*>(s.zc_dptr)
-                              << " (align16=" << (reinterpret_cast<uintptr_t>(s.zc_dptr) & 15)
-                              << ") " << (needs_realign ? "D2D-realign" : "in-place")
-                              << std::endl;
+                              << " (align16=" << (a & 15) << ") -> "
+                              << (s.zc_mode == ShmemSession::kInPlace
+                                      ? "in-place"
+                                      : (zc_h2d_ ? "H2D-realign" : "D2D-realign"))
+                              << "  [" << why << "]" << std::endl;
+                    s.zc_logged = true;
                 }
-                if (needs_realign) {
-                    CUDA_CHECK(cudaMemcpyAsync(s.d_input, s.zc_dptr, copy_bytes,
-                                               cudaMemcpyDeviceToDevice));
+
+                if (s.zc_mode == ShmemSession::kRealign) {
+                    ++s.realign_count;
+                    if (zc_h2d_) {
+                        // E1: copy from the page-locked HOST pointer over the
+                        // H2D DMA path instead of D2D from the mapped device
+                        // alias.  Same bytes, potentially a much better engine:
+                        // Phase 0 measured the D2D path at only ~52 GB/s.
+                        CUDA_CHECK(cudaMemcpyAsync(s.d_input, src, copy_bytes,
+                                                   cudaMemcpyHostToDevice));
+                    } else {
+                        CUDA_CHECK(cudaMemcpyAsync(s.d_input, s.zc_dptr, copy_bytes,
+                                                   cudaMemcpyDeviceToDevice));
+                    }
+                    if (st) ts_c = std::chrono::steady_clock::now();
                     s.fft->execute(s.d_input, s.d_output);
                 } else {
+                    if (st) ts_c = std::chrono::steady_clock::now();
                     s.fft->execute(s.zc_dptr, s.d_output);
+                }
+                if (st) {
+                    ts_d = std::chrono::steady_clock::now();
+                    auto us = [](const std::chrono::steady_clock::time_point& a,
+                                 const std::chrono::steady_clock::time_point& b) {
+                        return std::chrono::duration<double>(b - a).count() * 1e6;
+                    };
+                    s.st_reg_us.push_back(us(ts_a, ts_b));
+                    s.st_realign_us.push_back(us(ts_b, ts_c));
+                    s.st_fftcall_us.push_back(us(ts_c, ts_d));
                 }
                 // No CPU copy and no H->D transfer occur on this path; any
                 // realignment is a device-internal copy, so transfer latency is
@@ -696,6 +764,54 @@ public:
             summary->set_buffers_received(0);
         }
 
+        // ── Phase-0 residual attribution report ──────────────────────────────
+        // zc_reg_count alone decides the leading hypothesis: if it tracks the
+        // message count, the device-pointer cache misses every message and we
+        // re-pin the entire payload each time.  If it stays small, the residual
+        // is somewhere else and the stage timers say where.
+        if (zero_copy_) {
+            const long long msgs = s.zc_cache_hits + s.zc_reg_count;
+            std::cout << "\n---- Phase 0: zero-copy residual attribution ----\n"
+                      << "  messages seen     : " << msgs << "\n"
+                      << "  cudaHostRegister  : " << s.zc_reg_count
+                      << "   (cache hits: " << s.zc_cache_hits << ")\n"
+                      << "  dev-ptr cache size: " << s.zc_dev_cache.size() << "\n"
+                      << "  feed mode         : "
+                      << (s.zc_mode == ShmemSession::kInPlace ? "in-place (no copy)"
+                          : s.zc_mode == ShmemSession::kRealign
+                              ? (zc_h2d_ ? "realign via H2D" : "realign via D2D")
+                              : "never decided")
+                      << "\n"
+                      << "  realigns          : " << s.realign_count << "\n";
+            if (msgs > 0) {
+                const double miss_pct =
+                    100.0 * static_cast<double>(s.zc_reg_count) / static_cast<double>(msgs);
+                std::cout << "  register rate     : " << miss_pct << " % of messages\n"
+                          << "  VERDICT           : "
+                          << (miss_pct > 50.0
+                                  ? "CONFIRMED - re-pinning the payload per message"
+                                  : "NOT the dominant cost - look at the stage timers")
+                          << "\n";
+            }
+            auto stage = [](std::vector<double> v, const char* name) {
+                if (v.empty()) return;
+                std::sort(v.begin(), v.end());
+                auto q = [&](int p) {
+                    return v[static_cast<size_t>(
+                        std::min<int>(static_cast<int>(v.size()) * p / 100,
+                                      static_cast<int>(v.size()) - 1))];
+                };
+                std::cout << "  " << name << " p50/p99 : " << q(50) << " / "
+                          << q(99) << " us  (n=" << v.size() << ")\n";
+            };
+            stage(s.st_reg_us,     "register+lookup");
+            stage(s.st_realign_us, "realign enqueue");
+            stage(s.st_fftcall_us, "fft call (wall)");
+            std::cout << "  note: 'fft call (wall)' minus the CSV fft_exec_us is"
+                         " launch + sync overhead.\n"
+                      << "------------------------------------------------\n";
+        }
+
         for (void* p : s.zc_registered) {
             cudaError_t uerr = cudaHostUnregister(p);
             if (uerr != cudaSuccess && uerr != cudaErrorHostMemoryNotRegistered)
@@ -728,6 +844,9 @@ private:
     bool        one_shot_;
     bool        zero_copy_;
     bool        verify_;
+    bool        stage_timing_;
+    bool        zc_h2d_;
+    bool        zc_align_;
     grpc::Server* server_;
 };
 
@@ -743,6 +862,9 @@ int main(int argc, char** argv) {
     bool zero_copy = false;                // Route 1 coherent zero-copy (shmem)
     bool zc_parse  = false;                // Level 2: samples span into loan
     bool verify    = false;                // one-shot spectral correctness check
+    bool stage_timing = false;             // Phase 0: attribute the ZC residual
+    bool zc_h2d       = false;             // E1: realign via H2D, not D2D
+    bool zc_align     = false;             // E2: probe cuFFT instead of assuming 16B
     std::string transport  = "standard";  // "standard" | "shmem" | "tcp"
 
     for (int i = 1; i < argc; ++i) {
@@ -756,6 +878,9 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--zero-copy"))                zero_copy = true;
         else if (!strcmp(argv[i], "--zc-parse"))               { zero_copy = true; zc_parse = true; }
         else if (!strcmp(argv[i], "--verify"))                   verify = true;
+        else if (!strcmp(argv[i], "--stage-timing"))             stage_timing = true;
+        else if (!strcmp(argv[i], "--zc-h2d"))                    zc_h2d = true;
+        else if (!strcmp(argv[i], "--zc-align"))                  zc_align = true;
     }
 
     const bool use_grpc_direct = (transport != "standard");
@@ -791,7 +916,8 @@ int main(int argc, char** argv) {
 
     // ── Build gRPC server ────────────────────────────────────────────────────
     PipelineFFTServiceImpl service(buf_size, n_buffers, warmup, out_path,
-                                   one_shot, zero_copy, verify);
+                                   one_shot, zero_copy, verify, stage_timing,
+                                   zc_h2d, zc_align);
 
     // grpc-direct infrastructure (router + GRPCDirectServiceImpl) is only needed
     // for shmem/tcp-direct transports.  For standard gRPC, skip it entirely:

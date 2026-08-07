@@ -28,6 +28,13 @@ public:
     // Blocks until execution is complete and updates last_exec_us().
     void execute(const float* d_input, cufftComplex* d_output);
 
+    // Same as execute() but returns false instead of throwing when cuFFT
+    // rejects the call (e.g. CUFFT_INVALID_VALUE for an under-aligned input).
+    // Used to probe once, at runtime, whether a given input pointer is
+    // acceptable, rather than guessing from a hard-coded alignment rule.
+    // Any sticky CUDA error is cleared before returning false.
+    bool try_execute(const float* d_input, cufftComplex* d_output);
+
     // GPU execution time of the last execute() call, in microseconds.
     float last_exec_us() const { return last_exec_us_; }
 
