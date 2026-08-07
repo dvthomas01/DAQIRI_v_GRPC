@@ -80,6 +80,37 @@ bool CuFFTExecutor::try_execute(const float* d_input, cufftComplex* d_output) {
     return true;
 }
 
+// ---- SM-based realign copy (E3) -------------------------------------------
+
+__global__ void realign_copy_f2(float2* __restrict__ dst,
+                                const float2* __restrict__ src,
+                                size_t n2) {
+    size_t       i      = blockIdx.x * static_cast<size_t>(blockDim.x) + threadIdx.x;
+    const size_t stride = static_cast<size_t>(gridDim.x) * blockDim.x;
+    for (; i < n2; i += stride) dst[i] = src[i];
+}
+
+void launch_realign_copy(float* dst, const float* src, size_t n_floats,
+                         cudaStream_t stream) {
+    const size_t n2 = n_floats / 2;   // float2 = 8 B, matches the 8-B alignment
+    if (n2 > 0) {
+        const int threads = 256;
+        size_t    want    = (n2 + threads - 1) / threads;
+        const int blocks  = static_cast<int>(want > 4096 ? 4096 : want);
+        realign_copy_f2<<<blocks, threads, 0, stream>>>(
+            reinterpret_cast<float2*>(dst),
+            reinterpret_cast<const float2*>(src), n2);
+        // A launch failure here is silent: dst keeps its previous contents and
+        // the FFT happily transforms stale/zero data, which looks like a fast
+        // but wrong result.  Fail loudly instead.
+        CUDA_CHECK(cudaGetLastError());
+    }
+    if (n_floats & 1) {  // odd tail; never hit for power-of-two buffers
+        CUDA_CHECK(cudaMemcpyAsync(dst + n_floats - 1, src + n_floats - 1,
+                                   sizeof(float), cudaMemcpyDefault, stream));
+    }
+}
+
 std::vector<std::pair<float, float>> CuFFTExecutor::detect_peaks(
     const cufftComplex* d_output,
     int                 k,

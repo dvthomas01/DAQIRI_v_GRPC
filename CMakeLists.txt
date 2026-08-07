@@ -10,9 +10,12 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-# DGX Spark = Grace Hopper (GH200) = SM 9.0
-# Override with -DCMAKE_CUDA_ARCHITECTURES=XX if targeting a different GPU.
-set(CMAKE_CUDA_ARCHITECTURES 90 CACHE STRING "CUDA architectures")
+# Build for the GPU actually present at configure time.  This was hard-coded to
+# 90 (Hopper) but spark-ac69 is a GB10 Grace-Blackwell at compute capability
+# 12.1, so sm_90 kernels had no matching image and every launch silently failed
+# with cudaErrorNoKernelImageForDevice.  cuFFT hid the problem because NVIDIA
+# ships fat binaries.  Override with -DCMAKE_CUDA_ARCHITECTURES=XX to cross-build.
+set(CMAKE_CUDA_ARCHITECTURES native CACHE STRING "CUDA architectures")
 
 find_package(CUDAToolkit REQUIRED)
 

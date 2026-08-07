@@ -13,7 +13,11 @@ if(NOT CMAKE_BUILD_TYPE)
     set(CMAKE_BUILD_TYPE Release)
 endif()
 
-set(CMAKE_CUDA_ARCHITECTURES 90)
+# See the top-level CMakeLists: hard-coding 90 produced no kernel image on the
+# GB10 (sm_121) and launches failed silently.  Build for the local GPU instead.
+if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+    set(CMAKE_CUDA_ARCHITECTURES native)
+endif()
 
 # =============================================================================
 # All pre-built artifact paths

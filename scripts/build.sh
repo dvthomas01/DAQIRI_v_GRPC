@@ -25,11 +25,13 @@ else
 fi
 
 # Configure
-# SM 90 = Grace Hopper (GH200) on DGX Spark.
-# Override: cmake .. -DCMAKE_CUDA_ARCHITECTURES=<sm>
+# `native` = build for the GPU in this box.  This was pinned to 90 (Hopper) on
+# the assumption that DGX Spark is GH200; it is actually a GB10 at sm_121, so
+# custom kernels had no image and launches failed silently.
+# Override: CUDA_ARCH=<sm> ./scripts/build.sh
 cmake "${REPO_DIR}" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES=90 \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH:-native}" \
     -DCMAKE_CUDA_COMPILER="${CUDA_BIN}/nvcc"
 
 echo

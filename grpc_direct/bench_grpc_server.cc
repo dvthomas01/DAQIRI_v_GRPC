@@ -77,11 +77,13 @@ public:
                            const std::string& out_path, bool one_shot,
                            bool zero_copy, bool verify,
                            bool stage_timing = false,
-                           bool zc_h2d = false, bool zc_align = false)
+                           bool zc_h2d = false, bool zc_align = false,
+                           bool zc_kernel = false, bool zc_bigreg = false)
         : buf_size_(buf_size), n_buffers_(n_buffers), warmup_(warmup),
           out_path_(out_path), one_shot_(one_shot), zero_copy_(zero_copy),
           verify_(verify), stage_timing_(stage_timing), zc_h2d_(zc_h2d),
-          zc_align_(zc_align), server_(nullptr) {}
+          zc_align_(zc_align), zc_kernel_(zc_kernel), zc_bigreg_(zc_bigreg),
+          server_(nullptr) {}
 
     void set_server(grpc::Server* s) { server_ = s; }
 
@@ -389,7 +391,7 @@ public:
 
         // How this session feeds cuFFT.  Decided once, on the first message,
         // then reused.  kProbe means "not decided yet".
-        enum ZcMode { kProbe = 0, kInPlace = 1, kRealign = 2 };
+        enum ZcMode { kProbe = 0, kInPlace = 1, kRealign = 2, kKernel = 3 };
         ZcMode        zc_mode = kProbe;
         std::vector<double> st_reg_us;     // cache lookup + cudaHostRegister
         std::vector<double> st_realign_us; // D2D realign enqueue
@@ -510,7 +512,24 @@ public:
                 // ring, so we cache one device pointer per distinct slot.
                 auto it = s.zc_dev_cache.find(src);
                 if (it == s.zc_dev_cache.end()) {
-                    void* reg = const_cast<void*>(static_cast<const void*>(src));
+                    void*  reg     = const_cast<void*>(static_cast<const void*>(src));
+                    size_t reg_len = copy_bytes;
+                    size_t off     = 0;
+                    // E4 (--zc-bigreg): register a whole-GPU-page span instead
+                    // of the exact payload.  DAQiri rounds every slot up to
+                    // GPU_PAGE_SIZE (64 KB) and gets a faster FFT out of the
+                    // same host memory (58.75 vs our 68.93 us at 4 MB), so the
+                    // mapping granularity is the suspect.  cudaHostRegisterReadOnly
+                    // was tried first and the driver rejected it outright
+                    // ("operation not supported") on GB10.
+                    constexpr uintptr_t kGpuPage = 64u * 1024u;
+                    if (zc_bigreg_) {
+                        const uintptr_t p    = reinterpret_cast<uintptr_t>(src);
+                        const uintptr_t base = p & ~(kGpuPage - 1);
+                        off     = static_cast<size_t>(p - base);
+                        reg     = reinterpret_cast<void*>(base);
+                        reg_len = (off + copy_bytes + kGpuPage - 1) & ~(kGpuPage - 1);
+                    }
                     // The Level-2 spans rotate through the grpc-direct shmem
                     // receive ring; adjacent slots share OS pages, so the 64 KB
                     // registration of a later slot can overlap one already
@@ -519,8 +538,22 @@ public:
                     // range is already mapped, so cudaHostGetDevicePointer still
                     // resolves a valid device address.  Only track the pointers
                     // we truly registered so teardown unmaps them exactly once.
-                    cudaError_t rerr = cudaHostRegister(reg, copy_bytes,
+                    cudaError_t rerr = cudaHostRegister(reg, reg_len,
                                                         cudaHostRegisterMapped);
+                    if (rerr != cudaSuccess &&
+                        rerr != cudaErrorHostMemoryAlreadyRegistered &&
+                        zc_bigreg_) {
+                        // Rounding down can run off the front of the mapping.
+                        // Fall back to registering exactly what we own.
+                        (void)cudaGetLastError();
+                        reg     = const_cast<void*>(static_cast<const void*>(src));
+                        reg_len = copy_bytes;
+                        off     = 0;
+                        rerr    = cudaHostRegister(reg, reg_len,
+                                                   cudaHostRegisterMapped);
+                        std::cerr << "[shmem][zero-copy] --zc-bigreg fell back to"
+                                     " exact-span registration" << std::endl;
+                    }
                     if (rerr == cudaSuccess) {
                         s.zc_registered.push_back(reg);
                     } else if (rerr == cudaErrorHostMemoryAlreadyRegistered) {
@@ -528,9 +561,10 @@ public:
                     } else {
                         CUDA_CHECK(rerr);
                     }
-                    float* dptr = nullptr;
+                    char* base_dev = nullptr;
                     CUDA_CHECK(cudaHostGetDevicePointer(
-                        reinterpret_cast<void**>(&dptr), reg, 0));
+                        reinterpret_cast<void**>(&base_dev), reg, 0));
+                    float* dptr = reinterpret_cast<float*>(base_dev + off);
                     it = s.zc_dev_cache.emplace(src, dptr).first;
                     ++s.zc_reg_count;
                 } else {
@@ -552,7 +586,10 @@ public:
                 if (s.zc_mode == ShmemSession::kProbe) {
                     const uintptr_t a = reinterpret_cast<uintptr_t>(s.zc_dptr);
                     const char* why;
-                    if ((a & 15) == 0) {
+                    if (zc_kernel_) {
+                        s.zc_mode = ShmemSession::kKernel;
+                        why = "--zc-kernel forced";
+                    } else if ((a & 15) == 0) {
                         s.zc_mode = ShmemSession::kInPlace;  why = "16B aligned";
                     } else if (zc_align_ &&
                                s.fft->try_execute(s.zc_dptr, s.d_output)) {
@@ -571,14 +608,22 @@ public:
                               << " (align16=" << (reinterpret_cast<uintptr_t>(src) & 15)
                               << ") dev=" << static_cast<void*>(s.zc_dptr)
                               << " (align16=" << (a & 15) << ") -> "
-                              << (s.zc_mode == ShmemSession::kInPlace
-                                      ? "in-place"
-                                      : (zc_h2d_ ? "H2D-realign" : "D2D-realign"))
+                              << FeedModeName(s.zc_mode)
                               << "  [" << why << "]" << std::endl;
                     s.zc_logged = true;
                 }
 
-                if (s.zc_mode == ShmemSession::kRealign) {
+                if (s.zc_mode == ShmemSession::kKernel) {
+                    // E3: SM-based copy into aligned device scratch, then FFT
+                    // from device memory (45.6 us at 4 MB) instead of in place
+                    // from mapped host memory (68.9 us).  Wins only if the
+                    // kernel beats the copy engine by enough to pay for itself.
+                    ++s.realign_count;
+                    launch_realign_copy(s.d_input, s.zc_dptr,
+                                        static_cast<size_t>(n_samp), 0);
+                    if (st) ts_c = std::chrono::steady_clock::now();
+                    s.fft->execute(s.d_input, s.d_output);
+                } else if (s.zc_mode == ShmemSession::kRealign) {
                     ++s.realign_count;
                     if (zc_h2d_) {
                         // E1: copy from the page-locked HOST pointer over the
@@ -776,12 +821,7 @@ public:
                       << "  cudaHostRegister  : " << s.zc_reg_count
                       << "   (cache hits: " << s.zc_cache_hits << ")\n"
                       << "  dev-ptr cache size: " << s.zc_dev_cache.size() << "\n"
-                      << "  feed mode         : "
-                      << (s.zc_mode == ShmemSession::kInPlace ? "in-place (no copy)"
-                          : s.zc_mode == ShmemSession::kRealign
-                              ? (zc_h2d_ ? "realign via H2D" : "realign via D2D")
-                              : "never decided")
-                      << "\n"
+                      << "  feed mode         : " << FeedModeName(s.zc_mode) << "\n"
                       << "  realigns          : " << s.realign_count << "\n";
             if (msgs > 0) {
                 const double miss_pct =
@@ -834,6 +874,17 @@ public:
             }).detach();
         }
     }
+
+    // How the session decided to feed cuFFT, for the log line and the report.
+    const char* FeedModeName(ShmemSession::ZcMode m) const {
+        switch (m) {
+            case ShmemSession::kInPlace: return "in-place (no copy)";
+            case ShmemSession::kKernel:  return "SM-kernel copy";
+            case ShmemSession::kRealign: return zc_h2d_ ? "realign via H2D"
+                                                        : "realign via D2D";
+            default:                     return "never decided";
+        }
+    }
 #endif
 
 private:
@@ -847,6 +898,8 @@ private:
     bool        stage_timing_;
     bool        zc_h2d_;
     bool        zc_align_;
+    bool        zc_kernel_;
+    bool        zc_bigreg_;
     grpc::Server* server_;
 };
 
@@ -865,6 +918,8 @@ int main(int argc, char** argv) {
     bool stage_timing = false;             // Phase 0: attribute the ZC residual
     bool zc_h2d       = false;             // E1: realign via H2D, not D2D
     bool zc_align     = false;             // E2: probe cuFFT instead of assuming 16B
+    bool zc_kernel    = false;             // E3: SM copy, then device-memory FFT
+    bool zc_bigreg    = false;             // E4: register whole 64 KB GPU pages
     std::string transport  = "standard";  // "standard" | "shmem" | "tcp"
 
     for (int i = 1; i < argc; ++i) {
@@ -881,6 +936,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stage-timing"))             stage_timing = true;
         else if (!strcmp(argv[i], "--zc-h2d"))                    zc_h2d = true;
         else if (!strcmp(argv[i], "--zc-align"))                  zc_align = true;
+        else if (!strcmp(argv[i], "--zc-kernel"))                 zc_kernel = true;
+        else if (!strcmp(argv[i], "--zc-bigreg"))                 zc_bigreg = true;
     }
 
     const bool use_grpc_direct = (transport != "standard");
@@ -917,7 +974,7 @@ int main(int argc, char** argv) {
     // ── Build gRPC server ────────────────────────────────────────────────────
     PipelineFFTServiceImpl service(buf_size, n_buffers, warmup, out_path,
                                    one_shot, zero_copy, verify, stage_timing,
-                                   zc_h2d, zc_align);
+                                   zc_h2d, zc_align, zc_kernel, zc_bigreg);
 
     // grpc-direct infrastructure (router + GRPCDirectServiceImpl) is only needed
     // for shmem/tcp-direct transports.  For standard gRPC, skip it entirely:

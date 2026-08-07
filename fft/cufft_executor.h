@@ -56,3 +56,13 @@ private:
     cudaEvent_t ev_stop_;
     float       last_exec_us_ = 0.0f;
 };
+
+// Copy n_floats from src to dst using the SMs instead of the copy engine.
+//
+// Phase 0 measured cudaMemcpyAsync out of mapped host memory at only ~52 GB/s,
+// and both the D2D and H2D variants hit the same wall, so the copy engine is
+// the limit.  A grid-stride kernel reads through the SMs' load paths instead.
+// src must be at least 8-byte aligned (float2 loads); dst is assumed to come
+// from cudaMalloc.  Enqueued on `stream`, no synchronisation.
+void launch_realign_copy(float* dst, const float* src, size_t n_floats,
+                         cudaStream_t stream);

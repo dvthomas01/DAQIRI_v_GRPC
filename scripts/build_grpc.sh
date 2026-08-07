@@ -35,9 +35,12 @@ cd "$BUILD_DIR"
 rm -f CMakeCache.txt
 
 # Configure (only runs fully on first call)
+# `native` = build for the GPU in this box.  This was pinned to 90 (Hopper),
+# but spark-ac69 is a GB10 at sm_121, so custom kernels had no image and every
+# launch failed silently.  Override with CUDA_ARCH=<sm> to cross-build.
 cmake "$SRC_DIR" \
     -DCMAKE_BUILD_TYPE=Release \
-    -DCMAKE_CUDA_ARCHITECTURES=90 \
+    -DCMAKE_CUDA_ARCHITECTURES="${CUDA_ARCH:-native}" \
     -DCUDA_TOOLKIT_ROOT_DIR=/usr/local/cuda-13 \
     2>&1
 
