@@ -35,8 +35,8 @@ clean_shmem () {
 
 arm_flags () {
     case "$1" in
-        base) echo "" ;;
-        e1)   echo "--zc-h2d" ;;
+        base) echo "--no-zc-align" ;;
+        e1)   echo "--no-zc-align --zc-h2d" ;;
         e2)   echo "--zc-align" ;;
         e12)  echo "--zc-align --zc-h2d" ;;
     esac

@@ -48,10 +48,16 @@
 #include <unordered_map>
 #include <filesystem>
 #include <iostream>
+#include <memory>
+#include <mutex>
 #include <numeric>
 #include <string>
 #include <thread>
 #include <vector>
+
+// --opt-affinity pins the grpc-direct handler thread to a fixed core.
+#include <pthread.h>
+#include <sched.h>
 
 #include <cuda_runtime.h>
 #include <cufft.h>
@@ -78,11 +84,15 @@ public:
                            bool zero_copy, bool verify,
                            bool stage_timing = false,
                            bool zc_h2d = false, bool zc_align = false,
-                           bool zc_kernel = false, bool zc_bigreg = false)
+                           bool zc_kernel = false, bool zc_bigreg = false,
+                           bool opt_nolock = false, bool opt_stream = false,
+                           int  opt_affinity = -1)
         : buf_size_(buf_size), n_buffers_(n_buffers), warmup_(warmup),
           out_path_(out_path), one_shot_(one_shot), zero_copy_(zero_copy),
           verify_(verify), stage_timing_(stage_timing), zc_h2d_(zc_h2d),
           zc_align_(zc_align), zc_kernel_(zc_kernel), zc_bigreg_(zc_bigreg),
+          opt_nolock_(opt_nolock), opt_stream_(opt_stream),
+          opt_affinity_(opt_affinity),
           server_(nullptr) {}
 
     void set_server(grpc::Server* s) { server_ = s; }
@@ -389,6 +399,21 @@ public:
         long long     zc_cache_hits = 0;   // zc_dev_cache lookups that hit
         long long     realign_count = 0;   // messages that needed the D2D copy
 
+        // ── Delivery accounting ─────────────────────────────────────────────
+        // The client sends N warmup + N measured buffers fire-and-forget; at
+        // <=256 KB only 170-179 of 200 arrive.  A median over survivors is only
+        // comparable to DAQiri's if the losses are independent of latency, so
+        // record which sequence numbers went missing and let the offline
+        // analysis test that.  seq_num is assigned by the client before send,
+        // so a gap here is a genuine loss, not a reordering artifact.
+        int           first_seq     = -1;  // first seq observed this session
+        int           last_seq      = -1;  // most recent seq observed
+        long long     recv_count    = 0;   // messages actually handled
+        long long     missing_total = 0;   // seq values never seen
+        long long     gap_events    = 0;   // discontinuities (a run of losses)
+        long long     reorder_count = 0;   // seq went backwards
+        std::vector<int> missing_seqs;     // the actual missing values
+
         // How this session feeds cuFFT.  Decided once, on the first message,
         // then reused.  kProbe means "not decided yet".
         enum ZcMode { kProbe = 0, kInPlace = 1, kRealign = 2, kKernel = 3 };
@@ -408,13 +433,47 @@ public:
     inline static std::unordered_map<pipeline_fft::PipelineSummary*, ShmemSession>
         shmem_sessions_;
 
+    // --opt-nolock fast path.  Every message currently takes a global mutex and
+    // an unordered_map lookup just to find its session.  unordered_map is
+    // node-based, so a ShmemSession's address is stable until it is erased;
+    // once a session is established we can publish it here and skip both.  The
+    // key is stored alongside so a second concurrent session falls back to the
+    // locked path instead of silently sharing state.
+    inline static std::atomic<pipeline_fft::PipelineSummary*> fast_key_{nullptr};
+    inline static std::atomic<ShmemSession*> fast_sess_{nullptr};
+
     grpc::Status StreamBuffersPerMessage(
         grpc::ServerContext*,
         const pipeline_fft::BufferRequest* req,
         pipeline_fft::PipelineSummary*      summary)
     {
-        std::lock_guard<std::mutex> lk(shmem_mtx_);
-        auto& s = shmem_sessions_[summary];
+        // --opt-affinity: pin the grpc-direct handler thread once, on its first
+        // message.  DAQiri treats cpu_core as a first-class config value; here
+        // the handler can migrate, which shows up in the tail.
+        if (opt_affinity_ >= 0) {
+            static thread_local bool pinned = false;
+            if (!pinned) {
+                pinned = true;
+                cpu_set_t set;
+                CPU_ZERO(&set);
+                CPU_SET(opt_affinity_, &set);
+                if (pthread_setaffinity_np(pthread_self(), sizeof(set), &set) != 0)
+                    std::cerr << "[warn] --opt-affinity: could not pin handler to CPU "
+                              << opt_affinity_ << std::endl;
+            }
+        }
+
+        ShmemSession* sp = nullptr;
+        std::unique_lock<std::mutex> lk;
+        if (opt_nolock_ &&
+            fast_key_.load(std::memory_order_acquire) == summary) {
+            sp = fast_sess_.load(std::memory_order_acquire);
+        }
+        if (sp == nullptr) {
+            lk = std::unique_lock<std::mutex>(shmem_mtx_);
+            sp = &shmem_sessions_[summary];
+        }
+        auto& s = *sp;
 
         // Ignore deliveries after we have already finalised (e.g. grpc-direct
         // may re-deliver the last request on teardown).
@@ -434,7 +493,7 @@ public:
                                       static_cast<size_t>(payload_bytes)));
             CUDA_CHECK(cudaEventCreate(&s.ev_h2d_start));
             CUDA_CHECK(cudaEventCreate(&s.ev_h2d_stop));
-            s.fft = std::make_unique<CuFFTExecutor>(buf_size_);
+            s.fft = std::make_unique<CuFFTExecutor>(buf_size_, opt_stream_);
             s.csv_path = out_path_.empty()
                 ? "data/grpc_pipeline_" + std::to_string(buf_size_) + ".csv"
                 : out_path_;
@@ -446,6 +505,12 @@ public:
             s.sampler->start();
             s.metrics.reserve(static_cast<size_t>(n_buffers_));
             s.initialized = true;
+            if (opt_nolock_) {
+                // Publish the session before the key: a reader that sees the
+                // key is then guaranteed to see the pointer too.
+                fast_sess_.store(&s, std::memory_order_release);
+                fast_key_.store(summary, std::memory_order_release);
+            }
             std::cout << "[shmem] session opened  buf_size=" << buf_size_
                       << (zero_copy_ ? "  [ZERO-COPY]" : "  [copy]") << "\n";
 
@@ -488,6 +553,24 @@ public:
 
         // ── Process one buffer (skip if size mismatch) ────────────────────────
         if (n_samp == buf_size_) {
+            // Delivery accounting: log any hole in the client's sequence before
+            // doing the work, so the gap is attributed to the right position in
+            // the stream even if this buffer later throws.
+            const int seq = req->seq_num();
+            ++s.recv_count;
+            if (s.first_seq < 0) {
+                s.first_seq = seq;
+            } else if (seq > s.last_seq + 1) {
+                ++s.gap_events;
+                for (int miss = s.last_seq + 1; miss < seq; ++miss) {
+                    ++s.missing_total;
+                    if (s.missing_seqs.size() < 512) s.missing_seqs.push_back(miss);
+                }
+            } else if (seq <= s.last_seq) {
+                ++s.reorder_count;
+            }
+            if (seq > s.last_seq) s.last_seq = seq;
+
             const auto   t_recv     = std::chrono::steady_clock::now();
             // Wall-clock (CLOCK_REALTIME) receive stamp for wire latency
             // (client + server share the host, so the delta is valid).
@@ -620,7 +703,8 @@ public:
                     // kernel beats the copy engine by enough to pay for itself.
                     ++s.realign_count;
                     launch_realign_copy(s.d_input, s.zc_dptr,
-                                        static_cast<size_t>(n_samp), 0);
+                                        static_cast<size_t>(n_samp),
+                                        s.fft->stream());
                     if (st) ts_c = std::chrono::steady_clock::now();
                     s.fft->execute(s.d_input, s.d_output);
                 } else if (s.zc_mode == ShmemSession::kRealign) {
@@ -631,10 +715,12 @@ public:
                         // alias.  Same bytes, potentially a much better engine:
                         // Phase 0 measured the D2D path at only ~52 GB/s.
                         CUDA_CHECK(cudaMemcpyAsync(s.d_input, src, copy_bytes,
-                                                   cudaMemcpyHostToDevice));
+                                                   cudaMemcpyHostToDevice,
+                                                   s.fft->stream()));
                     } else {
                         CUDA_CHECK(cudaMemcpyAsync(s.d_input, s.zc_dptr, copy_bytes,
-                                                   cudaMemcpyDeviceToDevice));
+                                                   cudaMemcpyDeviceToDevice,
+                                                   s.fft->stream()));
                     }
                     if (st) ts_c = std::chrono::steady_clock::now();
                     s.fft->execute(s.d_input, s.d_output);
@@ -700,6 +786,7 @@ public:
                                         / (e2e_us > 0.0 ? e2e_us * 1e-6 : 1e-9);
                 m.buffer_size_samples = buf_size_;
                 m.dropped_buffers     = 0;
+                m.seq_num             = seq;
                 m.cpu_util_pct        = s.sampler->cpu_pct();
                 m.gpu_util_pct        = s.sampler->gpu_pct();
                 {
@@ -809,6 +896,43 @@ public:
             summary->set_buffers_received(0);
         }
 
+        // ── Delivery accounting ──────────────────────────────────────────────
+        // A p50 computed over survivors is only comparable to DAQiri's if the
+        // losses are independent of latency.  Print where the holes are so the
+        // offline analysis can test that; the position of the gaps (clustered
+        // at the start vs spread uniformly) already distinguishes ring warmup
+        // from steady-state overrun.
+        if (s.first_seq >= 0) {
+            const long long span = static_cast<long long>(s.last_seq - s.first_seq) + 1;
+            std::cout << "\n---- Delivery accounting ----\n"
+                      << "  seq range         : " << s.first_seq << " .. " << s.last_seq
+                      << "  (span " << span << ")\n"
+                      << "  received          : " << s.recv_count << "\n"
+                      << "  missing           : " << s.missing_total
+                      << "  (" << (span > 0 ? 100.0 * static_cast<double>(s.missing_total)
+                                                    / static_cast<double>(span)
+                                            : 0.0)
+                      << " % of span)\n"
+                      << "  gap events        : " << s.gap_events
+                      << "   reorders: " << s.reorder_count << "\n";
+            if (!s.missing_seqs.empty()) {
+                std::cout << "  missing seqs      : ";
+                const size_t show = std::min<size_t>(s.missing_seqs.size(), 64);
+                for (size_t i = 0; i < show; ++i) std::cout << s.missing_seqs[i] << ' ';
+                if (s.missing_seqs.size() > show)
+                    std::cout << "... (+" << (s.missing_seqs.size() - show) << " more)";
+                std::cout << "\n";
+                // Mean run length separates "many isolated single drops"
+                // (independent loss) from "a few long bursts" (overrun).
+                std::cout << "  mean run length   : "
+                          << (s.gap_events > 0
+                                  ? static_cast<double>(s.missing_total)
+                                        / static_cast<double>(s.gap_events)
+                                  : 0.0)
+                          << " consecutive\n";
+            }
+        }
+
         // ── Phase-0 residual attribution report ──────────────────────────────
         // zc_reg_count alone decides the leading hypothesis: if it tracks the
         // message count, the device-pointer cache misses every message and we
@@ -864,6 +988,12 @@ public:
         CUDA_CHECK(cudaFree(s.d_input));
         CUDA_CHECK(cudaFree(s.d_output));
         CUDA_CHECK(cudaFreeHost(s.h_staging));
+        // Retire the --opt-nolock fast pointer before the node is destroyed,
+        // otherwise a late redelivery could dereference freed session state.
+        if (fast_key_.load(std::memory_order_acquire) == summary) {
+            fast_key_.store(nullptr, std::memory_order_release);
+            fast_sess_.store(nullptr, std::memory_order_release);
+        }
         shmem_sessions_.erase(summary);
 
         if (one_shot_ && server_) {
@@ -900,6 +1030,9 @@ private:
     bool        zc_align_;
     bool        zc_kernel_;
     bool        zc_bigreg_;
+    bool        opt_nolock_   = false;
+    bool        opt_stream_   = false;
+    int         opt_affinity_ = -1;
     grpc::Server* server_;
 };
 
@@ -917,9 +1050,30 @@ int main(int argc, char** argv) {
     bool verify    = false;                // one-shot spectral correctness check
     bool stage_timing = false;             // Phase 0: attribute the ZC residual
     bool zc_h2d       = false;             // E1: realign via H2D, not D2D
-    bool zc_align     = false;             // E2: probe cuFFT instead of assuming 16B
+    // E2 is ON by default: probing cuFFT beats the old hard-coded 16-byte rule
+    // at every size (1.67x at 4 MB) and is spectrally identical.  --no-zc-align
+    // restores the pre-fix behaviour so the baseline stays measurable.
+    bool zc_align     = true;
     bool zc_kernel    = false;             // E3: SM copy, then device-memory FFT
     bool zc_bigreg    = false;             // E4: register whole 64 KB GPU pages
+    // The clock-fair sweep put the entire remaining gap to DAQiri in the
+    // residual (e2e - fft): 7.1 us here vs DAQiri's 4.9 at 4 MB.  These three
+    // attack that fixed overhead rather than the transform itself.
+    //
+    // Only --opt-stream earned a default.  Interleaved cur/all runs (3 reps x
+    // 3 sizes) put it ahead on 9 of 9 paired residual comparisons, worth
+    // 0.15 us at 16 KB rising to 0.39 us at 4 MB.  --no-opt-stream restores
+    // the legacy null stream + blocking sync so the baseline stays measurable.
+    //
+    // The other two stay opt-in on purpose.  --opt-nolock measured inside the
+    // noise (the mutex is uncontended, so there was nothing to win) and its
+    // lock-free fast path carries a real session-lifetime hazard; taking that
+    // risk for no gain is a bad trade.  --opt-affinity was neutral to harmful
+    // (4 MB p99 of 118 us) because grpc-direct already pins its own handler
+    // thread, so forcing a core fights the runtime.
+    bool opt_nolock   = false;             // skip the per-message mutex + map
+    bool opt_stream   = true;              // dedicated stream + spin completion
+    int  opt_affinity = -1;                // pin handler thread to this CPU
     std::string transport  = "standard";  // "standard" | "shmem" | "tcp"
 
     for (int i = 1; i < argc; ++i) {
@@ -936,8 +1090,14 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--stage-timing"))             stage_timing = true;
         else if (!strcmp(argv[i], "--zc-h2d"))                    zc_h2d = true;
         else if (!strcmp(argv[i], "--zc-align"))                  zc_align = true;
+        else if (!strcmp(argv[i], "--no-zc-align"))               zc_align = false;
         else if (!strcmp(argv[i], "--zc-kernel"))                 zc_kernel = true;
         else if (!strcmp(argv[i], "--zc-bigreg"))                 zc_bigreg = true;
+        else if (!strcmp(argv[i], "--opt-nolock"))                opt_nolock = true;
+        else if (!strcmp(argv[i], "--opt-stream"))                opt_stream = true;
+        else if (!strcmp(argv[i], "--no-opt-stream"))             opt_stream = false;
+        else if (!strcmp(argv[i], "--opt-affinity") && i+1 < argc) opt_affinity = std::atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--opt-all"))                 { opt_nolock = true; opt_stream = true; }
     }
 
     const bool use_grpc_direct = (transport != "standard");
@@ -974,7 +1134,8 @@ int main(int argc, char** argv) {
     // ── Build gRPC server ────────────────────────────────────────────────────
     PipelineFFTServiceImpl service(buf_size, n_buffers, warmup, out_path,
                                    one_shot, zero_copy, verify, stage_timing,
-                                   zc_h2d, zc_align, zc_kernel, zc_bigreg);
+                                   zc_h2d, zc_align, zc_kernel, zc_bigreg,
+                                   opt_nolock, opt_stream, opt_affinity);
 
     // grpc-direct infrastructure (router + GRPCDirectServiceImpl) is only needed
     // for shmem/tcp-direct transports.  For standard gRPC, skip it entirely:

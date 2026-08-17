@@ -16,7 +16,15 @@ class CuFFTExecutor {
 public:
     // Creates a 1D R2C plan for transforms of size n.
     // Throws std::runtime_error on cuFFT or CUDA failure.
-    explicit CuFFTExecutor(int n);
+    //
+    // own_stream: run the transform on a dedicated non-blocking stream instead
+    //   of the legacy null stream, and wait for completion by polling
+    //   cudaEventQuery rather than blocking in cudaEventSynchronize.  The clock
+    //   -fair sweep put the whole remaining gap to DAQiri in this path: the
+    //   residual (e2e - fft) is 4.9 us for DAQiri and 7.1 us here, and DAQiri
+    //   polls a CUDA event on its own stream.  Blocking sync parks the thread
+    //   and pays a wakeup; spinning trades a busy core for latency.
+    explicit CuFFTExecutor(int n, bool own_stream = false);
     ~CuFFTExecutor();
 
     // Non-copyable
@@ -49,12 +57,20 @@ public:
 
     int n() const { return n_; }
 
+    // The stream this executor runs on.  0 (legacy null stream) unless the
+    // executor was constructed with own_stream.  Callers that enqueue their own
+    // work ahead of the transform must use this stream, or the transform can
+    // start before that work has finished.
+    cudaStream_t stream() const { return stream_; }
+
 private:
-    int         n_;
-    cufftHandle plan_;
-    cudaEvent_t ev_start_;
-    cudaEvent_t ev_stop_;
-    float       last_exec_us_ = 0.0f;
+    int          n_;
+    cufftHandle  plan_;
+    cudaEvent_t  ev_start_;
+    cudaEvent_t  ev_stop_;
+    cudaStream_t stream_    = 0;      // 0 = legacy null stream
+    bool         own_stream_ = false; // stream_ is ours to destroy
+    float        last_exec_us_ = 0.0f;
 };
 
 // Copy n_floats from src to dst using the SMs instead of the copy engine.

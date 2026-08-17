@@ -17,6 +17,7 @@ struct BufferMetrics {
     float  gpu_util_pct        = 0.0f; // nvmlDeviceGetUtilizationRates
     int    buffer_size_samples = 0;
     int    dropped_buffers     = 0;    // cumulative at time of this buffer
+    int    seq_num             = -1;   // client-assigned sequence; -1 = not reported
 };
 
 // Aggregate summary computed from a full run.

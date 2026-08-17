@@ -27,6 +27,7 @@ void CsvLogger::write_header() {
           << ",buffer_size_samples"
           << ",dropped_buffers"
           << ",wire_latency_us"
+          << ",seq_num"
           << "\n";
 }
 
@@ -42,6 +43,7 @@ void CsvLogger::log(const BufferMetrics& m) {
           << ',' << m.buffer_size_samples
           << ',' << m.dropped_buffers
           << ',' << m.wire_latency_us
+          << ',' << m.seq_num
           << '\n';
 }
 

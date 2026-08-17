@@ -31,8 +31,17 @@
 
 // ---- CuFFTExecutor --------------------------------------------------------
 
-CuFFTExecutor::CuFFTExecutor(int n) : n_(n) {
+CuFFTExecutor::CuFFTExecutor(int n, bool own_stream) : n_(n) {
     CUFFT_CHECK(cufftPlan1d(&plan_, n_, CUFFT_R2C, 1));
+    if (own_stream) {
+        // cudaStreamNonBlocking so this stream never implicitly synchronises
+        // with the legacy null stream used elsewhere in the process.
+        CUDA_CHECK(cudaStreamCreateWithFlags(&stream_, cudaStreamNonBlocking));
+        CUFFT_CHECK(cufftSetStream(plan_, stream_));
+        own_stream_ = true;
+    }
+    // cudaEventDisableTiming would be cheaper, but last_exec_us() needs the
+    // timestamps, so keep timing enabled and accept the small record cost.
     CUDA_CHECK(cudaEventCreate(&ev_start_));
     CUDA_CHECK(cudaEventCreate(&ev_stop_));
 }
@@ -41,18 +50,28 @@ CuFFTExecutor::~CuFFTExecutor() {
     cufftDestroy(plan_);
     cudaEventDestroy(ev_start_);
     cudaEventDestroy(ev_stop_);
+    if (own_stream_ && stream_) cudaStreamDestroy(stream_);
 }
 
 void CuFFTExecutor::execute(const float* d_input, cufftComplex* d_output) {
-    CUDA_CHECK(cudaEventRecord(ev_start_));
+    CUDA_CHECK(cudaEventRecord(ev_start_, stream_));
     // cufftExecR2C requires a non-const input pointer (in-place transforms
     // modify the input buffer); we guarantee d_input is not reused before
     // the next synchronize, so the cast is safe.
     CUFFT_CHECK(cufftExecR2C(plan_,
                               const_cast<cufftReal*>(d_input),
                               d_output));
-    CUDA_CHECK(cudaEventRecord(ev_stop_));
-    CUDA_CHECK(cudaEventSynchronize(ev_stop_));
+    CUDA_CHECK(cudaEventRecord(ev_stop_, stream_));
+    if (own_stream_) {
+        // Spin instead of blocking.  cudaEventSynchronize parks the thread and
+        // pays a scheduler wakeup on completion; at these durations (tens of
+        // us) that wakeup is a measurable part of the residual.
+        cudaError_t q;
+        while ((q = cudaEventQuery(ev_stop_)) == cudaErrorNotReady) { }
+        CUDA_CHECK(q);
+    } else {
+        CUDA_CHECK(cudaEventSynchronize(ev_stop_));
+    }
 
     float ms = 0.0f;
     CUDA_CHECK(cudaEventElapsedTime(&ms, ev_start_, ev_stop_));
@@ -60,7 +79,7 @@ void CuFFTExecutor::execute(const float* d_input, cufftComplex* d_output) {
 }
 
 bool CuFFTExecutor::try_execute(const float* d_input, cufftComplex* d_output) {
-    CUDA_CHECK(cudaEventRecord(ev_start_));
+    CUDA_CHECK(cudaEventRecord(ev_start_, stream_));
     cufftResult r = cufftExecR2C(plan_,
                                  const_cast<cufftReal*>(d_input),
                                  d_output);
@@ -68,7 +87,7 @@ bool CuFFTExecutor::try_execute(const float* d_input, cufftComplex* d_output) {
         (void)cudaGetLastError();  // clear any sticky error the failure left
         return false;
     }
-    CUDA_CHECK(cudaEventRecord(ev_stop_));
+    CUDA_CHECK(cudaEventRecord(ev_stop_, stream_));
     cudaError_t serr = cudaEventSynchronize(ev_stop_);
     if (serr != cudaSuccess) {
         (void)cudaGetLastError();
