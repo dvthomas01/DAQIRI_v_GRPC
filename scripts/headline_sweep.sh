@@ -37,9 +37,37 @@ YAML=daqiri/config_roce_pipeline.yaml
 
 SIZES="${SIZES:-4096 8192 16384 32768 65536 131072 262144 524288 1048576}"
 ARMS="${ARMS:-base opt daq}"
-REPS="${REPS:-3}"
+REPS="${REPS:-2}"
 N=200; W=50; PACE=400; PORT=50104
 OUT=data/headline_runs.csv
+
+# ── build-freshness guard ────────────────────────────────────────────────────
+# An scp once died before the rebuild, leaving this box with a binary that did
+# not contain the change being measured.  The sweep would have produced clean,
+# publishable, wrong numbers.  Refuse to run in that state.
+SRC=grpc_direct/bench_grpc_server.cc
+if [ ! -x "$SERVER" ]; then
+    echo "ABORT: $SERVER not built."; exit 1
+fi
+if [ "$SRC" -nt "$SERVER" ]; then
+    echo "ABORT: $SRC is newer than $SERVER.  Rebuild first:"
+    echo "  cmake --build ~/daqiri_gpu/build_grpc --parallel 16 --target bench_grpc_server"
+    exit 1
+fi
+# Direct check that the binary actually contains the current flag set, which
+# catches a stale binary whose mtime happens to look fine.
+if ! grep -qa -- '--no-opt-stream' "$SERVER"; then
+    echo "ABORT: $SERVER predates the --opt-stream work (flag string absent)."
+    echo "  scp the source and rebuild before sweeping."
+    exit 1
+fi
+
+GITSHA=$(git -C "$HOME/daqiri_gpu" rev-parse --short HEAD 2>/dev/null || echo unknown)
+DIRTY=$(git -C "$HOME/daqiri_gpu" status --porcelain -- "$SRC" 2>/dev/null | head -c1)
+[ -n "$DIRTY" ] && GITSHA="${GITSHA}+dirty"
+echo "build: $GITSHA   server mtime: $(date -r "$SERVER" '+%Y-%m-%d %H:%M:%S')"
+echo "sweep: ${REPS} reps x $(echo $ARMS | wc -w) arms x $(echo $SIZES | wc -w) sizes, arms interleaved"
+echo
 
 clean_all () {
     pkill -9 -f bench_grpc_server 2>/dev/null
@@ -50,7 +78,7 @@ clean_all () {
     sleep 1
 }
 
-echo "arm,size,kb,rep,e2e_p50,e2e_p99,fft_p50,resid,n,result" > "$OUT"
+echo "arm,size,kb,rep,e2e_p50,e2e_p99,fft_p50,resid,n,result,gitsha" > "$OUT"
 
 printf "%-6s %-9s %-6s %-4s %-9s %-9s %-9s %-8s %-6s %s\n" \
   "arm" "size" "KB" "rep" "e2e_p50" "e2e_p99" "fft_p50" "resid" "n" "result"
@@ -101,7 +129,7 @@ for S in $SIZES; do
       printf "%-6s %-9s %-6s %-4s %-9s %-9s %-9s %-8s %-6s %s\n" \
         "$ARM" "$S" "$KB" "$R" "${e2e50:-NA}" "${e2e99:-NA}" "${fft50:-NA}" \
         "$resid" "${n:-NA}" "$res"
-      echo "$ARM,$S,$KB,$R,${e2e50:-NA},${e2e99:-NA},${fft50:-NA},$resid,${n:-NA},$res" >> "$OUT"
+      echo "$ARM,$S,$KB,$R,${e2e50:-NA},${e2e99:-NA},${fft50:-NA},$resid,${n:-NA},$res,$GITSHA" >> "$OUT"
     done
   done
   echo "--------------------------------------------------------------------------------------"

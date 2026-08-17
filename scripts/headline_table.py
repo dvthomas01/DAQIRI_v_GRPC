@@ -30,12 +30,18 @@ with open(PATH) as fh:
                 "arm": r["arm"], "kb": int(r["kb"]), "rep": int(r["rep"]),
                 "e2e": float(r["e2e_p50"]), "p99": float(r["e2e_p99"]),
                 "fft": float(r["fft_p50"]), "resid": float(r["resid"]),
+                "gitsha": r.get("gitsha", ""),
             })
         except ValueError:
             continue
 
 if not rows:
     sys.exit(f"no usable rows in {PATH}")
+
+shas = sorted({r.get("gitsha", "") for r in rows} - {""})
+if len(shas) > 1:
+    print(f"WARNING: rows span more than one build: {', '.join(shas)}")
+    print("         arms may not be comparable.\n")
 
 
 def med(xs):
