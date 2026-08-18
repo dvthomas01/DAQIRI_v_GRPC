@@ -7,3 +7,14 @@ set_target_properties(cufft_executor PROPERTIES
 
 add_executable(fft_validate fft_validate.cc)
 target_link_libraries(fft_validate PRIVATE cufft_executor signal_gen CUDA::cudart)
+
+# Single-process placement ladder: times the same R2C plan over device memory,
+# cudaHostAlloc'd pinned host, registered heap, registered /dev/shm, and
+# registered huge pages.  No gRPC, no DAQiri, no network.
+add_executable(bench_fft_memsrc bench_fft_memsrc.cc)
+target_link_libraries(bench_fft_memsrc PRIVATE
+    cufft_executor
+    signal_gen
+    CUDA::cudart
+    rt          # shm_open lives in librt on older glibc
+)

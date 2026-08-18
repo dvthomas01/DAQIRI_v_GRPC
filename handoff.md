@@ -290,6 +290,95 @@ buffer, in one process, interleaved. If the placement theory is right the gap re
 no gRPC involved at all, and if it does not reproduce, the cause is somewhere else entirely and
 the Rust work is unnecessary. That experiment is cheap and nobody has run it.
 
+## 7b. i-RDMA: can the data land in GPU memory instead? (measured 2026-08-18)
+
+The idea: stop reading the transform's input from host memory and have it arrive in
+GPU-resident memory instead. Two premises have to be corrected before reading any of this.
+
+**We already have no GPU copy.** The optimized path logs `feed mode : in-place (no copy)`.
+The staging copy was removed by `--zc-align`. There is nothing left to delete.
+
+**DAQiri does not write to the GPU either.** From `bench_daqiri_roce_pipeline.cc`:
+"DAQiri host_pinned MRs are cudaMallocHost'd". Its receive buffers are host memory, mapped
+to a device pointer and transformed in place, exactly like ours. Its `cudaMalloc` calls are
+for the FFT *output*. This is why the placement ladder found the two identical. Matching
+DAQiri is not the prize here; the prize is going past it, because it is stuck in host memory
+too and has no route out that we do not also have.
+
+### What was measured
+
+`fft/bench_fft_memsrc.cc` was extended to time the producer's WRITE as well as the transform,
+because in the pipeline benchmark the write falls outside the measured window. An arm that
+writes slowly and transforms quickly would look like a pure win while being neutral or worse.
+The verdict is therefore taken on write + transform, never on the transform alone.
+
+At 4 MB, 5 sizes x 5 reps, arms rotated every iteration, alignment held at 2 MB for all:
+
+| arm | write | transform | total |
+|---|---|---|---|
+| `hostalloc` (DAQiri's kind) | 173.36 | 60.42 | **236.78** |
+| `shmreg` (what we get today) | 217.81 | 69.60 | **287.60** |
+| `mgdwrite` (managed, preferred location GPU) | 192.31 | 70.43 | **263.41** |
+| `device` (cudaMalloc, reached by copying) | 448.71 | 43.52 | **492.23** |
+| `devwrite` (cudaMalloc, CPU stores into it) | FAULTS | FAULTS | FAULTS |
+
+Three findings, in order of how much they constrain the design:
+
+1. **The CPU cannot store into `cudaMalloc`'d memory on GB10.** A guarded one-byte probe
+   (SIGSEGV/SIGBUS handler plus `siglongjmp`, so the sweep drops the arm instead of dying)
+   faults at every size. Any design where a CPU-side producer writes directly into device
+   memory is impossible on this hardware. Only a DMA engine can put bytes there.
+2. **Copying your way there is dead by two orders of magnitude.** The `device` arm has the
+   fastest transform by far, 43.52 vs 69.60, but pays 448.71 to get the bytes in. Total is
+   492.23 against 287.60. The decision rule was "dead if the write penalty exceeds 6.10 us";
+   the penalty is +230.90.
+3. **Managed memory does not deliver device residency.** `mgdwrite` sets
+   `cudaMemAdviseSetPreferredLocation` to the GPU and prefetches there, and its transform is
+   still 70.43, indistinguishable from ordinary host memory. The CPU write migrates the pages
+   straight back. Route C is not merely risky in theory, it was measured and it does not work.
+   Sign test against every other arm: p = 1 throughout.
+
+### How much is actually on the table
+
+Two numbers, and the difference between them matters:
+
+* **6.10 us at 4 MB** (47.55 vs 53.66) from the read-only ladder, where nothing wrote to the
+  buffer beforehand.
+* **26.08 us at 4 MB** (43.52 vs 69.60) from this run, where a CPU store dirtied the host
+  buffer before each transform.
+
+The second figure flatters the idea. Our CPU-store producer dirties host caches in a way a
+DMA producer would not, and DAQiri's producer is a NIC, not a CPU. **Cite 6.10 us as the
+conservative floor.** It is still the entire size of our remaining gap, so a working
+device-landing path would put gRPC-Direct ahead of DAQiri rather than level with it.
+
+### NUMA and page attributes: closed, not deferred
+
+The premise was that on a coherent part "device" versus "host" memory might be a page
+attribute rather than a physical location, reachable with `mbind` without touching Rust:
+
+```
+$ numactl --hardware
+available: 1 nodes (0)
+node 0 size: 122571 MB
+```
+
+One node covering all 122 GB. GPU memory is not a separate NUMA node, so there is no node to
+bind to and `move_pages` would report node 0 for every page by construction. No probe was
+built because there is nothing it could report. Closed.
+
+### The three routes, costed
+
+| | Route B: GPUDirect RDMA | Route A: device-resident arena | Route C: managed memory |
+|---|---|---|---|
+| **Blocker** | `GRPC_DIRECT_TRANSPORT_RDMA = 3` exists in `grpc_direct.h` but the header says twice: "not yet implemented, returns NULL". Behind Cargo `--features rdma`, via easyrdma. | The iceoryx2 arena is allocated inside the Rust library with `shm_open`/`mmap`. We receive a pointer; we never choose where it lives. Same FFI seam as section 7. And per finding 1, the CPU could not write there anyway, so the producer would have to become a DMA engine, which collapses this into Route B. | None. Fully implementable today. |
+| **Effort** | Large. Implementing an RDMA transport in the Rust library, then registering device memory with the NIC (nvidia_peermem or dma-buf). | Large, and probably pointless on its own. | Already done. It took an afternoon. |
+| **Risk** | The transform gain is real but the floor is 6.10 us, not 26. Needs a second box or a loopback RoCE setup to be meaningful. | Blocked and likely subsumed by B. | **Retired.** Measured, does not work, pages migrate back on CPU write. |
+| **Rank** | **First.** It is the architecturally correct answer for a real instrument: the producer is a DMA engine that must write the bytes somewhere regardless, so choosing GPU memory as the destination is free and the 6.10 us is genuine rather than moved around. | Second, conditional on B. | Last. Do not revisit without new evidence. |
+
+Nobody should start Route B expecting a quick win. It is the right design, it is a real piece
+of work in a Rust library we do not own, and the payoff is about 6 us at the largest payload.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build
