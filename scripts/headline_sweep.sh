@@ -39,7 +39,10 @@ SIZES="${SIZES:-4096 8192 16384 32768 65536 131072 262144 524288 1048576}"
 ARMS="${ARMS:-base opt daq}"
 REPS="${REPS:-2}"
 N=200; W=50; PACE=400; PORT=50104
-OUT=data/headline_runs.csv
+# Overridable so a smoke test can be sent somewhere harmless.  This file is
+# truncated on start, so pointing a short validation run at the real path would
+# leave a stub that looks like the headline artifact if the full run then died.
+OUT="${OUT:-data/headline_runs.csv}"
 
 # ── build-freshness guard ────────────────────────────────────────────────────
 # An scp once died before the rebuild, leaving this box with a binary that did
@@ -62,9 +65,19 @@ if ! grep -qa -- '--no-opt-stream' "$SERVER"; then
     exit 1
 fi
 
-GITSHA=$(git -C "$HOME/daqiri_gpu" rev-parse --short HEAD 2>/dev/null || echo unknown)
-DIRTY=$(git -C "$HOME/daqiri_gpu" status --porcelain -- "$SRC" 2>/dev/null | head -c1)
-[ -n "$DIRTY" ] && GITSHA="${GITSHA}+dirty"
+# The tree on the Spark is an scp mirror, not a clone, so there is usually no
+# git metadata here to read.  Pass the workstation's SHA in explicitly:
+#     GITSHA=952b68a bash scripts/headline_sweep.sh
+# Stamping "unknown" would leave the headline CSV unattributable to any commit,
+# which defeats the point, so if no SHA is supplied we fall back to a hash of
+# the source that was actually compiled on this box.  That is weaker than a
+# commit id but it still pins the rows to specific bytes.
+if [ -z "${GITSHA:-}" ]; then
+    GITSHA=$(git -C "$HOME/daqiri_gpu" rev-parse --short HEAD 2>/dev/null || true)
+    DIRTY=$(git -C "$HOME/daqiri_gpu" status --porcelain -- "$SRC" 2>/dev/null | head -c1)
+    [ -n "$GITSHA" ] && [ -n "$DIRTY" ] && GITSHA="${GITSHA}+dirty"
+fi
+[ -z "${GITSHA:-}" ] && GITSHA="srchash:$(sha256sum "$SRC" | cut -c1-10)"
 echo "build: $GITSHA   server mtime: $(date -r "$SERVER" '+%Y-%m-%d %H:%M:%S')"
 echo "sweep: ${REPS} reps x $(echo $ARMS | wc -w) arms x $(echo $SIZES | wc -w) sizes, arms interleaved"
 echo

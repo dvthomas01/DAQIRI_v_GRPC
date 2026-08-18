@@ -18,7 +18,22 @@ import sys
 from collections import defaultdict
 from math import comb
 
-PATH = sys.argv[1] if len(sys.argv) > 1 else "data/headline_runs.csv"
+# Usage: headline_table.py [csv] [--arms A,B,C]
+#   A = the pre-change / control arm
+#   B = the arm under test
+#   C = the reference we are chasing (DAQiri)
+# Defaults to the headline sweep's arms.  Parameterised so the placement and
+# registration probes can reuse this analyzer rather than forking a second copy
+# that could drift out of agreement with it.
+PATH = "data/headline_runs.csv"
+A_CTL, A_TST, A_REF = "base", "opt", "daq"
+_args = sys.argv[1:]
+if "--arms" in _args:
+    i = _args.index("--arms")
+    A_CTL, A_TST, A_REF = _args[i + 1].split(",")
+    del _args[i:i + 2]
+if _args:
+    PATH = _args[0]
 
 rows = []
 with open(PATH) as fh:
@@ -67,20 +82,21 @@ def m(arm, kb, key):
 print(f"headline: {len(rows)} runs, {len(sizes)} sizes, {len(reps)} reps, "
       f"arms interleaved within each rep\n")
 
-hdr = ("KB", "base_e2e", "opt_e2e", "daq_e2e", "speedup", "gap_us", "gap_%",
-       "base_res", "opt_res", "daq_res", "opt_p99", "daq_p99")
+hdr = ("KB", f"{A_CTL}_e2e", f"{A_TST}_e2e", f"{A_REF}_e2e", "speedup",
+       "gap_us", "gap_%", f"{A_CTL}_res", f"{A_TST}_res", f"{A_REF}_res",
+       f"{A_TST}_p99", f"{A_REF}_p99")
 print(("{:<7}" + "{:>10}" * 11).format(*hdr))
 print("-" * 117)
 
 for kb in sizes:
-    b, o, d = m("base", kb, "e2e"), m("opt", kb, "e2e"), m("daq", kb, "e2e")
+    b, o, d = m(A_CTL, kb, "e2e"), m(A_TST, kb, "e2e"), m(A_REF, kb, "e2e")
     sp = b / o if o else float("nan")
     gap = o - d
     gpct = 100.0 * gap / d if d else float("nan")
     print(("{:<7}" + "{:>10.2f}" * 11).format(
         kb, b, o, d, sp, gap, gpct,
-        m("base", kb, "resid"), m("opt", kb, "resid"), m("daq", kb, "resid"),
-        m("opt", kb, "p99"), m("daq", kb, "p99")))
+        m(A_CTL, kb, "resid"), m(A_TST, kb, "resid"), m(A_REF, kb, "resid"),
+        m(A_TST, kb, "p99"), m(A_REF, kb, "p99")))
 
 # ── where the remaining gap lives ────────────────────────────────────────────
 # resid is defined as e2e - fft, so per run the identity is exact:
@@ -95,14 +111,15 @@ for kb in sizes:
 # difference there is not a transport problem at all and will not respond to
 # transport work.
 idx = {(r["arm"], r["kb"], r["rep"]): r for r in rows}
-print("\nwhere the remaining opt->daq gap lives (per-cell diffs, then median)")
+print(f"\nwhere the remaining {A_TST}->{A_REF} gap lives "
+      f"(per-cell diffs, then median)")
 print("-" * 117)
 print(("{:<7}" + "{:>10}" * 5).format(
     "KB", "e2e_gap", "fft_gap", "res_gap", "fft_%", "res_%"))
 for kb in sizes:
     e2e_d, fft_d, res_d = [], [], []
     for rep in reps:
-        o, d = idx.get(("opt", kb, rep)), idx.get(("daq", kb, rep))
+        o, d = idx.get((A_TST, kb, rep)), idx.get((A_REF, kb, rep))
         if not o or not d:
             continue
         e2e_d.append(o["e2e"] - d["e2e"])
@@ -144,13 +161,15 @@ def sign_test(arm_a, arm_b, key):
 print("\npaired sign tests (pairing on size x rep)")
 print("-" * 117)
 for a, b, key, label in (
-    ("opt", "base", "resid", "opt residual < base residual"),
-    ("opt", "base", "e2e",   "opt e2e      < base e2e"),
-    ("daq", "opt",  "resid", "daq residual < opt  residual"),
-    ("daq", "opt",  "e2e",   "daq e2e      < opt  e2e"),
+    (A_TST, A_CTL, "resid", f"{A_TST} residual < {A_CTL} residual"),
+    (A_TST, A_CTL, "e2e",   f"{A_TST} e2e      < {A_CTL} e2e"),
+    (A_TST, A_CTL, "fft",   f"{A_TST} fft      < {A_CTL} fft"),
+    (A_REF, A_TST, "resid", f"{A_REF} residual < {A_TST} residual"),
+    (A_REF, A_TST, "e2e",   f"{A_REF} e2e      < {A_TST} e2e"),
+    (A_REF, A_TST, "fft",   f"{A_REF} fft      < {A_TST} fft"),
 ):
     w, t, p = sign_test(a, b, key)
-    print(f"  {label:32s}  {w}/{t} cells   p = {p:.4g}")
+    print(f"  {label:36s}  {w}/{t} cells   p = {p:.4g}")
 
 print("\nnote: e2e medians move with the GPU clock and are only comparable")
 print("      within a rep; the residual columns are the drift-resistant ones.")
