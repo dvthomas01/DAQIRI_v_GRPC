@@ -12,10 +12,13 @@ gRPC-Direct was 1.76x slower than DAQiri at 4 MB. We found the cause (an incorre
 assumption forcing an unnecessary GPU copy on 100% of messages), fixed it, and closed most of
 the gap. A dedicated CUDA stream took a little more. Five other optimization ideas were
 measured and rejected, and one (the arena) is blocked by an ownership boundary we do not
-control. At 4 MB we are now within about 3 us, roughly 4%.
+control. At 4 MB we went from 1.76x slower to 1.13x slower. DAQiri is still ahead at every
+size, and roughly three quarters of what remains is inside cuFFT rather than in transport.
 
-**If you read only one more thing, read section 1.** Two of this project's headline numbers
-turned out to be measurement artifacts rather than results, and both were caught late.
+**If you read only one more thing, read section 1.** Three of this project's headline numbers
+turned out to be measurement artifacts rather than results, and all three were caught late.
+The most recent was a gap figure taken from a single un-repeated run; it is retracted in
+section 5.
 
 ## 1. How to measure on this box (read this before you run anything)
 
@@ -133,45 +136,80 @@ never necessary. It cost ~77 us at 4 MB.
 
 ## 5. Current scoreboard (p50 us)
 
-> **This section previously reported a 12.2 us gap at 4 MB and a memory-source ladder
-> explaining it. Both were wrong.** They came from a gRPC sweep and a DAQiri sweep run
-> back to back rather than interleaved, so the arms drifted apart thermally and the drift was
-> read as a result. The table below is from a single interleaved run. If you have quoted the
-> 12.2 us figure anywhere, correct it.
+> **This section has now been wrong twice, in opposite directions. Read the retraction
+> before quoting anything.**
+>
+> Version 1 reported a **12.2 us** gap at 4 MB plus a memory-source ladder explaining it. Both
+> came from a gRPC sweep and a DAQiri sweep run back to back rather than interleaved, so the
+> arms drifted apart thermally and the drift was read as a result.
+>
+> Version 2 reported a **2.91 us** gap at 4 MB and concluded the transform was not involved.
+> That run was interleaved, which fixed the first problem, but it was a **single rep**, so
+> there was no way to see how much a single measurement moves. It did not replicate. Its
+> DAQiri 4 MB figure (69.07) came in 6.8 us slower than the repeated run below (62.31) while
+> the gRPC figure barely moved, which inflated our apparent standing.
+>
+> The table below is 2 reps, arms interleaved within each rep, 54 runs, one build
+> (`gitsha 952b68a` stamped on every row). Raw data in `data/headline_runs.csv`.
 
-All three arms measured adjacently at each size, one thermal window:
+All three arms measured adjacently at each size, both reps in one thermal window:
 
-| KB | base | optimized | DAQiri | speedup | gap | gRPC resid | DAQiri resid |
-|---|---|---|---|---|---|---|---|
-| 16 | 16.99 | **13.18** | 11.41 | 1.29x | +1.78 | 5.66 | 4.94 |
-| 32 | 18.26 | **15.01** | 12.42 | 1.22x | +2.59 | 5.73 | 5.09 |
-| 64 | 21.62 | **17.54** | 15.47 | 1.23x | +2.06 | 5.76 | 4.91 |
-| 128 | 27.25 | **23.81** | 22.06 | 1.14x | +1.74 | 5.82 | 4.91 |
-| 256 | 27.60 | **24.27** | 20.62 | 1.14x | +3.65 | 5.81 | 4.88 |
-| 512 | 35.47 | **29.02** | 26.03 | 1.22x | +2.99 | 5.79 | 5.04 |
-| 1024 | 47.15 | **33.92** | 28.29 | 1.39x | +5.63 | 5.98 | 4.93 |
-| 2048 | 67.63 | **42.43** | 37.07 | 1.59x | +5.36 | 6.46 | 4.98 |
-| 4096 | 126.42 | **71.98** | 69.07 | **1.76x** | +2.91 | 7.12 | 4.91 |
+| KB | base | optimized | DAQiri | speedup | gap | gap % | base res | opt res | daq res |
+|---|---|---|---|---|---|---|---|---|---|
+| 16 | 17.09 | **12.78** | 11.70 | 1.34x | +1.09 | 9.3% | 8.27 | 5.46 | 5.13 |
+| 32 | 18.36 | **14.14** | 12.58 | 1.30x | +1.55 | 12.3% | 9.04 | 5.53 | 4.96 |
+| 64 | 21.71 | **17.38** | 15.56 | 1.25x | +1.82 | 11.7% | 10.02 | 5.59 | 5.02 |
+| 128 | 27.37 | **23.17** | 22.16 | 1.18x | +1.01 | 4.6% | 10.92 | 5.60 | 4.89 |
+| 256 | 27.45 | **23.78** | 20.74 | 1.15x | +3.03 | 14.6% | 13.23 | 5.63 | 4.87 |
+| 512 | 36.02 | **28.38** | 25.91 | 1.27x | +2.47 | 9.5% | 18.08 | 5.60 | 4.98 |
+| 1024 | 47.70 | **32.87** | 28.27 | 1.45x | +4.60 | 16.3% | 26.86 | 5.73 | 4.96 |
+| 2048 | 67.85 | **42.08** | 37.11 | 1.61x | +4.97 | 13.4% | 45.80 | 6.02 | 4.97 |
+| 4096 | 127.02 | **70.41** | 62.31 | **1.80x** | +8.10 | 13.0% | 81.88 | 6.65 | 4.95 |
 
-Throughput at 4 MB went from 33,055 to 57,944 MB/s. Correctness verified: top-3 spectral peaks
-identical to the CPU-copy ground truth at every size, to every printed digit.
+Paired sign tests over all 18 (size, rep) cells, all four at p = 7.6e-06:
 
-**The three corrections this run forced.**
+- optimized beats base on residual **18/18**, and on e2e **18/18**
+- DAQiri beats optimized on residual **18/18**, and on e2e **18/18**
 
-1. **The gap at 4 MB is 2.91 us (4.2%), not 12.2 us.**
-2. **The two cuFFT times are nearly identical** (64.86 vs 64.16 at 4 MB, a 0.7 us difference).
-   The memory-source ladder was a cross-run artifact. Whatever is left is not the transform.
-3. **The gRPC residual is now flat**, 5.66 rising to 7.12, matching the shape of DAQiri's 4.88
-   to 5.09. Before the fix it grew 8.11 to 81.46. The size-dependent cost is gone entirely;
-   what remains is a fixed offset.
+So the alignment fix plus `--opt-stream` is a real and large win, and DAQiri is still
+consistently ahead. Both statements are solid; neither is close to the noise.
 
-**So the remaining gap is the residual difference**, roughly 0.8 to 2.2 us, and it is launch
-and completion overhead rather than anything size-dependent. That is what the trio was aimed
-at, and `--opt-stream` recovered 0.15 to 0.39 us of it.
+**Where the remaining gap actually lives.** Because `resid = e2e - fft`, the gap decomposes
+exactly, per run: `(opt_e2e - daq_e2e) = (opt_fft - daq_fft) + (opt_resid - daq_resid)`.
+Differencing inside each (size, rep) cell before taking the median keeps the identity exact
+and cancels drift:
 
-**Still unexplained.** At 1024 and 2048 KB our cuFFT runs about 4 us slower than DAQiri's
-(27.94 vs 23.36, 35.97 vs 32.10) while at 4096 KB the two match. The gap is widest at exactly
-those two sizes. Nobody has explained this.
+| KB | e2e gap | cuFFT gap | residual gap | share in cuFFT |
+|---|---|---|---|---|
+| 16 | 1.09 | 0.77 | 0.32 | 71% |
+| 64 | 1.82 | 1.25 | 0.57 | 68% |
+| 256 | 3.03 | 2.27 | 0.77 | 75% |
+| 1024 | 4.60 | 3.82 | 0.77 | 83% |
+| 2048 | 4.97 | 3.92 | 1.05 | 79% |
+| 4096 | 8.10 | 6.40 | 1.70 | 79% |
+
+**This is the important result of the run, and it reverses a previous conclusion.** Version 2
+of this section said the two cuFFT times were within 0.7 us and therefore "whatever is left is
+not the transform." That is refuted. The same transform, same size, same GPU, same minutes,
+is consistently slower in the gRPC process, and the difference **grows with buffer size**:
+0.77 us at 16 KB to 6.40 us at 4 MB. Transport overhead, the part we own, is only 0.3 to 1.7 us.
+
+A cost that scales with payload size inside cuFFT is a memory bandwidth or placement symptom,
+not a launch overhead symptom. That points straight back at where the input buffer lives, which
+is the ownership problem in section 7.
+
+**Also retracted: the "1024/2048 KB anomaly" was never specific to those sizes.** Version 2
+reported our cuFFT as ~4 us slower at 1024 and 2048 KB but matching at 4096. With two reps the
+cuFFT gap is present at *every* size and rises monotonically. The apparent match at 4 MB was
+the artifact, not the mismatch.
+
+Throughput at 4 MB went from about 33,000 to 58,000 MB/s. Correctness verified: top-3 spectral
+peaks identical to the CPU-copy ground truth at every size, to every printed digit.
+
+**What survives from the earlier corrections.** The gRPC residual really is flat now: 5.46
+rising to 6.65, against DAQiri's 4.87 to 5.13. Before the alignment fix it grew 8.11 to 81.46.
+The size-dependent *transport* cost is gone. The `base` arm in the table above still shows that
+old growth (8.27 to 81.88), which is a useful control confirming the fix is what moved.
 
 ## 6. Mode flags
 
@@ -237,15 +275,20 @@ land in the good kind of memory.
   (`~/grpc-direct`, not in this repo) and would break the project rule that the gRPC API stays
   structurally intact.
 
-**Why it also stopped being worth much.** The original case for the arena was the 12.2 us gap
-and the memory-source ladder that appeared to explain it. The interleaved run killed both. Our
-cuFFT and DAQiri's cuFFT are within 0.7 us at 4 MB, so even a perfect fix to payload placement
-has well under a microsecond of headroom, not ten.
+**Why it is now the leading hypothesis again.** This paragraph previously said the arena had
+"stopped being worth much," on the grounds that our cuFFT and DAQiri's were within 0.7 us so
+payload placement had under a microsecond of headroom. That was based on the single-rep run and
+is withdrawn. The 2-rep sweep in section 5 shows the cuFFT gap is real, present at every size,
+and growing with payload: 0.77 us at 16 KB to 6.40 us at 4 MB, which is 79% of the total gap
+there. A per-byte cost inside the transform is what you would expect if the input buffer sits
+in memory the transform reads less efficiently. That is exactly what this section is about.
 
-**Status: blocked, and low value even if unblocked.** The honest framing for a writeup is that
-going from 63 us behind to about 3 us behind with a root cause explained is the result, and
-"the last microsecond is memory placement, blocked by allocator ownership across an FFI
-boundary" is a legitimate place to stop.
+**Status: blocked, but now the highest-value blocked item.** The headroom is roughly 6 us at
+4 MB rather than under one. Before investing in the Rust-side work, confirm the mechanism
+cheaply: run the same cuFFT plan over a buffer we allocate ourselves versus the loaned iceoryx2
+buffer, in one process, interleaved. If the placement theory is right the gap reproduces with
+no gRPC involved at all, and if it does not reproduce, the cause is somewhere else entirely and
+the Rust work is unnecessary. That experiment is cheap and nobody has run it.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
@@ -302,8 +345,8 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 
 | Script | What it does |
 |---|---|
-| `scripts/headline_sweep.sh` | **The headline artifact.** 9 sizes x 3 arms (base / optimized / DAQiri) x 3 reps, arms interleaved within each rep. Writes `data/headline_runs.csv`. |
-| `scripts/headline_table.py` | Turns that CSV into the scoreboard plus paired sign tests. |
+| `scripts/headline_sweep.sh` | **The headline artifact.** 9 sizes x 3 arms (base / optimized / DAQiri) x `REPS` reps (default 2), arms interleaved within each rep. Aborts if the server binary is missing, older than its source, or predates `--opt-stream`. Stamps the git SHA on every row. Writes `data/headline_runs.csv`. |
+| `scripts/headline_table.py` | Turns that CSV into the scoreboard, the cuFFT-vs-transport gap decomposition, and paired sign tests. |
 | `scripts/trio_probe.sh` | Arms cur/nl/st/af/all with a correctness pass. Interleaves if you pass `ARMS='cur all cur all cur all'`. |
 | `scripts/drop_probe.sh` | Delivery accounting: received, missing, gap events, mean run length, across paces. |
 | `scripts/check_drop_bias.py` | Local. Checks sequence **contiguity** in `data/*.csv`, not just row count. |
@@ -318,13 +361,16 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 
 Most of the original list is done. What is genuinely left:
 
-1. **Explain the 1024/2048 KB anomaly**, where our cuFFT runs ~4 us slower than DAQiri's while
-   matching at 4 MB. It is the largest unexplained item on the board and it sits exactly where
-   the gap is widest. Start by checking whether the two are picking different cuFFT plans or
-   different transform decompositions at those sizes.
-2. **Attack the residual floor.** We sit near 5.5 to 6.6 us against DAQiri's 4.9. `--opt-stream`
-   took the easy part. What is left is per-message CUDA event record/query overhead and the
-   metrics bookkeeping. Consider whether the two events per buffer are both needed.
+1. **Find out why our cuFFT is slower than DAQiri's.** This is now the whole ballgame: it is
+   79% of the remaining gap at 4 MB and it scales with payload size (section 5). The cheapest
+   decisive experiment is the placement A/B described at the end of section 7, which needs no
+   gRPC and no Rust changes. If placement is not the cause, check whether the two processes
+   pick different cuFFT plans by dumping the plan's work-area size and chosen algorithm at
+   each size in both binaries.
+2. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9, so this is
+   worth 0.3 to 1.7 us, smaller than item 1 but fully ours to fix. `--opt-stream` took the
+   easy part. What is left is per-message CUDA event record/query overhead and the metrics
+   bookkeeping. Consider whether the two events per buffer are both needed.
 3. **The small-buffer drops are benign and can be deprioritised.** See the note below.
 
 Deliberately not on this list: the arena (section 7, blocked), and E1/E3/E4 (section 6,

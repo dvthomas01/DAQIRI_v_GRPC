@@ -82,6 +82,40 @@ for kb in sizes:
         m("base", kb, "resid"), m("opt", kb, "resid"), m("daq", kb, "resid"),
         m("opt", kb, "p99"), m("daq", kb, "p99")))
 
+# ── where the remaining gap lives ────────────────────────────────────────────
+# resid is defined as e2e - fft, so per run the identity is exact:
+#     (opt_e2e - daq_e2e) = (opt_fft - daq_fft) + (opt_resid - daq_resid)
+# Differencing WITHIN a (size, rep) cell before taking the median keeps that
+# identity intact and cancels clock drift, which differencing the medians of
+# each arm separately would not do.
+#
+# This split matters because the two terms have different owners. The resid
+# term is ours: transport, threading, copy scheduling. The fft term is cuFFT
+# doing the same transform on the same GPU in two different processes, so any
+# difference there is not a transport problem at all and will not respond to
+# transport work.
+idx = {(r["arm"], r["kb"], r["rep"]): r for r in rows}
+print("\nwhere the remaining opt->daq gap lives (per-cell diffs, then median)")
+print("-" * 117)
+print(("{:<7}" + "{:>10}" * 5).format(
+    "KB", "e2e_gap", "fft_gap", "res_gap", "fft_%", "res_%"))
+for kb in sizes:
+    e2e_d, fft_d, res_d = [], [], []
+    for rep in reps:
+        o, d = idx.get(("opt", kb, rep)), idx.get(("daq", kb, rep))
+        if not o or not d:
+            continue
+        e2e_d.append(o["e2e"] - d["e2e"])
+        fft_d.append(o["fft"] - d["fft"])
+        res_d.append(o["resid"] - d["resid"])
+    if not e2e_d:
+        continue
+    e, f, s = med(e2e_d), med(fft_d), med(res_d)
+    fpct = 100.0 * f / e if e else float("nan")
+    spct = 100.0 * s / e if e else float("nan")
+    print(("{:<7}" + "{:>10.2f}" * 3 + "{:>9.0f}%" + "{:>9.0f}%").format(
+        kb, e, f, s, fpct, spct))
+
 # ── paired sign tests ────────────────────────────────────────────────────────
 def sign_test(arm_a, arm_b, key):
     """Count cells where arm_a < arm_b, pairing on (kb, rep)."""
