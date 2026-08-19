@@ -1,0 +1,34 @@
+=== Gate 1: platform capabilities ===
+
+device            : NVIDIA GB10  (sm_121)
+runtime / driver  : 13020 / 13000
+integrated        : 1   (1 = shares memory with the host)
+canMapHostMemory  : 1
+unifiedAddressing : 1
+
+-- the four attributes this design depends on --
+  CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM        1   1 = host ptr IS the device ptr
+  GPU_DIRECT_RDMA_SUPPORTED                      0   third-party DMA into DEVICE memory
+  DMA_BUF_SUPPORTED                              0   dma-buf export of DEVICE memory (deprecated)
+  HOST_ALLOC_DMA_BUF_SUPPORTED                   1   dma-buf export of PAGE-LOCKED HOST memory <- our case
+  UNIFIED_ADDRESSING                             1   one virtual address space
+
+-- context: coherence and access model --
+  INTEGRATED                                     1   
+  CAN_MAP_HOST_MEMORY                            1   
+  PAGEABLE_MEMORY_ACCESS                         1   GPU can read plain malloc
+  CONCURRENT_MANAGED_ACCESS                      1   
+  HOST_NATIVE_ATOMIC_SUPPORTED                   1   
+
+-- context: RDMA write ordering and flush --
+  GPU_DIRECT_RDMA_FLUSH_WRITES_OPTIONS           1   bitmask
+  GPU_DIRECT_RDMA_WRITES_ORDERING                100   0=none 100=owner 200=all
+
+-- what a real cudaHostAlloc buffer actually looks like --
+  host   ptr : 0x32ee00000
+  device ptr : 0x32ee00000
+  identical  : YES  (host ptr is directly usable by the GPU)
+  4 KB aligned: yes   2 MB aligned: yes
+  pointer type from the driver's view: host (device 0)
+
+=== Gate 1 completed ===

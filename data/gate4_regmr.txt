@@ -1,0 +1,24 @@
+=== Gate 4: will the NIC register CUDA-pinned host memory? ===
+
+HCA               : rocep1s0f0   (of 4 available)
+cudaHostAlloc     : 0x32ee00000  (4194304 bytes, cudaHostAllocMapped)
+device pointer    : 0x32ee00000
+same address      : YES
+
+ibv_reg_mr        : SUCCESS
+  lkey            : 0x00182ae7
+  rkey            : 0x00182ae7
+  mr->addr        : 0x32ee00000
+  mr->length      : 4194304
+  addr matches    : YES
+  length matches  : YES
+
+GPU wrote, CPU read back the same region: YES, coherent
+
+-- control: same call on cudaMalloc'd DEVICE memory --
+  REJECTED: Bad address
+  This is the expected result: Gate 1 reported
+  GPU_DIRECT_RDMA_SUPPORTED = 0, so host memory is not a
+  preference here, it is the only option.
+
+=== Gate 4 PASSES ===
