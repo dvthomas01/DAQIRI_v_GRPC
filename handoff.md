@@ -379,6 +379,117 @@ built because there is nothing it could report. Closed.
 Nobody should start Route B expecting a quick win. It is the right design, it is a real piece
 of work in a Rust library we do not own, and the payoff is about 6 us at the largest payload.
 
+## 7c. RETRACTION: memory kind is not dead, and we found the mechanism (2026-08-19)
+
+Section 7b and the earlier memory-kind ladder both concluded that where the buffer comes from
+does not matter. **That conclusion was wrong, and the reason it was wrong is worth more than
+the conclusion.** The ladder that produced it never wrote to the buffer before transforming
+it. Real pipelines always do. Once a CPU store precedes the transform, the arms separate
+immediately and stay separated.
+
+### What backs each mapping (from /proc/self/smaps, 4 MB payload)
+
+The harness now walks its own `smaps` and prints the backing of every arm, because a name is
+not evidence:
+
+```
+hostalloc  pagesize=4kB rss=6144kB anonhuge=0kB    back=/dev/zero (deleted)              vmflags: rd wr sh mr mw me ms
+heapreg    pagesize=4kB rss=4096kB anonhuge=0kB    back=anonymous                        vmflags: rd wr mr mw me ac
+shmreg     pagesize=4kB rss=4096kB anonhuge=0kB    back=/dev/shm/fft_memsrc_probe (del)  vmflags: rd wr sh mr mw me ms
+hugereg    pagesize=4kB rss=4096kB anonhuge=4096kB back=anonymous                        vmflags: rd wr mr mw me ac hg
+```
+
+Two things fall out of this immediately:
+
+1. **`cudaMallocHost` is 4 KB pages too.** It is a `MAP_SHARED` mapping of a deleted
+   `/dev/zero`, with vmflags byte-identical to our `/dev/shm` arm. DAQiri's memory and our
+   memory are the same class of object to the kernel. The page-size hypothesis is refuted at
+   the source: there is no page-size difference to explain anything.
+2. **The old huge-page arm never had huge pages.** `madvise(MADV_HUGEPAGE)` returning 0 means
+   the kernel accepted a hint, not that it promoted anything. The arm is only a real
+   huge-page arm at payloads of 2 MB or more; below that it silently duplicated `heapreg`,
+   and it had been reported as "THP" on the strength of the return code alone. The harness now
+   prints `WARNING: 'hugereg' got NO huge pages` when `AnonHugePages` is zero.
+
+`MAP_HUGETLB` is unavailable on this box regardless: `HugePages_Total: 0`, and filling the
+pool needs root. THP at 2 MB is the only huge-page mechanism reachable as `nitest`.
+
+### The result: page size is innocent, registration is guilty
+
+4 MB payload, 15 reps, 200 iterations, arms rotated so no arm keeps the same slot:
+
+| arm | how it was built | write | transform | total |
+|---|---|---|---|---|
+| `hostalloc` | `cudaHostAlloc` | **56.75** | **53.22** | **109.83** |
+| `heapreg` | `malloc` + `cudaHostRegister` | 118.66 | 63.07 | 181.87 |
+| `shmreg` | `/dev/shm` + `cudaHostRegister` | 117.49 | 64.19 | 181.57 |
+| `hugereg` | 2 MB THP + `cudaHostRegister` | 114.53 | 66.91 | 181.65 |
+
+Sign tests, paired per rep: `heapreg`, `shmreg` and `hugereg` are each **0/15** faster than
+`hostalloc`. `shmreg` slower than `hostalloc` **15/15, p = 6.104e-05**, by 10.94 us of GPU
+time.
+
+Applying the decision rule stated before the run: the huge-page arm was to indict page size if
+it matched `hostalloc` and exonerate it if it matched `shmreg`. **It matched `shmreg`**, at
+181.65 against 181.57, with `hostalloc` 72 us away. Verified 2 MB pages bought nothing.
+
+The three slow arms have nothing in common except `cudaHostRegister`. They differ in page size
+(4 KB vs 2 MB), in sharing (`MAP_PRIVATE` vs `MAP_SHARED`), and in whether they were
+pre-faulted. They land within 0.3 us of each other. The one fast arm is the one the driver
+allocated. Both paths then go through `cudaHostAllocMapped` / `cudaHostRegisterMapped` and
+`cudaHostGetDevicePointer`, so the device pointer is obtained identically and cannot be the
+difference.
+
+**Driver-allocated pinned memory beats user-allocated-then-registered memory, on both halves:
+about 2x on the CPU write and about 11 us on the GPU transform.** That the CPU write is
+affected at all is the strongest clue to the mechanism, since registration has no business
+changing CPU store speed unless it also changes the page's cacheability or coherency
+attributes. On a C2C-coherent part that is a plausible thing for `cudaHostRegister` to do.
+
+### Why this matters more than the RDMA route
+
+Our pipeline receives an iceoryx2 buffer from `/dev/shm` and must `cudaHostRegister` it.
+DAQiri calls `cudaMallocHost`. So DAQiri sits on the fast side of this effect and we sit on
+the slow side, by construction, and **10.94 us is larger than our entire remaining 8.10 us
+gap.** This is very likely the mechanism we have been hunting, and unlike Route B it does not
+require an RDMA transport that does not exist yet.
+
+It does still run into the section 7 seam, since iceoryx2 owns the allocation. But the ask
+changes shape completely: not "move the data to the GPU" but "have the transport hand us
+memory the CUDA driver allocated". Confirmed by reading `iceoryx2-bb-posix-0.7.0`:
+
+* `shared_memory.rs:185` allocates with `shm_open`, so segments are always `/dev/shm`.
+* `shared_memory.rs:588-597` hardcodes `posix::MAP_SHARED` with no flag hook.
+* `MAP_HUGETLB`, `MADV_HUGEPAGE` and `hugetlb` appear **nowhere** in `iceoryx2-0.7.0`,
+  `iceoryx2-bb-posix`, `iceoryx2-cal` or `iceoryx2-pal-configuration`. The only hits in the
+  tree are unused constants in generated bindings.
+* The configurable paths (`ICEORYX2_ROOT_PATH`, `TEMP_DIRECTORY`) are compile-time `const`s,
+  not runtime config, and they do not govern the shm segment location anyway.
+
+So there is no config line. Pointing iceoryx2 at hugetlbfs would be a patch to a crates.io
+dependency, and page size is innocent so it would buy nothing even if it worked.
+
+### What to test next, in order
+
+1. Whether the penalty is inherent to `cudaHostRegister` or to how we call it. Try
+   `cudaHostRegisterDefault` and `cudaHostRegisterPortable` against `cudaHostRegisterMapped`
+   on the same `/dev/shm` buffer. Cheap, and it is the difference between "unfixable without
+   changing iceoryx2" and "one flag".
+2. Whether registering once at startup and never again removes it. The pipeline registers per
+   slot. `--zc-bigreg` tested span granularity and was null, but that was before we knew to
+   dirty the buffer first, so it deserves a rerun under the write-then-transform discipline.
+3. Only then, whether iceoryx2 can be handed a pre-allocated `cudaHostAlloc` region. That is
+   the Rust-side change, and it should not be started until 1 and 2 are ruled out.
+
+### Method note
+
+The first version of this run had the arms in fixed order, and `hostalloc` was listed first
+and won 15/15 against all three others. A first-listed arm winning everything is what an order
+effect looks like, so the loop was changed to rotate the starting arm each iteration even
+though a comment already claimed it did. The effect survived and grew, from 7.17 us to
+10.94 us. Interleaving is not the same as rotating, and only the second one removes position
+as a hidden variable.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build

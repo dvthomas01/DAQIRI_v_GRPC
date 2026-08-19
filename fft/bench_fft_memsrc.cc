@@ -113,6 +113,64 @@ constexpr size_t kAlign = 2u * 1024 * 1024;   // 2 MB, also the THP size
 
 size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
+// ── what actually backs a mapping ────────────────────────────────────────────
+// Walks /proc/self/smaps to the entry containing `p` and reports the fields
+// that decide page size.  This exists because a name is not evidence: the
+// 'hugereg' arm calls madvise(MADV_HUGEPAGE), but madvise is a request, not a
+// guarantee, and the kernel is free to leave the region on 4 KB pages.  An
+// earlier sweep reported that arm as "THP" on the strength of madvise
+// returning 0, which proves only that the kernel accepted the hint.  If
+// AnonHugePages comes back 0 here, the arm was never a huge-page arm and any
+// null result from it says nothing about page size.
+std::string smaps_backing(const void* p) {
+    const uintptr_t want = reinterpret_cast<uintptr_t>(p);
+    std::FILE* f = std::fopen("/proc/self/smaps", "r");
+    if (!f) return "smaps unavailable";
+
+    char     line[512];
+    bool     in_range = false;
+    long     kernel_pagesize = 0, anon_huge = -1, file_pmd = -1, rss = 0;
+    std::string vmflags, backing;
+
+    while (std::fgets(line, sizeof line, f)) {
+        unsigned long lo = 0, hi = 0;
+        int           consumed = 0;
+        // A header line is: addr-addr perms offset dev inode pathname
+        if (std::sscanf(line, "%lx-%lx %*s %*s %*s %*s %n", &lo, &hi, &consumed) == 2) {
+            if (in_range) break;                 // we already passed our entry
+            in_range = (want >= lo && want < hi);
+            if (in_range) {
+                backing = (consumed > 0) ? std::string(line + consumed) : std::string();
+                while (!backing.empty() &&
+                       (backing.back() == '\n' || backing.back() == ' '))
+                    backing.pop_back();
+                if (backing.empty()) backing = "anonymous";
+            }
+            continue;
+        }
+        if (!in_range) continue;
+        long v = 0;
+        if (std::sscanf(line, "KernelPageSize: %ld kB", &v) == 1) kernel_pagesize = v;
+        else if (std::sscanf(line, "AnonHugePages: %ld kB", &v) == 1) anon_huge = v;
+        else if (std::sscanf(line, "FilePmdMapped: %ld kB", &v) == 1) file_pmd = v;
+        else if (std::sscanf(line, "Rss: %ld kB", &v) == 1)          rss = v;
+        else if (std::strncmp(line, "VmFlags:", 8) == 0) {
+            vmflags = line + 8;
+            while (!vmflags.empty() && (vmflags.back() == '\n' || vmflags.back() == ' '))
+                vmflags.pop_back();
+        }
+    }
+    std::fclose(f);
+    if (!in_range && backing.empty()) return "no smaps entry (driver-private mapping)";
+
+    char out[512];
+    std::snprintf(out, sizeof out,
+                  "pagesize=%ldkB rss=%ldkB anonhuge=%ldkB filepmd=%ldkB back=%s%s",
+                  kernel_pagesize, rss, anon_huge, file_pmd,
+                  backing.c_str(), vmflags.empty() ? "" : (" vmflags:" + vmflags).c_str());
+    return out;
+}
+
 // One memory kind under test.  `use` is what cuFFT reads; `host` is where we
 // write the signal (null for the device arm, which needs a copy instead).
 struct Arm {
@@ -487,6 +545,16 @@ int main(int argc, char** argv) {
             if (!a.usable)
                 std::printf("   EXCLUDED: arm '%s' cannot be measured here\n",
                             a.name.c_str());
+            if (a.usable)
+                std::printf("   %-10s SMAPS %s\n", a.name.c_str(),
+                            smaps_backing(a.host ? static_cast<void*>(a.host)
+                                                 : static_cast<void*>(a.use)).c_str());
+            // A huge-page arm that reports anonhuge=0 is a 4 KB arm wearing the
+            // wrong label, and its result must not be read as a page-size test.
+            if (a.name == "hugereg" &&
+                smaps_backing(a.host).find("anonhuge=0kB") != std::string::npos)
+                std::printf("   WARNING: 'hugereg' got NO huge pages; this arm does "
+                            "not test page size\n");
         }
 
         // ── correctness before timing ──────────────────────────────────────
@@ -522,10 +590,18 @@ int main(int argc, char** argv) {
             for (auto& a : arms) { a.samples.clear(); a.write_samples.clear(); }
 
             for (int it = 0; it < warmup + iters; ++it) {
-                // Rotate arms every iteration.  This is the whole point: two
-                // arms measured seconds apart are two different GPU clock
-                // states, and that has already produced one retracted number.
-                for (auto& a : arms) {
+                // Interleave at the finest grain, and ROTATE the starting arm
+                // each iteration.  Interleaving alone is not enough: with a
+                // fixed order the arm listed first always runs straight after
+                // the pace gap, and every later arm re-reads a source buffer
+                // the earlier arms just pulled into cache.  That makes
+                // position a hidden variable perfectly correlated with arm
+                // identity.  An earlier fixed-order run had the first-listed
+                // arm win 15/15 against all three others, which is exactly
+                // what an order effect looks like.  Rotating spreads every arm
+                // evenly across every slot, so position averages out.
+                for (size_t k = 0; k < arms.size(); ++k) {
+                    Arm& a = arms[(size_t(it) + k) % arms.size()];
                     if (!a.usable) continue;
 
                     // Producer write, then transform, in pipeline order.  The
