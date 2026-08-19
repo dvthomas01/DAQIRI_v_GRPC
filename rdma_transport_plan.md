@@ -60,8 +60,8 @@ Three reasons to commit to it rather than widen it:
 - It avoids cross-box clock synchronisation entirely. A networked end-to-end figure needs
 sender-side timestamps on the PXI comparable to receiver-side timestamps on the Spark,
 which is a materially larger job than the transport itself.
-- It is where the mechanism under investigation lives. The 10.94 µs allocator penalty is
-paid after the bytes land, and so is every microsecond of the remaining 8.10 µs gap.
+- It is where the mechanism under investigation lives. The 10.94 µs allocator penalty at
+4 MB is paid after the bytes land, and so is every microsecond of the remaining 8.10 µs gap.
 
 **Therefore the 8.10 µs gap is a post-arrival processing figure**, for both arms, and
 always was. It does not describe networked end-to-end latency and never did. Label it
@@ -229,8 +229,9 @@ No RDMA involved. It runs entirely inside `bench_fft_memsrc.cc`.
 
 ### Hypothesis
 
-The 10.94 µs advantage of `cudaHostAlloc` over `cudaHostRegister` is a page-attribute
-effect, most likely cacheability. The CUDA Tegra documentation notes that `cudaHostAlloc`
+The 10.94 µs advantage of `cudaHostAlloc` over `cudaHostRegister` at a 4 MB payload is a
+page-attribute effect, most likely cacheability. The CUDA Tegra documentation notes that
+`cudaHostAlloc`
 can be allocated with `cudaHostAllocWriteCombined` or the default flag, and that
 userspace mappings must match the allocation attribute or behavior is undefined. That is
 an attribute set at allocation time, which registration cannot retroactively apply.
@@ -257,8 +258,8 @@ has since been retracted.
 
 ### Decision rules
 
-- If any `cudaHostRegister` variant closes most of the 10.94 µs: we have a one-line fix,
-the ownership problem evaporates, and RDMA becomes optional rather than necessary.
+- If any `cudaHostRegister` variant closes most of the 10.94 µs at 4 MB: we have a one-line
+fix, the ownership problem evaporates, and RDMA becomes optional rather than necessary.
 Report it and re-scope.
 - If `WriteCombined` differs sharply from default: we have identified the mechanism and
 can state precisely why driver allocation wins. This answers the open question sent to

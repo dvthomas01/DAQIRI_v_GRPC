@@ -79,8 +79,8 @@ system as much as the code.
    but with a fixed order the arm listed first always runs in the same slot, so position becomes
    a hidden variable perfectly correlated with arm identity. The signature is a first-listed arm
    winning every single cell. Rotate the starting arm: `arms[(it + k) % arms.size()]`. Doing this
-   to the memory ladder did not erase its effect, it grew it from 7.17 to 10.94 us, but you
-   cannot know which until you check.
+   to the memory ladder did not erase its effect, it grew it from 7.17 to 10.94 us at 4 MB, but
+   you cannot know which until you check.
 5. **Dirty the buffer before you time a transform.** A ladder that only reads the buffer
    understates host memory badly enough to invert the conclusion. Real pipelines always write
    first. **Time the producer write and the transform together**, because a change that slows
@@ -110,8 +110,8 @@ system as much as the code.
 - *A read-only benchmark answering a question about writes.* The rebuilt memory ladder was
   interleaved, repeated and sign-tested, and it declared memory kind dead. It never wrote to the
   buffer. Adding the CPU write that every real pipeline performs separated the arms by 10.94 us
-  at p = 6.1e-05 and produced the mechanism the whole project had been looking for. The
-  read-only caveat had been written down at the time and not acted on.
+  of transform time at a 4 MB payload, p = 6.1e-05, and produced the mechanism the whole project
+  had been looking for. The read-only caveat had been written down at the time and not acted on.
 
 **A name is not evidence.** An arm labelled as a huge-page test had been reported as one on the
 strength of `madvise(MADV_HUGEPAGE)` returning 0. That return value means the kernel accepted a
@@ -176,7 +176,7 @@ performance without giving up the gRPC API", which was the original project goal
 | `scripts/memsrc_table.py` | Parses its CSV, prints write / transform / total tables plus paired sign tests |
 | `scripts/gate1_caps.cu` | GPU capability probe (Gate 1) |
 | `scripts/gate4_regmr.cu` | `ibv_reg_mr` over a `cudaHostAlloc` buffer, with the device-memory control (Gate 4) |
-| `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us result |
+| `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 
 ## 4. How we found the problem (the reasoning that mattered)
@@ -533,7 +533,8 @@ pool needs root. THP at 2 MB is the only huge-page mechanism reachable as `nites
 
 Sign tests, paired per rep: `heapreg`, `shmreg` and `hugereg` are each **0/15** faster than
 `hostalloc`. `shmreg` slower than `hostalloc` **15/15, p = 6.104e-05**, by 10.94 us of GPU
-time.
+time at this 4 MB payload. Section 7e later shows this penalty is size-dependent and does not
+exist below about 1 MB, so the figure travels with its size or not at all.
 
 Applying the decision rule stated before the run: the huge-page arm was to indict page size if
 it matched `hostalloc` and exonerate it if it matched `shmreg`. **It matched `shmreg`**, at
@@ -547,7 +548,8 @@ allocated. Both paths then go through `cudaHostAllocMapped` / `cudaHostRegisterM
 difference.
 
 **Driver-allocated pinned memory beats user-allocated-then-registered memory, on both halves:
-about 2x on the CPU write and about 11 us on the GPU transform.** That the CPU write is
+about 2x on the CPU write and about 11 us on the GPU transform, both at 4 MB.** That the CPU
+write is
 affected at all is the strongest clue to the mechanism, since registration has no business
 changing CPU store speed unless it also changes the page's cacheability or coherency
 attributes. On a C2C-coherent part that is a plausible thing for `cudaHostRegister` to do.
@@ -556,7 +558,8 @@ attributes. On a C2C-coherent part that is a plausible thing for `cudaHostRegist
 
 Our pipeline receives an iceoryx2 buffer from `/dev/shm` and must `cudaHostRegister` it.
 DAQiri calls `cudaMallocHost`. So DAQiri sits on the fast side of this effect and we sit on
-the slow side, by construction, and **10.94 us is larger than our entire remaining 8.10 us
+the slow side, by construction, and **10.94 us at 4 MB is larger than our entire remaining
+8.10 us
 gap.** This is very likely the mechanism we have been hunting, and unlike Route B it does not
 require an RDMA transport that does not exist yet.
 
@@ -595,7 +598,8 @@ The first version of this run had the arms in fixed order, and `hostalloc` was l
 and won 15/15 against all three others. A first-listed arm winning everything is what an order
 effect looks like, so the loop was changed to rotate the starting arm each iteration even
 though a comment already claimed it did. The effect survived and grew, from 7.17 us to
-10.94 us. Interleaving is not the same as rotating, and only the second one removes position
+10.94 us, both at 4 MB. Interleaving is not the same as rotating, and only the second one
+removes position
 as a hidden variable.
 
 ## 7d. RoCE straight into `cudaHostAlloc` memory: the four pre-flight gates (2026-08-19)
@@ -612,7 +616,8 @@ rather than device memory, because on this chip host memory is what the GPU read
 This is DAQiri's architecture. DAQiri already does RoCE into `cudaMallocHost` buffers. The
 claim is not a faster path, it is "DAQiri performance without giving up the gRPC API", which
 was the original project goal. The reason to expect it to work is 7c: `cudaHostAlloc` beats
-`cudaHostRegister` by 10.94 us of transform time, which is larger than the remaining 8.10 us
+`cudaHostRegister` by 10.94 us of transform time at a 4 MB payload, which is larger than the
+remaining 8.10 us
 gap to DAQiri. Today iceoryx2 allocates the buffers with `shm_open` and we register them after
 the fact. Owning the allocation is the point.
 
@@ -681,9 +686,9 @@ percentile of 2.20 us. That is a clean fabric, not a marginal one.
 transport is running at about 98% of line rate and there is essentially nothing left to win in
 the wire. Every microsecond still on the table is in what happens after the bytes land. That is
 precisely what the `cudaHostAlloc` design changes, and it is why the 10.94 us registration
-penalty from 7c is worth chasing even though it is small next to a 695 us transfer: DAQiri pays
-the same 695 us, so the comparison stays honest and the 10.94 us is the part we actually
-control.
+penalty from 7c, measured at a 4 MB payload, is worth chasing even though it is small next to a
+695 us transfer for the same 4 MB: DAQiri pays the same 695 us, so the comparison stays honest
+and the 10.94 us is the part we actually control.
 
 ### RESUME STEP: the PXI RoCE address does not survive a reboot
 
@@ -957,7 +962,7 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 | `scripts/e34_probe.sh` | Arms e2/e3/e4/e34 plus a correctness pass. |
 | `scripts/verify_e2.sh` | Spectral correctness: copy vs realign vs in-place. |
 | `scripts/decompose_4mb.py` | Local. Reads `data/*.csv`, prints the residual decomposition. |
-| `fft/bench_fft_memsrc.cc` | The memory placement ladder, and the harness behind the 10.94 us result. No gRPC, no DAQiri, no network. Build target `bench_fft_memsrc`. |
+| `fft/bench_fft_memsrc.cc` | The memory placement ladder, and the harness behind the 10.94 us at 4 MB result. No gRPC, no DAQiri, no network. Build target `bench_fft_memsrc`. |
 | `scripts/memsrc_table.py` | Local. Turns its CSV into write / transform / total tables, paired sign tests, and a `shmreg` versus `hostalloc` head-to-head. |
 | `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA gates. Self-contained, run on the Spark, print their own verdicts. |
 | `scripts/grpc_sweep.sh`, `scripts/roce_sweep.sh` | Older single-transport sweeps. **Not interleaved with each other.** Use `headline_sweep.sh` for any gRPC-vs-DAQiri claim. |
@@ -965,9 +970,10 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 ## 10. What to do next
 
 The question that used to head this list, "why is our cuFFT slower than DAQiri's", is answered.
-It is not cuFFT. It is the buffer cuFFT is reading: driver-allocated memory transforms 10.94 us
-faster than memory we allocate and register ourselves, which is more than the entire remaining
-gap. Section 7c. Everything below follows from that.
+It is not cuFFT. It is the buffer cuFFT is reading: at a 4 MB payload, driver-allocated memory
+transforms 10.94 us faster than memory we allocate and register ourselves, which is more than
+the entire remaining gap. The penalty shrinks with payload size and vanishes below about 1 MB,
+so the size is part of the claim. Sections 7c and 7e. Everything below follows from that.
 
 **Do these in order. The first two are cheap and could make the third unnecessary.**
 
