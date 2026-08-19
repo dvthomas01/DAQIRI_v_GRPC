@@ -182,6 +182,7 @@ struct Arm {
     bool        registered = false;
     bool        is_mmap    = false;
     bool        is_device  = false;
+    bool        is_hostalloc = false;  // release with cudaFreeHost
     int         shm_fd     = -1;
     std::string note;             // how it was actually built, if degraded
     std::vector<float> samples;        // transform time, GPU us
@@ -224,16 +225,114 @@ bool host_can_store(void* p) {
     return ok;
 }
 
-// Register a host span and resolve its device pointer.  Alignment is already
-// guaranteed by the caller; span granularity was tested separately (--zc-bigreg)
-// and made no difference, so the exact span is used here.
-void register_and_map(Arm& a, size_t bytes) {
-    CUDA_CHECK(cudaHostRegister(a.host, bytes, cudaHostRegisterMapped));
-    a.registered = true;
-    void* dev = nullptr;
-    CUDA_CHECK(cudaHostGetDevicePointer(&dev, a.host, 0));
-    a.use = static_cast<float*>(dev);
+// Append to an arm's note without losing what is already there.  Several of
+// the Phase 1 arms can pick up two remarks (a fallback and an exclusion), and
+// an overwritten note would misreport how the arm was actually built.
+void add_note(Arm& a, const std::string& s) {
+    if (!a.note.empty()) a.note += "; ";
+    a.note += s;
 }
+
+// Register a host span and resolve its device pointer.
+//
+// `flags` is the variable under test in the Phase 1 ladder, so it is a
+// parameter rather than the constant it used to be.  Registration can fail for
+// a legitimate reason (this driver rejects cudaHostRegisterReadOnly outright),
+// and one unsupported flag must not cost the whole sweep, so a failure marks
+// the arm unusable instead of aborting.
+//
+// `reg_bytes` allows registering a span larger than the payload.  That is the
+// page-rounded registration --zc-bigreg tested on the server, re-run here under
+// write-then-transform discipline, because its original null came from the
+// read-only ladder that has since been retracted.
+bool register_and_map(Arm& a, size_t bytes, unsigned flags, size_t reg_bytes = 0) {
+    if (reg_bytes == 0) reg_bytes = bytes;
+    const cudaError_t rc = cudaHostRegister(a.host, reg_bytes, flags);
+    if (rc != cudaSuccess) {
+        cudaGetLastError();            // clear the sticky error
+        a.usable = false;
+        a.use    = a.host;
+        add_note(a, std::string("EXCLUDED: cudaHostRegister rejected: ")
+                    + cudaGetErrorString(rc));
+        return true;                   // built, but excluded from measurement
+    }
+    a.registered = true;
+
+    // Without cudaHostRegisterMapped there is no mapped device pointer to ask
+    // for.  That is not fatal here: gate 1 showed cudaHostGetDevicePointer
+    // returning the same address cudaHostAlloc did, so unified addressing makes
+    // the host pointer device-usable on this part.  Fall back to it and record
+    // that we did, because an unrecorded fallback would quietly turn a
+    // flag-comparison arm into a different experiment.
+    void* dev = nullptr;
+    if (cudaHostGetDevicePointer(&dev, a.host, 0) == cudaSuccess && dev) {
+        a.use = static_cast<float*>(dev);
+    } else {
+        cudaGetLastError();
+        a.use = a.host;
+        add_note(a, "no mapped devptr, using host ptr (unified addressing)");
+    }
+    return true;
+}
+
+// Build a /dev/shm mapping, the same class of object iceoryx2 hands the server
+// (its segments show up as /dev/shm/iox2_*).  Split out of the shmreg arm
+// because every Phase 1 registration arm needs a byte-identical mapping and
+// must differ ONLY in the flag passed to cudaHostRegister.  Sharing the
+// construction is what makes that a controlled comparison rather than four
+// separate experiments.  Each arm gets its own segment name so arms measured in
+// the same run cannot collide over one.
+bool map_shm(Arm& a, size_t slack, const std::string& tag) {
+    const std::string nm = "/fft_memsrc_" + tag;
+    shm_unlink(nm.c_str());
+    int fd = shm_open(nm.c_str(), O_CREAT | O_RDWR | O_EXCL, 0600);
+    if (fd < 0) return false;
+    if (ftruncate(fd, static_cast<off_t>(slack)) != 0) {
+        close(fd); shm_unlink(nm.c_str()); return false;
+    }
+    void* h = mmap(nullptr, slack, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
+    shm_unlink(nm.c_str());   // unlink now; the mapping keeps it alive
+    if (h == MAP_FAILED) { close(fd); return false; }
+    a.shm_fd    = fd;
+    a.raw       = h;
+    a.raw_bytes = slack;
+    a.is_mmap   = true;
+    a.host = reinterpret_cast<float*>(
+        align_up(reinterpret_cast<uintptr_t>(h), kAlign));
+    return true;
+}
+
+// ── Phase 1: the allocator and registration flag ladder ────────────────────
+// 7c established that driver-allocated pinned memory beats
+// user-allocated-then-registered memory by 10.94 us of transform time at 4 MB,
+// on both halves, which is more than the entire remaining gap to DAQiri.  It
+// did not establish WHY, and the leading guess is that allocation-time page
+// attributes (cacheability) differ from anything registration can retroactively
+// apply.  These arms hold the mapping constant and vary only the flag.
+//
+// The stake is the scope of the whole project: if some cudaHostRegister flag
+// closes the gap, the fix is one line and the RDMA transport becomes optional.
+// If none does, the penalty is inherent to registration, owning the allocation
+// is the only way out, and the transport work proceeds with a real
+// justification instead of an assumed one.
+struct FlagArm { const char* name; unsigned flags; const char* what; };
+
+const FlagArm kAllocArms[] = {
+    {"ha_def",   cudaHostAllocDefault,
+     "cudaHostAlloc Default"},
+    {"ha_wc",    cudaHostAllocWriteCombined,
+     "cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)"},
+    {"ha_wcmap", cudaHostAllocMapped | cudaHostAllocWriteCombined,
+     "cudaHostAlloc Mapped|WriteCombined"},
+};
+
+const FlagArm kRegisterArms[] = {
+    {"shmreg_def",  cudaHostRegisterDefault,  "cudaHostRegister Default"},
+    {"shmreg_port", cudaHostRegisterPortable, "cudaHostRegister Portable"},
+    {"shmreg_ro",   cudaHostRegisterMapped | cudaHostRegisterReadOnly,
+     "cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so "
+     "read-only input is legal here)"},
+};
 
 bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
     a.name = kind;
@@ -319,11 +418,43 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
         CUDA_CHECK(cudaHostAlloc(&h, slack, cudaHostAllocMapped));
         a.raw = h;
         a.raw_bytes = slack;
+        a.is_hostalloc = true;
         a.host = reinterpret_cast<float*>(
             align_up(reinterpret_cast<uintptr_t>(h), kAlign));
         void* dev = nullptr;
         CUDA_CHECK(cudaHostGetDevicePointer(&dev, a.host, 0));
         a.use = static_cast<float*>(dev);   // already mapped by cudaHostAlloc
+        return true;
+    }
+
+    // Allocation-side flag arms.  Identical to `hostalloc` except for the flag,
+    // which is the point: `hostalloc` is the Mapped case and stays under its
+    // original name so the 15-rep result in 7c remains directly comparable.
+    for (const FlagArm& f : kAllocArms) {
+        if (kind != f.name) continue;
+        void* h = nullptr;
+        const cudaError_t rc = cudaHostAlloc(&h, slack, f.flags);
+        if (rc != cudaSuccess) {
+            cudaGetLastError();
+            a.usable = false;
+            add_note(a, std::string("EXCLUDED: cudaHostAlloc rejected: ")
+                        + cudaGetErrorString(rc));
+            return true;
+        }
+        a.raw = h;
+        a.raw_bytes = slack;
+        a.is_hostalloc = true;
+        a.host = reinterpret_cast<float*>(
+            align_up(reinterpret_cast<uintptr_t>(h), kAlign));
+        add_note(a, f.what);
+        void* dev = nullptr;
+        if (cudaHostGetDevicePointer(&dev, a.host, 0) == cudaSuccess && dev) {
+            a.use = static_cast<float*>(dev);
+        } else {
+            cudaGetLastError();
+            a.use = a.host;
+            add_note(a, "no mapped devptr, using host ptr (unified addressing)");
+        }
         return true;
     }
 
@@ -334,8 +465,7 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
         a.raw_bytes = slack;
         a.host = reinterpret_cast<float*>(
             align_up(reinterpret_cast<uintptr_t>(h), kAlign));
-        register_and_map(a, bytes);
-        return true;
+        return register_and_map(a, bytes, cudaHostRegisterMapped);
     }
 
     if (kind == "shmreg") {
@@ -343,22 +473,29 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
         // of object iceoryx2 hands the server (its segments show up as
         // /dev/shm/iox2_*).  This is the arm that stands in for the loaned
         // buffer we cannot obtain directly.
-        const char* nm = "/fft_memsrc_probe";
-        shm_unlink(nm);
-        int fd = shm_open(nm, O_CREAT | O_RDWR | O_EXCL, 0600);
-        if (fd < 0) return false;
-        if (ftruncate(fd, static_cast<off_t>(slack)) != 0) { close(fd); shm_unlink(nm); return false; }
-        void* h = mmap(nullptr, slack, PROT_READ | PROT_WRITE, MAP_SHARED, fd, 0);
-        shm_unlink(nm);   // unlink now; the mapping keeps it alive
-        if (h == MAP_FAILED) { close(fd); return false; }
-        a.shm_fd = fd;
-        a.raw = h;
-        a.raw_bytes = slack;
-        a.is_mmap = true;
-        a.host = reinterpret_cast<float*>(
-            align_up(reinterpret_cast<uintptr_t>(h), kAlign));
-        register_and_map(a, bytes);
-        return true;
+        if (!map_shm(a, slack, kind)) return false;
+        return register_and_map(a, bytes, cudaHostRegisterMapped);
+    }
+
+    // Registration-side flag arms, on a byte-identical /dev/shm mapping.
+    for (const FlagArm& f : kRegisterArms) {
+        if (kind != f.name) continue;
+        if (!map_shm(a, slack, kind)) return false;
+        add_note(a, f.what);
+        return register_and_map(a, bytes, f.flags);
+    }
+
+    if (kind == "shmreg_big") {
+        // Page-rounded registration: register a 2 MB-aligned span instead of the
+        // exact payload.  This is --zc-bigreg's hypothesis (that registration
+        // granularity, not memory kind, is what costs us) re-tested under
+        // write-then-transform discipline.  Its original null result predates
+        // the discovery that a read-only ladder cannot answer this question.
+        const size_t reg_bytes = align_up(bytes, kAlign);
+        if (!map_shm(a, reg_bytes + kAlign, kind)) return false;
+        add_note(a, "registration span rounded up to " +
+                    std::to_string(reg_bytes / (1024 * 1024)) + " MB");
+        return register_and_map(a, bytes, cudaHostRegisterMapped, reg_bytes);
     }
 
     if (kind == "hugereg") {
@@ -389,8 +526,7 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
         // them; registering a region of untouched pages would measure the
         // fault path instead of the transform.
         std::memset(a.host, 0, bytes);
-        register_and_map(a, bytes);
-        return true;
+        return register_and_map(a, bytes, cudaHostRegisterMapped);
     }
 
     return false;
@@ -398,9 +534,9 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
 
 void destroy_arm(Arm& a) {
     if (a.registered && a.host) cudaHostUnregister(a.host);
-    if (a.is_device && a.raw)   cudaFree(a.raw);
-    else if (a.is_mmap && a.raw) munmap(a.raw, a.raw_bytes);
-    else if (a.raw && a.name == "hostalloc") cudaFreeHost(a.raw);
+    if (a.is_device && a.raw)     cudaFree(a.raw);
+    else if (a.is_mmap && a.raw)  munmap(a.raw, a.raw_bytes);
+    else if (a.is_hostalloc && a.raw) cudaFreeHost(a.raw);
     else if (a.raw) std::free(a.raw);
     if (a.shm_fd >= 0) close(a.shm_fd);
     a.raw = nullptr; a.host = nullptr; a.use = nullptr; a.registered = false;
@@ -555,6 +691,21 @@ int main(int argc, char** argv) {
                 smaps_backing(a.host).find("anonhuge=0kB") != std::string::npos)
                 std::printf("   WARNING: 'hugereg' got NO huge pages; this arm does "
                             "not test page size\n");
+        }
+
+        // ── usability probe, before correctness ───────────────────────────
+        // A registration arm built without cudaHostRegisterMapped falls back to
+        // the host pointer, and cuFFT may refuse it.  Probe once with the
+        // non-throwing form so one unsupported flag drops its own arm instead
+        // of aborting a sweep that the other arms would have answered.
+        for (auto& a : arms) {
+            if (!a.usable) continue;
+            if (!exec.try_execute(a.use, d_out)) {
+                a.usable = false;
+                add_note(a, "EXCLUDED: cuFFT rejected this pointer");
+                std::printf("   EXCLUDED: arm '%s' -> cuFFT rejected its pointer\n",
+                            a.name.c_str());
+            }
         }
 
         // ── correctness before timing ──────────────────────────────────────
