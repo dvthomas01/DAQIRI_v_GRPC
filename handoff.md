@@ -232,6 +232,26 @@ never necessary. It cost ~77 us at 4 MB.
 > The table below is 2 reps, arms interleaved within each rep, 54 runs, one build
 > (`gitsha 952b68a` stamped on every row). Raw data in `data/headline_runs.csv`.
 
+**What these numbers measure, corrected 2026-08-19.** This is **post-arrival processing
+latency**, not end-to-end networked latency. Every arm's clock starts after the buffer has
+landed and stops after the FFT: DAQiri takes `t_rx` once the RECEIVE completion is
+dequeued and documents the column as "received-buffer-in-hand -> post-FFT (RX-side wall
+clock)", and the gRPC server takes `t_recv` on handler entry. Time in flight is outside
+the window for both.
+
+**The DAQiri arm is a single-process, single-device RC loopback**, not a networked run.
+`bench_daqiri_roce_pipeline.cc` hardcodes `SERVER_ADDR` and `CLIENT_ADDR` both to
+`192.168.20.1`, the Spark's own RoCE IP, so TX and RX are two threads in one process on
+one NIC and the PXI is not involved. Two independent checks confirm it: at 50 Gb/s the
+wire time alone for 4 MB is 671 us against a reported 62.31, and Gate 3 measured a real
+PXI-to-Spark 4 MB write at 694.76 us. From 256 KB upward the reported e2e is below the
+theoretical wire time, which is only possible if no wire was crossed.
+
+None of the numbers change. The gap is real and the arms are comparable to each other,
+because both producers are local and both windows are identical. Only the label was
+wrong. Quote it as post-arrival processing latency and name the DAQiri arm as loopback.
+See `rdma_transport_plan.md` section 3.
+
 All three arms measured adjacently at each size, both reps in one thermal window:
 
 | KB | base | optimized | DAQiri | speedup | gap | gap % | base res | opt res | daq res |
