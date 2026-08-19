@@ -1,0 +1,28 @@
+=== Phase 2: RDMA straight into cudaHostAlloc memory ===
+mode              : *** BROKEN ORDERING (this run is SUPPOSED to fail) ***
+sizes (KB)        : 16,256,4096
+messages per size : 20
+HCA               : rocep1s0f0
+port 1           : ACTIVE, active_mtu=5, gid[3]=0000:0000:0000:0000:0000:ffff:c0a8:1401
+pool              : 4 slots x 4096 KB = 16 MB at 0x32ee00000
+ibv_reg_mr        : lkey=0x00182eeb rkey=0x00182eeb
+host == device VA : yes (C2C coherent, translation is an identity here)
+startup complete  : 1 alloc, 1 reg_mr, 4 translate; counters now frozen
+
+waiting for the sender on TCP :18515 ...
+queue pair        : RTS (local qpn=406 -> remote qpn=77)
+
+ size KB   messages   verified     failed   worst peak seen
+--------------------------------------------------------------------------
+      16         20          1         19   399902 Hz, expected 10000
+     256         20          0         20   399994 Hz, expected 10000
+    4096         20          0         20   400000 Hz, expected 10000
+
+verified          : 1
+verification fails: 59
+completion errors : 0
+timeouts          : 0
+pool operations   : 1 alloc, 1 reg_mr, 4 translate (unchanged since startup: YES)
+
+BROKEN-ORDERING TEST PASSED: the verification noticed. It is sensitive to the race.
+DONE_RDMA_FFT rc=0

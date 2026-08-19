@@ -3,7 +3,8 @@
 Status: Phase 0 complete, all four gates passed. Phase 0.5 complete, DAQiri confirmed
 local and the headline table relabelled. Measurement window committed to post-arrival.
 Phase 1 complete and negative: no flag closes any part of the gap, so Phase 2 is justified
-and proceeds.
+and proceeds. Phase 2 complete and passing: 31,800 verified messages, the broken-ordering
+control fails as required, nothing on the hot path. Next is Phase 3.
 
 ---
 
@@ -274,7 +275,30 @@ Delivered: `data/memsrc_flags.csv`, `data/memsrc_flags_run.log`, `handoff.md` se
 
 ---
 
-## 5. Phase 2: minimal RDMA data path
+## 5. Phase 2: minimal RDMA data path — COMPLETE, PASSING
+
+Built as `rdma/rdma_fft_server.cu` (Spark) and `rdma/rdma_fft_client.cc` (PXI), sharing
+`rdma/rdma_contract.h`. Full writeup in `handoff.md` section 7f. Against the checks below:
+
+- Spectral verification at **all nine sizes**, not just the three listed, because Phase 1
+found the allocator penalty is size-dependent and a small-payload difference should show up
+in the correctness test rather than in Phase 4. 200 messages each, 1800/1800 verified.
+- **Broken ordering fails, as it must.** 59 of 60 messages wrong, reporting the 400 kHz
+poison tone. The checker is sensitive to the race. One 16 KB message in twenty passed even
+with the ordering broken, so the test's own sensitivity is size-dependent and needs enough
+messages at the smallest payload; that is recorded in 7f.
+- **30,000 messages** at 16, 256 and 4096 KB: zero verification failures, zero completion
+queue errors, zero timeouts.
+- **Nothing on the hot path, asserted.** 1 alloc, 1 reg_mr, 4 translate at startup and the
+same at the end. Calls after startup abort at the call site; a per-message assertion catches
+anything that bypassed the wrappers.
+
+One deviation from the plan text below: raw verbs with a TCP side channel rather than
+`rdma_cm`. Reason: that is the path perftest takes, and perftest is the only RDMA traffic
+ever demonstrated between these two boxes, so a failure is our bug rather than an unexplored
+interaction with `rdma_cm` on an NI Linux RT kernel.
+
+The original plan text follows unchanged.
 
 No gRPC. No iceoryx2. No protobuf. The smallest program that proves the architecture.
 

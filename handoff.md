@@ -30,7 +30,11 @@ the gap. The cheap escape route is closed, so owning the allocation is the only 
 **Current work: give gRPC-Direct DAQiri's actual transport.** A RoCE RDMA write from the PXI
 landing directly in a `cudaHostAlloc`'d receive buffer that cuFFT reads in place. All four
 pre-flight gates passed on 2026-08-19; section 7d has the results and the reproduction steps.
-Phase 1 is done and negative, so Phase 2 builds the minimal data path.
+**Phase 2 is built and passing:** 31,800 messages from the PXI across payloads from 16 KB to
+4 MB, every one spectrally verified, zero completion errors, and nothing allocated or registered
+after startup. The deliberately-broken-ordering control fails as it must, so the checker is
+known to be sensitive to the race rather than merely green. Section 7f. Next is Phase 3,
+integration into the transport.
 
 **If you read only one more thing, read section 1.** Four of this project's headline numbers
 turned out to be measurement artifacts rather than results, and all four were caught late.
@@ -176,6 +180,10 @@ performance without giving up the gRPC API", which was the original project goal
 | `scripts/memsrc_table.py` | Parses its CSV, prints write / transform / total tables plus paired sign tests |
 | `scripts/gate1_caps.cu` | GPU capability probe (Gate 1) |
 | `scripts/gate4_regmr.cu` | `ibv_reg_mr` over a `cudaHostAlloc` buffer, with the device-memory control (Gate 4) |
+| `rdma/rdma_fft_server.cu` | Phase 2 receiver. Spark side: the pool, the ordering rule, the hot-path assertions, and `--break-ordering`. Build target `rdma_fft_server`. |
+| `rdma/rdma_fft_client.cc` | Phase 2 sender. Builds on the PXI with `g++ ... -libverbs`, no CUDA. |
+| `rdma/rdma_contract.h` | The sequence-number-to-tone mapping both sides must agree on. One definition on purpose. |
+| `data/p2_break.log`, `data/p2_correct.log`, `data/p2_soak.log` | Phase 2 raw output, including the run that is supposed to fail |
 | `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 
@@ -873,6 +881,87 @@ The same script now prints sign tests per size before pooling them, and on the t
 than the transform. Pooling is only valid where the effect exists at every size, and the
 transform penalty does not exist below 1 MB, so pooling it diluted a real 15 us effect at 4 MB
 against eight sizes with nothing to find.
+
+## 7f. Phase 2: the RDMA data path works, and the checker was validated first (2026-08-19)
+
+The smallest program that exercises the architecture end to end. The PXI RDMA-writes into a
+`cudaHostAlloc`'d pool on the Spark and cuFFT transforms those bytes in place. No gRPC, no
+iceoryx2, no protobuf. `rdma/rdma_fft_server.cu` on the Spark, `rdma/rdma_fft_client.cc` on the
+PXI, contract shared through `rdma/rdma_contract.h`.
+
+This is the first time in this project that a measured pipeline has actually crossed the cable.
+Section 5 explains why that sentence needed writing.
+
+### The broken-ordering test ran first, and it had to
+
+A verification that always passes is indistinguishable from a verification that cannot see what
+it claims to check. So before trusting any green run, `--break-ordering` deliberately launches
+cuFFT *before* observing the completion, while the RDMA write is still in flight:
+
+| size | messages | verified | failed | worst peak seen |
+|---|---|---|---|---|
+| 16 KB | 20 | 1 | 19 | 399902 Hz, expected 10000 |
+| 256 KB | 20 | 0 | 20 | 399994 Hz, expected 10000 |
+| 4096 KB | 20 | 0 | 20 | 400000 Hz, expected 10000 |
+
+59 of 60 failed and the observed peak is the 400 kHz poison tone, so the diagnosis is
+"the transform read the slot before the data landed" rather than a vaguely wrong number.
+**The checker is sensitive to the race. Only now do the passing runs mean anything.**
+
+Two design choices are what make this test capable of failing at all, and both are easy to
+leave out:
+
+* **The payload changes every message.** The tone is a function of the sequence number. With a
+  fixed payload, reading the previous message's leftover bytes would verify clean and the race
+  would be invisible.
+* **The slot is poisoned before every message,** with a real tone at a frequency no payload
+  uses. Without poison the first test above is only checking for stale data, not for absent
+  data.
+
+**One result in that table is a warning, not a footnote.** At 16 KB, one message in twenty
+verified clean *with the ordering deliberately broken*, because a 16 KB write can land inside
+the launch window. The sensitivity of this test is itself size-dependent, and a single-message
+version of it at a small payload would have reported all-clear on a program with the race fully
+present. Anyone re-running it needs enough messages at the smallest size to make that
+vanishingly unlikely; 20 was sufficient, 1 would not have been.
+
+### The correct-ordering run
+
+The rule the program is built around: **the thread that observes the completion is the thread
+that launches cuFFT, and the launch follows the observation.** One thread, two adjacent
+statements, commented, so that any future edit separating them shows up in a diff.
+
+| run | sizes | messages | verified | failed | CQ errors | timeouts |
+|---|---|---|---|---|---|---|
+| sweep | 16 KB to 4 MB, all nine | 200 each | **1800** | 0 | 0 | 0 |
+| soak | 16, 256, 4096 KB | 10000 each | **30000** | 0 | 0 | 0 |
+
+The sweep covers the full ladder rather than only 4 MB, because 7e found the allocator penalty
+is size-dependent. If the RDMA path behaved differently at small payloads we wanted it in the
+correctness test rather than as a surprise in Phase 4.
+
+### Nothing on the hot path, asserted rather than intended
+
+`1 alloc, 1 reg_mr, 4 translate` at startup, and the same three numbers at the end of all
+31,800 messages. This is enforced, not hoped for: after startup the counters freeze, any
+`cudaHostAlloc`, `ibv_reg_mr` or `cudaHostGetDevicePointer` call after that point aborts at the
+call site, and a per-message assertion re-checks the totals in case something bypassed the
+wrappers. Per-message registration is the single easiest way to build a transport slower than
+the one we already have.
+
+Also confirmed at runtime: `host == device VA`, so the cached translation is an identity on this
+part. It is still cached rather than assumed, because that is a GB10 property and not a
+portable one.
+
+### What this does not show
+
+It is a lockstep correctness harness, one message in flight, with a TCP credit between messages.
+**Do not quote any timing from it.** The determinism is what makes the ordering test meaningful,
+and it is the opposite of what a latency benchmark wants.
+
+The ordering test also demonstrates sensitivity to data that is absent, which is the loud form
+of the race. A subtly partial arrival, where most of the buffer is correct and a tail is not, is
+harder to force deliberately and is not separately proven here.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 

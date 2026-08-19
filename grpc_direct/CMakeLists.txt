@@ -120,6 +120,12 @@ find_package(CUDAToolkit REQUIRED)
 add_subdirectory("${DAQIRI_GPU_ROOT}/common" common)
 add_subdirectory("${DAQIRI_GPU_ROOT}/fft"    fft)
 
+# Phase 2 of the RDMA plan: the minimal RoCE data path straight into
+# cudaHostAlloc'd receive buffers.  It lives in this build tree rather than the
+# top-level one because this is the tree that is actually configured and built
+# on the Spark (build_grpc/), and a target nobody builds is a target that rots.
+add_subdirectory("${DAQIRI_GPU_ROOT}/rdma"   rdma)
+
 # =============================================================================
 # Proto codegen — uses absolute paths to pre-built tools (no cmake targets)
 # =============================================================================

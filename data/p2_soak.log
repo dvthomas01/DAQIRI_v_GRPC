@@ -1,0 +1,28 @@
+=== Phase 2: RDMA straight into cudaHostAlloc memory ===
+mode              : correct ordering
+sizes (KB)        : 16,256,4096
+messages per size : 10000
+HCA               : rocep1s0f0
+port 1           : ACTIVE, active_mtu=5, gid[3]=0000:0000:0000:0000:0000:ffff:c0a8:1401
+pool              : 4 slots x 4096 KB = 16 MB at 0x32ee00000
+ibv_reg_mr        : lkey=0x00182eeb rkey=0x00182eeb
+host == device VA : yes (C2C coherent, translation is an identity here)
+startup complete  : 1 alloc, 1 reg_mr, 4 translate; counters now frozen
+
+waiting for the sender on TCP :18515 ...
+queue pair        : RTS (local qpn=408 -> remote qpn=79)
+
+ size KB   messages   verified     failed   worst peak seen
+--------------------------------------------------------------------------
+      16      10000      10000          0   -
+     256      10000      10000          0   -
+    4096      10000      10000          0   -
+
+verified          : 30000
+verification fails: 0
+completion errors : 0
+timeouts          : 0
+pool operations   : 1 alloc, 1 reg_mr, 4 translate (unchanged since startup: YES)
+
+ALL SIZES VERIFIED
+DONE_RDMA_FFT rc=0
