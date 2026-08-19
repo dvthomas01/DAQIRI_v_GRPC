@@ -1,0 +1,83 @@
+Gate 3: RoCE end to end, PXIe-8881 -> DGX Spark
+================================================
+Date        : 2026-08-19
+Client      : NI-PXIe-8881-31F6D74, rocep117s0, 192.168.20.2, GID index 5 (RoCE v2 / IPv4)
+Server      : spark-ac69,           rocep1s0f0,  192.168.20.1, GID index 3 (RoCE v2 / IPv4)
+Link        : 50000 Mb/s, Ethernet, through a switch (not a direct cable)
+perftest    : built from source on the PXI into /home/admin/perftest, nothing installed
+              system-wide. PCIe relax order: OFF (detected, not stubbed).
+
+Direction matches the real design: the PXI is the client and does the RDMA write, the
+Spark is the server and receives it.
+
+Measured twice on purpose. The PXI came up with netdev MTU 1500, giving RoCE active_mtu
+1024, while the Spark sat at netdev 9000 / active_mtu 4096. A queue pair silently
+negotiates the minimum. Rather than fix that and measure once, the baseline was recorded
+first so the MTU effect is attributable on its own.
+
+
+BEFORE: PXI netdev MTU 1500, both ends negotiate active_mtu 1024
+----------------------------------------------------------------
+ib_write_lat -s 2 -n 5000
+ #bytes #iterations  t_min    t_max   t_typical  t_avg   t_stdev   99%     99.9%
+ 2       5000        1.78     3.77    1.81       1.81    0.00      1.87    2.19
+
+ib_write_lat -s 4194304 -n 1000
+ #bytes  #iterations t_min    t_max   t_typical  t_avg   t_stdev   99%     99.9%
+ 4194304 1000        729.99   731.31  730.29     730.44  0.00      731.07  731.31
+
+ib_write_bw -s 4194304 -n 1000
+ #bytes   #iterations  BW peak[MiB/s]  BW average[MiB/s]  MsgRate[Mpps]
+ 4194304  1000         5518.37         5518.37            0.001380
+
+
+CHANGE APPLIED
+--------------
+ip link set dev enp117s0 mtu 9000        # on the PXI, matching the Spark's netdev
+
+Verified rather than assumed:
+  ibv_devinfo -d rocep117s0  -> active_mtu: 4096 (5)   PORT_ACTIVE (4)
+  ibv_devinfo -d rocep1s0f0  -> active_mtu: 4096 (5)   PORT_ACTIVE (4)
+  ping -c 3 -M do -s 8972 192.168.20.2 from the Spark -> 0% loss, 8980 bytes returned
+  (the do-not-fragment ping must run from the Spark; the PXI's busybox ping has no -M)
+
+
+AFTER: both ends at active_mtu 4096
+------------------------------------
+ib_write_lat -s 2 -n 5000
+ #bytes #iterations  t_min    t_max   t_typical  t_avg   t_stdev   99%     99.9%
+ 2       5000        1.73     3.74    1.82       1.82    0.00      1.89    2.20
+
+ib_write_lat -s 4194304 -n 1000
+ #bytes  #iterations t_min    t_max   t_typical  t_avg   t_stdev   99%     99.9%
+ 4194304 1000        694.28   695.79  694.76     695.06  0.00      695.74  695.79
+
+ib_write_bw -s 4194304 -n 1000
+ #bytes   #iterations  BW peak[MiB/s]  BW average[MiB/s]  MsgRate[Mpps]
+ 4194304  1000         5843.23         5843.22            0.001461
+
+
+DELTA
+-----
+ 2 B write, t_typical    1.81 us   -> 1.82 us       no change (this is the control)
+ 4 MB write, t_typical   730.29 us -> 694.76 us     -35.53 us, 4.87% faster
+ 4 MB write bandwidth    5518 MiB/s-> 5843 MiB/s    +324.9 MiB/s, +5.89%
+
+The 2-byte row is the control and it is the reason the 4 MB numbers can be trusted. MTU
+cannot affect a message that fits in a single packet either way, and it did not move.
+Had it moved, the 4 MB improvement would have been drift between runs rather than the
+MTU change.
+
+
+WHAT THIS MEANS FOR THE DESIGN
+-------------------------------
+5843 MiB/s is 6.13 GB/s, or 49.0 Gb/s on a 50 Gb link: about 98% of line rate. The
+transport is not where the remaining time is. Small-message latency is 1.81 us typical
+with a standard deviation of 0.00 and a 99.9th percentile of 2.20 us, so the fabric is
+clean rather than marginal, and there is no fabric configuration problem to solve before
+application code exists.
+
+Everything still on the table is in what happens after the bytes land, which is exactly
+what the cudaHostAlloc receive-buffer design changes. The 695 us transfer is paid
+identically by DAQiri, so it cancels out of the comparison; the 10.94 us registration
+penalty measured in handoff section 7c does not.

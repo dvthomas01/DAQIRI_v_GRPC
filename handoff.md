@@ -490,6 +490,203 @@ though a comment already claimed it did. The effect survived and grew, from 7.17
 10.94 us. Interleaving is not the same as rotating, and only the second one removes position
 as a hidden variable.
 
+## 7d. RoCE straight into `cudaHostAlloc` memory: the four pre-flight gates (2026-08-19)
+
+### The design in one paragraph
+
+The PXIe-8881 does an RDMA write over RoCE into a buffer on the Spark. That buffer was
+allocated with `cudaHostAlloc` plus `cudaHostAllocMapped` and registered with the NIC via
+`ibv_reg_mr`. The Spark polls the completion, then hands cuFFT the device pointer from
+`cudaHostGetDevicePointer` and transforms in place. Nothing is copied. The NIC writes once and
+the GPU reads what the NIC wrote. It is still zero-copy, it just terminates in host memory
+rather than device memory, because on this chip host memory is what the GPU reads from anyway.
+
+This is DAQiri's architecture. DAQiri already does RoCE into `cudaMallocHost` buffers. The
+claim is not a faster path, it is "DAQiri performance without giving up the gRPC API", which
+was the original project goal. The reason to expect it to work is 7c: `cudaHostAlloc` beats
+`cudaHostRegister` by 10.94 us of transform time, which is larger than the remaining 8.10 us
+gap to DAQiri. Today iceoryx2 allocates the buffers with `shm_open` and we register them after
+the fact. Owning the allocation is the point.
+
+### Gate results
+
+| Gate | Question | Result |
+|---|---|---|
+| 1 | Does the GPU permit host pointers for registered memory? | **PASS**, and it also killed the device-memory route |
+| 2 | Is RoCE up on both ends with a usable address? | **PASS** |
+| 3 | Does RoCE work end to end, and what is the latency floor? | **PASS**, at 98% of line rate |
+| 4 | Will `ibv_reg_mr` accept CUDA-pinned memory? | **PASS**, decisively |
+
+All four pass, so the architecture is feasible and the next step is the flag experiment.
+
+Evidence is committed at `data/gate1_caps.txt` and `data/gate4_regmr.txt`; the probes that
+produced them are `scripts/gate1_caps.cu` and `scripts/gate4_regmr.cu`.
+
+**Gate 1** returned `CAN_USE_HOST_POINTER_FOR_REGISTERED_MEM = 1`, and the allocation confirmed
+it rather than merely asserting it: `cudaHostAlloc` returned `0x32ee00000` and
+`cudaHostGetDevicePointer` returned the same address, 2 MB aligned. So
+`cudaHostGetDevicePointer` is optional here, not load-bearing.
+
+Gate 1 also settled the route ranking with hardware evidence instead of judgement.
+`GPU_DIRECT_RDMA_SUPPORTED = 0` and `DMA_BUF_SUPPORTED = 0`, but
+`HOST_ALLOC_DMA_BUF_SUPPORTED = 1`. Third-party DMA into device memory is unsupported on GB10;
+third-party DMA into page-locked host memory is supported. Section 7b ranked GPUDirect RDMA
+first. That ranking is retired. Landing in host memory is not the second-best option, it is the
+only one the hardware offers.
+
+`nvidia-peermem` is present at
+`/lib/modules/6.11.0-1016-nvidia/kernel/nvidia-580-open/nvidia-peermem.ko`, version 580.95.05,
+but is not loaded, and `modprobe` fails with "Operation not permitted" because `nitest` has no
+passwordless sudo. This is moot: peermem exists to expose device memory to the NIC, and device
+memory is not on the table.
+
+**Gate 4 is the one that mattered.** `ibv_reg_mr` succeeded on a 4 MB `cudaHostAlloc` buffer,
+returning lkey and rkey `0x00182ae7`, with `mr->addr` and `mr->length` matching the CUDA
+allocation exactly. A GPU kernel then wrote the region and the CPU read it back coherently, so
+the NIC and the GPU address the same bytes rather than two aliases of the same size. The
+control in the same program attempted the identical registration on `cudaMalloc`'d device
+memory and was rejected with "Bad address". Host landing is therefore a demonstrated constraint
+on this hardware, not a design preference, and that sentence is worth more in a pitch than the
+positive result on its own.
+
+### Gate 3: the fabric is not the problem
+
+`ib_write_lat` and `ib_write_bw`, PXI as client writing into the Spark as server, which is the
+direction the real design uses. Measured twice on purpose: once at the MTU we found, then again
+after aligning it, so the MTU effect is attributable instead of being folded into a single
+number.
+
+| measurement | MTU 1024 | MTU 4096 | delta |
+|---|---|---|---|
+| 2 B write, t_typical | 1.81 us | 1.82 us | none, as expected |
+| 4 MB write, t_typical | 730.29 us | 694.76 us | **-35.5 us, 4.9% faster** |
+| 4 MB write bandwidth | 5518.37 MiB/s | 5843.23 MiB/s | **+324.9 MiB/s, 5.9%** |
+
+The 2-byte row is the control. MTU cannot affect a message that fits in one packet either way,
+and it did not move, which is what says the 4 MB improvement really came from the MTU and not
+from drift between runs.
+
+Small-message latency is 1.81 us typical with a standard deviation of 0.00 and a 99.9th
+percentile of 2.20 us. That is a clean fabric, not a marginal one.
+
+**The conclusion that matters for the design.** 5843 MiB/s is 49.0 Gb/s on a 50 Gb link, so the
+transport is running at about 98% of line rate and there is essentially nothing left to win in
+the wire. Every microsecond still on the table is in what happens after the bytes land. That is
+precisely what the `cudaHostAlloc` design changes, and it is why the 10.94 us registration
+penalty from 7c is worth chasing even though it is small next to a 695 us transfer: DAQiri pays
+the same 695 us, so the comparison stays honest and the 10.94 us is the part we actually
+control.
+
+### RESUME STEP: the PXI RoCE address does not survive a reboot
+
+`enp117s0` on the PXI gets no DHCP lease and comes up with a link-local `169.254.x` address
+only, which cannot reach the Spark's `192.168.20.1`. After any PXI reboot, run this as root on
+the PXI before anything RDMA will work:
+
+```sh
+ip addr add 192.168.20.2/24 dev enp117s0
+ip link set dev enp117s0 mtu 9000
+```
+
+Both lines are needed and both are lost on reboot. The MTU one matters because the PXI comes up
+at 1500, which gives a RoCE `active_mtu` of 1024 while the Spark sits at 4096, and a queue pair
+silently negotiates the minimum. Nothing errors; you just quietly lose about 5% of your
+bandwidth.
+
+Remove them with `ip addr del 192.168.20.2/24 dev enp117s0` and `ip link set dev enp117s0 mtu
+1500`. Verify with `ping -c 3 -I enp117s0 192.168.20.1`, which should show sub-millisecond
+replies and 0% loss.
+
+After the MTU change, confirm it actually took effect on both sides rather than assuming it.
+Run `ibv_devinfo -d rocep117s0` on the PXI and `ibv_devinfo -d rocep1s0f0` on the Spark and
+check that `active_mtu` reads `4096 (5)` in both. Then send a large frame that is not allowed to
+fragment, `ping -c 3 -M do -s 8972 192.168.20.2` from the Spark. Note that the PXI's busybox
+`ping` has no `-M` flag, so this test has to run from the Spark side. If the two ends disagree
+on MTU, large frames black-hole and present as intermittent stalls rather than clean errors,
+which is a much worse failure to debug than a refused packet.
+
+The GID index changes when you add the address. On the PXI, RoCE v2 over IPv4 for
+`192.168.20.2` is **GID index 5**; on the Spark, RoCE v2 over IPv4 for `192.168.20.1` is **GID
+index 3**. Pass these to perftest with `-x`. Read them back with
+`cat /sys/class/infiniband/<dev>/ports/1/gid_attrs/types/<i>` alongside `.../gids/<i>` rather
+than guessing, because the indices shift as addresses come and go.
+
+Check the address is unclaimed before assigning it: ping it from the Spark and then read
+`ip neigh show dev enp1s0f0np0`. An `INCOMPLETE` entry means the Spark asked and nobody
+answered, which is a stronger proof of absence than a silent ping.
+
+There is precedent for writing this down. `192.168.20.1` on the Spark was configured ad hoc
+during the earlier RoCE work and also did not survive, and rediscovering that cost time. The
+symptom is a dead link that looks like a hardware fault and is actually a missing line.
+
+### Topology, established without any privileges
+
+The two 50 G ports go through a switch, not a direct cable. Reading
+`/sys/class/net/*/statistics/rx_packets` on the Spark before and after an ARP burst from the
+PXI showed `enp1s0f0np0` up 71 and `enP2p1s0f0np0` up 64, while the 1 G ports barely moved.
+Both 50 G ports seeing the same broadcasts means one L2 domain. This is a useful trick when you
+have no root and cannot run tcpdump.
+
+### Tooling notes for the PXI
+
+We are uid 0 on the PXI, unlike the Spark. `perftest` is not installed there, but `rdma-core`
+51.0 with `rdma-core-dev`, `gcc` and `g++` are, so perftest builds from source into a user
+directory without touching opkg on a shared instrument controller. `rping`, `ucmatose` and
+`udaddy` are present on both ends but only prove connectivity; none of them gives a latency
+floor. `ibdev2netdev` is missing on the PXI, so use `ibv_devinfo`.
+
+**How perftest was built on the PXI**, since it is not obvious and took two dead ends.
+`configure` hard-fails with "pciutils header files not found" and there is no flag to skip it;
+the check is in `configure.ac` and older tags fail the same way, so downgrading does not help.
+The box has `libpciaccess` but not `libpci`. perftest uses libpci in exactly one place,
+`src/perftest_parameters.c`, to detect PCIe relaxed ordering. Stubbing it out is tempting and is
+the wrong call, because relaxed ordering affects RDMA write performance and that is the thing
+being measured. Build libpci into a user directory instead:
+
+```sh
+cd /home/admin
+git clone --depth 1 https://github.com/pciutils/pciutils.git pciutils-src
+cd pciutils-src
+make -j4 ZLIB=no HWDB=no LIBKMOD=no DNS=no SHARED=no PREFIX=/home/admin/pciutils-inst
+make install-lib PREFIX=/home/admin/pciutils-inst
+
+cd /home/admin
+git clone --depth 1 https://github.com/linux-rdma/perftest.git
+cd perftest
+./autogen.sh
+./configure CPPFLAGS=-I/home/admin/pciutils-inst/include LDFLAGS=-L/home/admin/pciutils-inst/lib
+make -j4
+```
+
+Binaries land in `/home/admin/perftest/` and nothing is installed system-wide. The run confirms
+it worked: perftest prints `PCIe relax order: OFF`, which is a real detected value rather than a
+stubbed default.
+
+`/home/admin` on the PXI already contains `easyrdma`, a built `easyrdma_pingpong` and its
+source, plus `grpc-direct` and `bench_pxi`. easyrdma is the library the real transport would
+use, so that binary is worth reading before writing new RDMA code.
+
+### How to re-run Gate 3
+
+Server on the Spark, client on the PXI, matching the direction of the real design:
+
+```sh
+# on the Spark
+ib_write_lat -d rocep1s0f0 -x 3 -s 4194304 -n 1000
+
+# on the PXI
+/home/admin/perftest/ib_write_lat -d rocep117s0 -x 5 -s 4194304 -n 1000 192.168.20.1
+```
+
+Swap `ib_write_lat` for `ib_write_bw` for the bandwidth figure. The control connection is plain
+TCP on port 18515 to `192.168.20.1`; `ufw` is active on the Spark but does not block it.
+
+One trap worth naming. Do not put a `pkill` for the server in the same remote command as the
+server launch. The usual `pkill -f "[i]b_write_lat"` bracket trick relies on the quotes
+surviving, and when the command is sent through PowerShell the inner double quotes are stripped,
+so the pattern matches the shell running the command and kills it. The symptom is a remote
+command that produces no output at all, not even an `echo` that ran before the `pkill`.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build
