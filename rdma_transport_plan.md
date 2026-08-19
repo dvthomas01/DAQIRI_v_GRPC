@@ -2,7 +2,8 @@
 
 Status: Phase 0 complete, all four gates passed. Phase 0.5 complete, DAQiri confirmed
 local and the headline table relabelled. Measurement window committed to post-arrival.
-Phase 1 in progress.
+Phase 1 complete and negative: no flag closes any part of the gap, so Phase 2 is justified
+and proceeds.
 
 ---
 
@@ -198,9 +199,31 @@ control arm.
 
 ---
 
-## 4. Phase 1: the allocator flag experiment
+## 4. Phase 1: the allocator flag experiment — RESOLVED, NEGATIVE
 
 **This may make the entire RDMA project unnecessary. Do it first.**
+
+It did not. Ran 2026-08-19, `data/memsrc_flags.csv`, SHA `6070ae1`, 9 sizes x 8 arms x
+5 reps x 200 iterations with arms rotated per iteration. Full writeup in `handoff.md`
+section 7e. Summary:
+
+- **The third decision rule fired.** Every `cudaHostAlloc` arm closes 94-101% of the
+`shmreg`-to-`hostalloc` gap, every `cudaHostRegister` arm closes 0% within noise, at all
+nine sizes. Registration versus driver allocation is irreducible, the ownership problem is
+real, and Phase 2 proceeds.
+- **The hypothesis below is refuted, not confirmed.** WriteCombined genuinely changes the
+mapping (backed by `/dev/nvidiactl`, three extra vmflags) and changes the timing by less
+than 0.5 µs at 4 MB. Cacheability as stated is not the mechanism, which remains unknown.
+That is not a blocker for Phase 2, since the effect reproduces regardless of why.
+- `cudaHostRegisterReadOnly` is rejected by the driver, "operation not supported". Second
+confirmation of the E4 refusal.
+- `--zc-bigreg` re-run under write-then-transform discipline is null again. Closed.
+- The 10.94 µs figure below was 4 MB only. The ladder splits it as +14.94 µs transform and
++33.86 µs write at 4 MB, with the transform half absent below 1 MB. Only the transform half
+is charged to the post-arrival window, and it alone still exceeds the 8.10 µs gap.
+
+The original plan text follows unchanged, since the hypothesis and decision rules are what
+make the result interpretable.
 
 No RDMA involved. It runs entirely inside `bench_fft_memsrc.cc`.
 
@@ -246,6 +269,7 @@ problem is real, and Phase 2 proceeds with a stronger justification.
 ### Output
 
 Table with all arms at 9 sizes, sign tests, committed CSV, and a `handoff.md` section.
+Delivered: `data/memsrc_flags.csv`, `data/memsrc_flags_run.log`, `handoff.md` section 7e.
 
 ---
 

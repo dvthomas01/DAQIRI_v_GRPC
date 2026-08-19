@@ -15,16 +15,22 @@ the gap. A dedicated CUDA stream took a little more. **At 4 MB the gap is now 8.
 
 **We now know why the transform is slower, and it is not the transform.** Buffers allocated by
 the CUDA driver with `cudaHostAlloc` beat buffers we allocate ourselves and hand to
-`cudaHostRegister` by **10.94 us** of GPU time at 4 MB, 15 out of 15 paired cells,
-p = 6.1e-05. That is larger than the entire remaining gap. iceoryx2 allocates our payload
-buffers with `shm_open` and we register them after the fact; DAQiri's buffers come from the
-driver. Owning the allocation is the whole difference. Section 7c has the evidence, and it
-retracts an earlier null result that came from a benchmark which never wrote to the buffer.
+`cudaHostRegister` by **14.94 us** of GPU time at 4 MB, 5 out of 5 paired cells, and by
+33.86 us more on the producer's write. That is larger than the entire remaining gap. iceoryx2
+allocates our payload buffers with `shm_open` and we register them after the fact; DAQiri's
+buffers come from the driver. Owning the allocation is the whole difference. Section 7c has the
+evidence, and it retracts an earlier null result that came from a benchmark which never wrote
+to the buffer.
+
+**No flag fixes it.** Section 7e sweeps three `cudaHostAlloc` flags and three
+`cudaHostRegister` flags across 9 sizes. Every allocation-side arm sits on the fast side and
+every registration-side arm sits on the slow side, with no flag closing any measurable part of
+the gap. The cheap escape route is closed, so owning the allocation is the only one left.
 
 **Current work: give gRPC-Direct DAQiri's actual transport.** A RoCE RDMA write from the PXI
 landing directly in a `cudaHostAlloc`'d receive buffer that cuFFT reads in place. All four
 pre-flight gates passed on 2026-08-19; section 7d has the results and the reproduction steps.
-The next step is the Phase 1 flag experiment.
+Phase 1 is done and negative, so Phase 2 builds the minimal data path.
 
 **If you read only one more thing, read section 1.** Four of this project's headline numbers
 turned out to be measurement artifacts rather than results, and all four were caught late.
@@ -325,7 +331,7 @@ hatch so the old behaviour stays measurable. Everything else is opt-in.
 | `--opt-affinity N` | pin the handler thread to core N | kept, opt-in: neutral to harmful |
 | `--zc-h2d` | **E1:** realign via H2D from pinned host instead of D2D | rejected: no change (76.6 vs 76.3), worse p99 |
 | `--zc-kernel` | **E3:** SM grid-stride copy, then device-memory FFT | rejected: 110.8 vs 76.4 at 4 MB |
-| `--zc-bigreg` | **E4:** register whole 64 KB GPU pages like DAQiri | rejected: 77.5 vs 76.4, no effect |
+| `--zc-bigreg` | **E4:** register whole 64 KB GPU pages like DAQiri | rejected: 77.5 vs 76.4, no effect; re-tested under write-then-transform discipline in 7e, null again |
 
 Why only one of the trio earned a default:
 
@@ -581,6 +587,8 @@ dependency, and page size is innocent so it would buy nothing even if it worked.
 3. Only then, whether iceoryx2 can be handed a pre-allocated `cudaHostAlloc` region. That is
    the Rust-side change, and it should not be started until 1 and 2 are ruled out.
 
+**Items 1 and 2 are now answered, both negative. See section 7e.** Item 3 is therefore live.
+
 ### Method note
 
 The first version of this run had the arms in fixed order, and `hostalloc` was listed first
@@ -786,6 +794,80 @@ server launch. The usual `pkill -f "[i]b_write_lat"` bracket trick relies on the
 surviving, and when the command is sent through PowerShell the inner double quotes are stripped,
 so the pattern matches the shell running the command and kills it. The symptom is a remote
 command that produces no output at all, not even an `echo` that ran before the `pkill`.
+
+## 7e. Phase 1: no allocation or registration flag closes the gap (2026-08-19)
+
+Section 7c left two cheap questions open before committing to an RDMA transport: whether the
+registration penalty is inherent to `cudaHostRegister` or just to the flag we happened to pass,
+and whether a page-rounded registration span removes it. Both are one-line fixes if they work,
+and both would make the transport work unnecessary, so they run first.
+
+The ladder holds the mapping constant and varies only the flag. Every registration arm gets a
+byte-identical `/dev/shm` mapping of its own, so the comparison is controlled rather than four
+separate experiments sharing a name.
+
+9 sizes x 8 arms x 5 reps x 200 iterations, arms rotated per iteration, `data/memsrc_flags.csv`,
+SHA `6070ae1`. Totals in microseconds, median over reps:
+
+| KB | `hostalloc` | `ha_def` | `ha_wc` | `ha_wcmap` | `shmreg` | `shmreg_def` | `shmreg_port` | `shmreg_big` |
+|---|---|---|---|---|---|---|---|---|
+| 256 | 19.70 | 19.65 | 19.65 | 19.65 | 27.76 | 27.74 | 28.02 | 27.68 |
+| 1024 | 34.19 | 35.01 | 34.32 | 34.16 | 57.55 | 54.75 | 57.65 | 59.23 |
+| 4096 | **113.30** | 113.92 | 113.46 | 112.99 | **162.03** | 165.55 | 162.86 | 166.43 |
+
+Read as a fraction of the `shmreg`-to-`hostalloc` gap that each variant closes: every
+allocation-side arm is at 94-101% at every size, and every registration-side arm is within
+noise of 0%, going negative as often as positive. `shmreg`, `shmreg_def`, `shmreg_port` and
+`shmreg_big` are each 0/5 faster than `hostalloc` at every size from 32 KB up; pooled that is
+3-4 wins out of 45, p between 9e-10 and 9e-09.
+
+`cudaHostRegisterReadOnly` never ran. The driver refuses it with "operation not supported",
+which is the same refusal E4 hit, now confirmed on a second code path.
+
+**Verdict: the decision rule's third branch. Nothing moves, so registration versus driver
+allocation is irreducible, the ownership problem in section 7 is real, and owning the
+allocation is the only route left.** Phase 2 proceeds with a stronger justification than it
+had, because the cheap alternative has now been ruled out by measurement rather than assumed
+away.
+
+### Two things this run corrected
+
+**WriteCombined refutes the cacheability story, and it is the cleanest negative here.** 7c
+argued that registration must be changing the page's cacheability, since nothing else explains
+why it would slow a CPU store. If that is the mechanism, changing cacheability on the
+allocation side should move the number. It does not. `ha_wc` and `ha_wcmap` are backed by
+`/dev/nvidiactl` with vmflags `rd wr sh mr mw me ms de dd mm`, while `hostalloc` and `ha_def`
+are backed by `/dev/zero (deleted)` with vmflags `rd wr sh mr mw me ms`. A different device, a
+different driver path, three extra vmflags, and the totals agree to within 0.5 us at 4 MB. So
+whatever `cudaHostRegister` costs, plain CPU-side write-combining is not it, and 7c's proposed
+mechanism should be treated as unproven rather than established.
+
+**The transform penalty is the smaller half, and it is size-dependent.** 7c measured at 4 MB
+only and reported 10.94 us of transform time. Across the ladder the split at 4 MB is +33.86 us
+on the write and +14.94 us on the transform, and the transform penalty is absent below about
+1 MB: at 128, 256 and 512 KB `shmreg` transforms marginally *faster* than `hostalloc` while
+still losing 4-15 us on the write. This does not change the conclusion, because the producer's
+write sits outside the measured window in both pipeline arms, so only the transform half is
+charged to the headline number, and 14.94 us alone still exceeds the 8.10 us gap. It does mean
+any future statement of this effect has to name a payload size.
+
+`shmreg_big` is null a second time, now under the write-then-transform discipline that 7c said
+the original `--zc-bigreg` result lacked. It is 0/5 at every size and slightly the worst arm on
+the page at 4 MB. Registration span granularity is closed.
+
+### A bug in the analysis script, found by this run
+
+`scripts/memsrc_table.py` summed only the upper tail of the sign test, from k to n. That is
+correct when an arm wins everything and silently wrong when it loses everything: 0 wins out of
+45 came out as p = 1, which reads as "no effect" for what is in fact the strongest effect in
+the table. Fixed to take the smaller tail, so consistently slower is as detectable as
+consistently faster. Every previously reported p-value from this script was for an arm that
+won, where the two formulas agree, so nothing already in this document changes.
+
+The same script now prints sign tests per size before pooling them, and on the total rather
+than the transform. Pooling is only valid where the effect exists at every size, and the
+transform penalty does not exist below 1 MB, so pooling it diluted a real 15 us effect at 4 MB
+against eight sizes with nothing to find.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
