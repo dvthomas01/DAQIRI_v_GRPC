@@ -1,4 +1,4 @@
-# HANDOFF — gRPC-Direct latency optimization (CURRENT, 2026-08-17)
+# HANDOFF: gRPC-Direct latency optimization (CURRENT, 2026-08-19)
 
 > Paste this into a new chat to continue. It is self-contained: everything a fresh session
 > needs about the goal, the system, what has been measured, and what to do next.
@@ -10,15 +10,36 @@
 
 gRPC-Direct was 1.76x slower than DAQiri at 4 MB. We found the cause (an incorrect alignment
 assumption forcing an unnecessary GPU copy on 100% of messages), fixed it, and closed most of
-the gap. A dedicated CUDA stream took a little more. Five other optimization ideas were
-measured and rejected, and one (the arena) is blocked by an ownership boundary we do not
-control. At 4 MB we went from 1.76x slower to 1.13x slower. DAQiri is still ahead at every
-size, and roughly three quarters of what remains is inside cuFFT rather than in transport.
+the gap. A dedicated CUDA stream took a little more. **At 4 MB the gap is now 8.10 us, about
+13%.** Roughly 80% of what remains is inside cuFFT rather than in transport.
 
-**If you read only one more thing, read section 1.** Three of this project's headline numbers
-turned out to be measurement artifacts rather than results, and all three were caught late.
-The most recent was a gap figure taken from a single un-repeated run; it is retracted in
-section 5.
+**We now know why the transform is slower, and it is not the transform.** Buffers allocated by
+the CUDA driver with `cudaHostAlloc` beat buffers we allocate ourselves and hand to
+`cudaHostRegister` by **10.94 us** of GPU time at 4 MB, 15 out of 15 paired cells,
+p = 6.1e-05. That is larger than the entire remaining gap. iceoryx2 allocates our payload
+buffers with `shm_open` and we register them after the fact; DAQiri's buffers come from the
+driver. Owning the allocation is the whole difference. Section 7c has the evidence, and it
+retracts an earlier null result that came from a benchmark which never wrote to the buffer.
+
+**Current work: give gRPC-Direct DAQiri's actual transport.** A RoCE RDMA write from the PXI
+landing directly in a `cudaHostAlloc`'d receive buffer that cuFFT reads in place. All four
+pre-flight gates passed on 2026-08-19; section 7d has the results and the reproduction steps.
+The next step is the Phase 1 flag experiment.
+
+**If you read only one more thing, read section 1.** Four of this project's headline numbers
+turned out to be measurement artifacts rather than results, and all four were caught late.
+Sections 5 and 7c contain the retractions.
+
+### Where to look for what
+
+| Section | Contents |
+|---|---|
+| 1 | How to measure on this box. Read before running anything. |
+| 5 | Current scoreboard and the retracted 2.91 us gap |
+| 7 | Why we do not own the payload allocation |
+| 7b | The three device-landing routes, costed. **Its ranking is retired by 7d.** |
+| 7c | The mechanism: `cudaHostAlloc` versus `cudaHostRegister` |
+| 7d | The RoCE-into-`cudaHostAlloc` design, the four gates, and the machine state that dies on reboot |
 
 ## 1. How to measure on this box (read this before you run anything)
 
@@ -48,8 +69,24 @@ system as much as the code.
    quoting. The trio's win is 0.15 to 0.39 us, far inside the run-to-run spread, but it took
    9 of 9 paired cells, and that is a defensible claim where "the median dropped 0.3 us" is
    not. `scripts/headline_table.py` does this automatically.
+4. **Rotate the arms, do not merely interleave them.** Interleaving removes drift between arms,
+   but with a fixed order the arm listed first always runs in the same slot, so position becomes
+   a hidden variable perfectly correlated with arm identity. The signature is a first-listed arm
+   winning every single cell. Rotate the starting arm: `arms[(it + k) % arms.size()]`. Doing this
+   to the memory ladder did not erase its effect, it grew it from 7.17 to 10.94 us, but you
+   cannot know which until you check.
+5. **Dirty the buffer before you time a transform.** A ladder that only reads the buffer
+   understates host memory badly enough to invert the conclusion. Real pipelines always write
+   first. **Time the producer write and the transform together**, because a change that slows
+   the write and speeds the transform looks like a pure win when only half the window is timed.
+6. **Include a control that should not move.** When the RoCE MTU was raised, 4 MB got 4.9%
+   faster, which alone is indistinguishable from drift. A 2-byte message measured in the same
+   pair of runs cannot be affected by MTU, and it did not move. That is what turns the 4 MB
+   number into a measurement. A control that stays still is cheaper than a repeat run and proves
+   more. Related: **baseline, change, remeasure**, even when the change is obviously correct,
+   because otherwise you get one number with nothing to attribute it to.
 
-**Both burns, so you can recognise the shape of them.**
+**Four burns, so you can recognise the shape of them.**
 
 - *The async timer.* A stage timer wrapped around the realign copy read 3.5 to 5.2 us, so the
   copy looked cheap and got dismissed. `cudaMemcpyAsync` only enqueues. The real 77 us landed
@@ -61,6 +98,25 @@ system as much as the code.
   to explain where those microseconds went. Both were assembled from separate runs. A single
   interleaved run put the gap at 2.9 us and showed the two FFT times within 0.7 us of each
   other. The ladder was drift. An entire causal story had been built on it, and it was wrong.
+- *One rep is not a measurement.* That 2.9 us gap then became the headline. It came from a
+  single interleaved run and did not replicate; two reps put it at 8.10 us. Interleaving removes
+  bias between arms but tells you nothing about how much a number moves between runs.
+- *A read-only benchmark answering a question about writes.* The rebuilt memory ladder was
+  interleaved, repeated and sign-tested, and it declared memory kind dead. It never wrote to the
+  buffer. Adding the CPU write that every real pipeline performs separated the arms by 10.94 us
+  at p = 6.1e-05 and produced the mechanism the whole project had been looking for. The
+  read-only caveat had been written down at the time and not acted on.
+
+**A name is not evidence.** An arm labelled as a huge-page test had been reported as one on the
+strength of `madvise(MADV_HUGEPAGE)` returning 0. That return value means the kernel accepted a
+hint. `/proc/self/smaps` showed the arm held zero huge pages, so its null result said nothing at
+all about page size. Verify the mechanism you claim to be testing, from the system's own
+accounting, not from the API's return code.
+
+**Test the negative case in the same program.** Gate 4 proved the NIC accepts CUDA-pinned host
+memory. Fifteen extra lines attempting the identical registration on device memory got a
+rejection, which upgraded "we chose host memory" to "host memory is the only option this
+hardware offers". The pair is worth far more than the positive alone.
 
 **One more, about sample counts.** Warmup discards the first N *received* messages, not the
 first N sequence numbers. An early loss burst therefore shifts the measurement window forward
@@ -75,23 +131,47 @@ Make gRPC-Direct's end-to-end latency match or beat DAQiri's RoCE path, while:
 - putting every optimization behind an opt-in mode flag so the baseline stays measurable,
 - proving correctness (spectral output) before trusting any speedup.
 
-The cross-machine RoCE test from the previous arc is shelved. Do not restart it.
+The cross-machine RoCE work was shelved during the optimization arc and has now been
+deliberately restarted, because the evidence in 7c points at the receive buffer's allocator and
+the only way to own that allocation is to own the transport. The claim being built is "DAQiri
+performance without giving up the gRPC API", which was the original project goal. See 7d.
 
 ## 3. Where the work lives
 
 - **Branch:** `grpc-direct-optimization`, cut from `main` at 57ba6d3. **`main` is untouched.**
-- **Commits on the branch:**
+- **Commits on the branch**, oldest first:
   - `5eaaf89` instrument the residual + fix the alignment rule (Phase 0, E1, E2)
   - `4de101c` E3/E4 measured and rejected + fix wrong CUDA arch
   - `a35bdb6` handoff docs
-- **Pushed** and tracking `origin/grpc-direct-optimization`. Git identity: Dami Thomas,
-  damithomas03@gmail.com. Remote `https://github.com/dvthomas01/DAQIRI_v_GRPC.git`.
+  - `3cf63de` seq accounting, dedicated CUDA stream, interleaved measurement
+  - `1051444` sweep refuses to run on a stale binary, stamps the build into the CSV
+  - `952b68a` `scripts/find_spark.sh`
+  - `efe712d` headline sweep, 2 reps interleaved, and the reversal on where the gap lives
+  - `50ce845` placement probe: registration granularity is not the mechanism
+  - `b8c0b96` i-RDMA feasibility: CPU cannot write device memory, managed memory does not stay
+  - `f5e5b79` page size is innocent, `cudaHostRegister` is the mechanism (retracts the null)
+  - `c91614c` Gates 1 and 4 pass
+  - `c875e0c` Gate 3 passes
+- `origin/grpc-direct-optimization` is at `efe712d`, so the branch is **5 commits ahead and not
+  pushed**. Ask before pushing. Git identity: Dami Thomas, damithomas03@gmail.com. Remote
+  `https://github.com/dvthomas01/DAQIRI_v_GRPC.git`.
 - **Note:** `PROGRESS.md`, `SHORTTERM_CONTEXT.md`, `LONGTERM_CONTEXT.md` are in `.gitignore`
   by existing repo convention. They are updated on disk but intentionally not committed.
 - **Also note:** the previous RoCE session left a lot of uncommitted work in the working tree
   (RoCE pipeline sources, `data/*.csv`, `presentation/`, many `scripts/probe_*.sh`). It is
   untracked and shared across both branches. It was deliberately left alone. Do not commit it
-  to the optimization branch.
+  to the optimization branch. **Always `git add` explicit paths, never `git add -A`.**
+
+### Probes and evidence added during the current arc
+
+| File | What it is |
+|---|---|
+| `fft/bench_fft_memsrc.cc` | The placement ladder. Same cuFFT plan over each memory kind, no gRPC, no network. `--sizes` is in **samples**, not KB. |
+| `scripts/memsrc_table.py` | Parses its CSV, prints write / transform / total tables plus paired sign tests |
+| `scripts/gate1_caps.cu` | GPU capability probe (Gate 1) |
+| `scripts/gate4_regmr.cu` | `ibv_reg_mr` over a `cudaHostAlloc` buffer, with the device-memory control (Gate 4) |
+| `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us result |
+| `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 
 ## 4. How we found the problem (the reasoning that mattered)
 
@@ -709,7 +789,17 @@ Fixed: arch is now `native` in `CMakeLists.txt`, `grpc_direct/CMakeLists.txt`,
 GPU clocks **cannot** be locked (`nvidia-smi -lgc` needs privileges we lack).
 
 **Access:** `nitest@spark-ac69.ni.corp.natinst.com`, key auth, **no password, no passwordless
-sudo.** Repo at `/home/nitest/daqiri_gpu`, build dir `build_grpc/`.
+sudo.** Repo at `/home/nitest/daqiri_gpu`, build dir `build_grpc/`. The repo there is an scp
+mirror with **no git metadata**, so always pass `GITSHA=` explicitly to any script that stamps
+it.
+
+**Second machine, for the RDMA work.** NI PXIe-8881 `NI-PXIe-8881-31F6D74`, ssh alias `pxi`,
+10.198.65.118, NI Linux Real-Time, kernel 6.12.74-rt16, x86_64. **We are uid 0 there**, unlike
+on the Spark. RoCE device `rocep117s0` on netdev `enp117s0`, cabled through a switch to the
+Spark's `enp1s0f0np0` / `rocep1s0f0`. Addresses `192.168.20.2` and `192.168.20.1`. See 7d for
+the two commands that must be re-run after any PXI reboot, and for the perftest build at
+`/home/admin/perftest`. ICMP is blocked on the corporate network but works fine on the
+192.168.20.0/24 RoCE segment.
 
 ```powershell
 # Windows: use full paths, they are not on PATH
@@ -731,8 +821,21 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 **SSH gotchas learned the hard way:**
 - Always `scp` a script file and run `bash /tmp/x.sh`. Inline multi-line compound commands get
   mangled.
-- Inline `pkill -9 -f bench_grpc_server` over ssh kills your own remote shell. Use it only from
-  inside a script file.
+- **PowerShell strips inner double quotes from a single-quoted ssh argument.** `grep -aE "A|B"`
+  arrives split in two and the remote shell reports "command not found"; `echo "(text)"` becomes
+  `echo (text)` and dies with a syntax error before anything runs. Use `grep -a -e A -e B`, and
+  **never put parentheses or double quotes inside a remote command string.**
+- Inline `pkill -f <pattern>` over ssh kills your own remote shell, because the shell's command
+  line contains the pattern. The usual `[p]attern` bracket trick does not save you, because the
+  quotes around it get stripped too. The symptom is a remote command that produces **no output
+  at all**, not even an `echo` that ran before the `pkill`. Use it only from inside a script
+  file, and never in the same command as the thing it is guarding.
+- **Never use `| Out-String`.** It buffers until the pipeline closes, so a finished command
+  looks hung.
+- `cmd | tail` makes `$?` report tail's status. Use `${PIPESTATUS[0]}`, or redirect to a file
+  and then `echo $?`.
+- Long-running ssh commands get moved to a background terminal, and reading that terminal back
+  often returns stale scrollback. Redirect remote output to a file and read the file.
 - Add `-o ConnectTimeout=N`.
 - `.gitattributes` forces LF on `*.sh` and `*.py` so Windows checkouts do not break bash on
   Spark. Do not remove it.
@@ -752,53 +855,87 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 | `scripts/e34_probe.sh` | Arms e2/e3/e4/e34 plus a correctness pass. |
 | `scripts/verify_e2.sh` | Spectral correctness: copy vs realign vs in-place. |
 | `scripts/decompose_4mb.py` | Local. Reads `data/*.csv`, prints the residual decomposition. |
+| `fft/bench_fft_memsrc.cc` | The memory placement ladder, and the harness behind the 10.94 us result. No gRPC, no DAQiri, no network. Build target `bench_fft_memsrc`. |
+| `scripts/memsrc_table.py` | Local. Turns its CSV into write / transform / total tables, paired sign tests, and a `shmreg` versus `hostalloc` head-to-head. |
+| `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA gates. Self-contained, run on the Spark, print their own verdicts. |
 | `scripts/grpc_sweep.sh`, `scripts/roce_sweep.sh` | Older single-transport sweeps. **Not interleaved with each other.** Use `headline_sweep.sh` for any gRPC-vs-DAQiri claim. |
 
 ## 10. What to do next
 
-Most of the original list is done. What is genuinely left:
+The question that used to head this list, "why is our cuFFT slower than DAQiri's", is answered.
+It is not cuFFT. It is the buffer cuFFT is reading: driver-allocated memory transforms 10.94 us
+faster than memory we allocate and register ourselves, which is more than the entire remaining
+gap. Section 7c. Everything below follows from that.
 
-1. **Find out why our cuFFT is slower than DAQiri's.** This is now the whole ballgame: it is
-   79% of the remaining gap at 4 MB and it scales with payload size (section 5). The cheapest
-   decisive experiment is the placement A/B described at the end of section 7, which needs no
-   gRPC and no Rust changes. If placement is not the cause, check whether the two processes
-   pick different cuFFT plans by dumping the plan's work-area size and chosen algorithm at
-   each size in both binaries.
-2. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9, so this is
-   worth 0.3 to 1.7 us, smaller than item 1 but fully ours to fix. `--opt-stream` took the
-   easy part. What is left is per-message CUDA event record/query overhead and the metrics
-   bookkeeping. Consider whether the two events per buffer are both needed.
-3. **The small-buffer drops are benign and can be deprioritised.** See the note below.
+**Do these in order. The first two are cheap and could make the third unnecessary.**
 
-Deliberately not on this list: the arena (section 7, blocked), and E1/E3/E4 (section 6,
-measured and rejected).
+1. **Is the penalty inherent to `cudaHostRegister`, or to how we call it?** Try
+   `cudaHostRegisterDefault` and `cudaHostRegisterPortable` against `cudaHostRegisterMapped` on
+   the same `/dev/shm` buffer, in `fft/bench_fft_memsrc.cc`, rotated and with the buffer
+   dirtied. This is the difference between "needs an iceoryx2 change" and "one flag", and it is
+   an afternoon at most. Note that both the fast and slow paths already use `...Mapped` plus
+   `cudaHostGetDevicePointer`, so pointer acquisition is not the difference; and the CPU write
+   is also about 2x slower on registered memory, which suggests registration changes page
+   cacheability or coherency attributes rather than anything CUDA-specific.
+2. **Does registering once at startup remove it?** The pipeline registers per slot. `--zc-bigreg`
+   tested span granularity and came back null, but that was before we knew to dirty the buffer,
+   so it deserves one rerun under the write-then-transform discipline.
+3. **The warm-versus-cold ring hole.** The ladder reuses one buffer; the real pipeline rotates a
+   ring. If the penalty is a first-touch or TLB effect it would show up in the ladder and not in
+   the pipeline, or the reverse. Measure a ring of buffers before drawing a conclusion that only
+   holds for one.
+4. **Phase 1 of the RDMA work: the flag experiment.** All four gates passed (7d), so this is
+   unblocked. Put the `cudaHostAlloc` receive buffer behind a mode flag exactly like every other
+   optimization on this branch, so the baseline stays measurable. Start from
+   `scripts/gate4_regmr.cu`, which already allocates, registers and proves coherence, and from
+   `/home/admin/easyrdma_pingpong.cpp` on the PXI, which is the library a real gRPC-Direct RDMA
+   transport would actually use.
+5. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
+   1.7 us, smaller than the above but fully ours. `--opt-stream` took the easy part; what is
+   left is per-message CUDA event record/query overhead and metrics bookkeeping. Consider
+   whether both events per buffer are needed.
 
-**On the drops.** Only 170 to 179 of 200 buffers are delivered at 256 KB and below, which
-looked like it might bias the medians. It does not. The missing sequence numbers are all early
-(roughly 1 to 26, plus a small cluster near 45 to 56) and nothing is lost after about seq 56 in
-a 250-message run. Every measured window is contiguous, so we measure ~171 *consecutive*
-messages instead of 200: a smaller sample, not a biased one. The decisive evidence that this is
-a startup/attach transient rather than latency-correlated shedding is that the 35%-faster arm
-drops the *same* count as the slow arm (29 vs 29, 24 vs 23). A ring shedding under backlog
-would shed less on the faster arm. Loss is also bursty (mean run length 12 to 14.5, not ~1),
-raising the pace from 400 to 2000 us cuts it from 29 to 2, and there are zero drops at 4 MB.
+**Deliberately not on this list.** The arena (section 7, blocked at an ownership boundary).
+E1/E3/E4 (section 6, measured and rejected). Landing data in device memory (7b and 7d: the
+hardware refuses it, `GPU_DIRECT_RDMA_SUPPORTED = 0`, and `ibv_reg_mr` on device memory returns
+"Bad address"). Fabric tuning (7d: already at 98% of line rate). Huge pages, NUMA and
+registration granularity (7c: all eliminated with evidence).
 
-## 11. Open questions (a teammate was asked for input on these)
+**On the small-buffer drops, which are benign and can stay deprioritised.** Only 170 to 179 of
+200 buffers are delivered at 256 KB and below, which looked like it might bias the medians. It
+does not. The missing sequence numbers are all early (roughly 1 to 26, plus a small cluster near
+45 to 56) and nothing is lost after about seq 56 in a 250-message run. Every measured window is
+contiguous, so we measure ~171 *consecutive* messages instead of 200: a smaller sample, not a
+biased one. The decisive evidence that this is a startup transient rather than
+latency-correlated shedding is that the 35%-faster arm drops the *same* count as the slow arm
+(29 vs 29, 24 vs 23). A ring shedding under backlog would shed less on the faster arm. Loss is
+also bursty (mean run length 12 to 14.5, not ~1), raising the pace from 400 to 2000 us cuts it
+from 29 to 2, and there are zero drops at 4 MB.
+
+## 11. Open questions
 
 1. ~~Why is `cudaHostRegister`'d heap memory ~10 us slower for a cuFFT read than
-   `cudaHostAlloc`'d memory?~~ **Withdrawn.** The 10 us was thermal drift across runs. An
-   interleaved run puts the two FFT times within 0.7 us. There is no ladder to explain.
-2. Why does our cuFFT run ~4 us slower than DAQiri's at 1024 and 2048 KB specifically, but
-   match at 4096 KB? This is the live version of question 1 and it is measured properly.
-3. Can grpc-direct be made to allocate received messages into a supplied arena? See section 7:
-   the answer from this side is no. The question is whether the Rust side wants to expose a
-   seam.
-4. Is ~52 GB/s expected for the copy engine reading mapped host memory on GB10? An SM kernel
+   `cudaHostAlloc`'d memory?~~ **Withdrawn, then reinstated, then answered.** It was first
+   dismissed as thermal drift, correctly, because the original ladder was built from separate
+   runs. Rebuilt properly (interleaved, rotated, repeated, buffer dirtied) the effect is real:
+   10.94 us at 4 MB, 15 of 15 paired cells, p = 6.1e-05. Section 7c.
+2. ~~Why does our cuFFT run ~4 us slower at 1024 and 2048 KB specifically but match at
+   4096 KB?~~ **Dissolved.** There was never anything size-specific. The gap exists at every
+   size and the apparent match at 4 MB was itself the artifact. Section 5.
+3. **What does `cudaHostRegister` actually change about a page?** This is now the live version
+   of question 1. The CPU write is also about 2x slower on registered memory, which points at
+   cacheability or coherency attributes rather than anything CUDA-specific. Answering it would
+   tell us whether item 1 in section 10 can succeed.
+4. Can grpc-direct be made to allocate received messages into a supplied arena? Section 7: the
+   answer from this side is no. The question is whether the Rust side wants to expose a seam.
+   Note that 7d is the other way of solving the same problem: if we own the transport, we own
+   the allocation, and the arena question stops mattering.
+5. Is ~52 GB/s expected for the copy engine reading mapped host memory on GB10? An SM kernel
    got ~102 GB/s.
-5. Is "cuFFT R2C accepts an 8-byte-aligned input" safe to rely on, or UB that happens to work?
+6. Is "cuFFT R2C accepts an 8-byte-aligned input" safe to rely on, or UB that happens to work?
    We probe at runtime and fall back, so we are safe either way, but it would be good to know
    whether the fallback can ever trigger.
-6. Can anything be done about the unlockable clocks? Every methodological contortion in
+7. Can anything be done about the unlockable clocks? Every methodological contortion in
    section 1 exists because of that one missing privilege.
 
 ## 12. File map
@@ -809,6 +946,8 @@ raising the pace from 400 to 2000 us cuts it from 29 to 2, and there are zero dr
 | `fft/cufft_executor.{h,cu}` | `CuFFTExecutor(n, own_stream)`. With `own_stream` it creates a non-blocking stream, calls `cufftSetStream`, and completes by spinning on `cudaEventQuery` instead of `cudaEventSynchronize`. Also has `try_execute()` (non-throwing, used by the E2 alignment probe) and `launch_realign_copy()` (the E3 kernel). |
 | `grpc_direct/bench_grpc_client.cc` | Builds a fresh `BufferRequest` inside the send loop and does a full CPU copy per iteration. Excluded from server e2e but caps throughput. Has `--pace-us` (default 400). |
 | `grpc_direct/pipeline_fft.proto` | `samples` is field 1 (`FloatArray`), `raw_samples` is field 4 (`bytes`). |
+| `fft/bench_fft_memsrc.cc` | The memory placement ladder. Arms `device` / `devwrite` / `mgdwrite` / `hostalloc` / `heapreg` / `shmreg` / `hugereg`. Has `smaps_backing()` for reading what actually backs a mapping, a `SIGSEGV`/`SIGBUS` fault probe that drops an unusable arm instead of killing the sweep, and a rotating arm order. **`--sizes` is in samples, not KB.** |
+| `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA feasibility gates. Build with `nvcc -O2 -arch=native ... -lcuda`, and add `-libverbs` for gate 4. |
 | `PROGRESS.md` / `SHORTTERM_CONTEXT.md` / `LONGTERM_CONTEXT.md` | Updated, gitignored. |
 
 ## 13. Benchmark parameters (keep these constant for comparability)
