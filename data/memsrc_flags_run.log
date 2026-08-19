@@ -1,0 +1,634 @@
+cuFFT input-placement ladder: WRITE + TRANSFORM
+build: 6070ae1   5 reps x 9 arms x 9 sizes, arms interleaved per iteration
+
+Why both halves are reported:
+  In the pipeline benchmark the producer's write happens OUTSIDE the
+  measured window.  A change that makes the write slower and the
+  transform faster would therefore look like a pure win while being
+  neutral or worse in reality.  Reporting the transform alone would be
+  a stopwatch artifact, so write, transform and their total are all
+  below and the verdict is taken on the TOTAL.
+
+Decision rule, fixed before the data exists:
+  Reading from device memory was worth 6.10 us at 4 MB in the earlier
+  read-only ladder (47.55 vs 53.66).  So if landing data in device
+  memory costs MORE than 6.10 us of extra write time, the direction is
+  dead and no implementation route gets started.
+
+Note on the 'device' arm: it reaches device memory the only way it
+  normally can, by copying.  Its write column is a full H2D transfer.
+  'devwrite' is the one that matters: the data LANDS there.
+
+== 16 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2064kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2064kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2064kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2064kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=16kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=16kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=16kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_def     peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_wc      peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_wcmap   peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg     peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_def peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_port peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_big peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   rep 1  hostalloc  write    0.160   fft    4.384   total    4.544 us    290.816 us/MB
+   rep 1  ha_def     write    0.160   fft    4.416   total    4.576 us    292.864 us/MB
+   rep 1  ha_wc      write    0.160   fft    4.384   total    4.544 us    290.816 us/MB
+   rep 1  ha_wcmap   write    0.160   fft    4.416   total    4.576 us    292.864 us/MB
+   rep 1  shmreg     write    1.248   fft    4.800   total    6.048 us    387.072 us/MB
+   rep 1  shmreg_def write    1.312   fft    4.896   total    6.208 us    397.312 us/MB
+   rep 1  shmreg_port write    1.312   fft    4.832   total    6.144 us    393.216 us/MB
+   rep 1  shmreg_big write    1.312   fft    4.928   total    6.240 us    399.360 us/MB
+   rep 2  hostalloc  write    0.160   fft    6.176   total    6.336 us    405.504 us/MB
+   rep 2  ha_def     write    0.160   fft    6.144   total    6.304 us    403.456 us/MB
+   rep 2  ha_wc      write    0.160   fft    6.112   total    6.272 us    401.408 us/MB
+   rep 2  ha_wcmap   write    0.160   fft    6.080   total    6.240 us    399.360 us/MB
+   rep 2  shmreg     write    1.264   fft    4.864   total    6.128 us    392.192 us/MB
+   rep 2  shmreg_def write    1.360   fft    4.864   total    6.224 us    398.336 us/MB
+   rep 2  shmreg_port write    1.376   fft    4.864   total    6.240 us    399.360 us/MB
+   rep 2  shmreg_big write    1.360   fft    4.864   total    6.224 us    398.336 us/MB
+   rep 3  hostalloc  write    0.160   fft    6.176   total    6.336 us    405.504 us/MB
+   rep 3  ha_def     write    0.160   fft    6.176   total    6.336 us    405.504 us/MB
+   rep 3  ha_wc      write    0.160   fft    6.144   total    6.304 us    403.456 us/MB
+   rep 3  ha_wcmap   write    0.160   fft    6.080   total    6.240 us    399.360 us/MB
+   rep 3  shmreg     write    1.264   fft    4.896   total    6.160 us    394.240 us/MB
+   rep 3  shmreg_def write    1.344   fft    4.864   total    6.208 us    397.312 us/MB
+   rep 3  shmreg_port write    1.360   fft    4.832   total    6.192 us    396.288 us/MB
+   rep 3  shmreg_big write    1.392   fft    4.896   total    6.288 us    402.432 us/MB
+   rep 4  hostalloc  write    0.160   fft    6.048   total    6.208 us    397.312 us/MB
+   rep 4  ha_def     write    0.160   fft    6.144   total    6.304 us    403.456 us/MB
+   rep 4  ha_wc      write    0.160   fft    6.112   total    6.272 us    401.408 us/MB
+   rep 4  ha_wcmap   write    0.160   fft    6.112   total    6.272 us    401.408 us/MB
+   rep 4  shmreg     write    1.264   fft    4.864   total    6.128 us    392.192 us/MB
+   rep 4  shmreg_def write    1.344   fft    4.832   total    6.176 us    395.264 us/MB
+   rep 4  shmreg_port write    1.376   fft    4.864   total    6.240 us    399.360 us/MB
+   rep 4  shmreg_big write    1.376   fft    4.896   total    6.272 us    401.408 us/MB
+   rep 5  hostalloc  write    0.160   fft    6.176   total    6.336 us    405.504 us/MB
+   rep 5  ha_def     write    0.160   fft    6.176   total    6.336 us    405.504 us/MB
+   rep 5  ha_wc      write    0.160   fft    6.144   total    6.304 us    403.456 us/MB
+   rep 5  ha_wcmap   write    0.160   fft    6.080   total    6.240 us    399.360 us/MB
+   rep 5  shmreg     write    1.280   fft    4.896   total    6.176 us    395.264 us/MB
+   rep 5  shmreg_def write    1.376   fft    4.832   total    6.208 us    397.312 us/MB
+   rep 5  shmreg_port write    1.360   fft    4.896   total    6.256 us    400.384 us/MB
+   rep 5  shmreg_big write    1.392   fft    4.832   total    6.224 us    398.336 us/MB
+
+== 32 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2080kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2080kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2080kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2080kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=32kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=32kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=32kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_def     peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_wc      peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   ha_wcmap   peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg     peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_def peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_port peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   shmreg_big peaks: 488.3 Hz 1220.7 Hz 2441.4 Hz 
+   rep 1  hostalloc  write    0.288   fft    6.400   total    6.688 us    214.016 us/MB
+   rep 1  ha_def     write    0.288   fft    6.368   total    6.656 us    212.992 us/MB
+   rep 1  ha_wc      write    0.288   fft    6.368   total    6.656 us    212.992 us/MB
+   rep 1  ha_wcmap   write    0.304   fft    6.368   total    6.672 us    213.504 us/MB
+   rep 1  shmreg     write    1.888   fft    6.656   total    8.544 us    273.408 us/MB
+   rep 1  shmreg_def write    1.840   fft    6.688   total    8.528 us    272.896 us/MB
+   rep 1  shmreg_port write    1.920   fft    6.592   total    8.512 us    272.384 us/MB
+   rep 1  shmreg_big write    1.824   fft    6.720   total    8.544 us    273.408 us/MB
+   rep 2  hostalloc  write    0.288   fft    6.400   total    6.688 us    214.016 us/MB
+   rep 2  ha_def     write    0.288   fft    6.400   total    6.688 us    214.016 us/MB
+   rep 2  ha_wc      write    0.288   fft    6.400   total    6.688 us    214.016 us/MB
+   rep 2  ha_wcmap   write    0.304   fft    6.400   total    6.704 us    214.528 us/MB
+   rep 2  shmreg     write    1.904   fft    6.592   total    8.496 us    271.872 us/MB
+   rep 2  shmreg_def write    1.840   fft    6.592   total    8.432 us    269.824 us/MB
+   rep 2  shmreg_port write    1.968   fft    6.528   total    8.496 us    271.872 us/MB
+   rep 2  shmreg_big write    1.840   fft    6.656   total    8.496 us    271.872 us/MB
+   rep 3  hostalloc  write    0.288   fft    6.208   total    6.496 us    207.872 us/MB
+   rep 3  ha_def     write    0.288   fft    6.176   total    6.464 us    206.848 us/MB
+   rep 3  ha_wc      write    0.288   fft    6.240   total    6.528 us    208.896 us/MB
+   rep 3  ha_wcmap   write    0.304   fft    6.208   total    6.512 us    208.384 us/MB
+   rep 3  shmreg     write    1.968   fft    6.368   total    8.336 us    266.752 us/MB
+   rep 3  shmreg_def write    1.904   fft    6.368   total    8.272 us    264.704 us/MB
+   rep 3  shmreg_port write    1.984   fft    6.432   total    8.416 us    269.312 us/MB
+   rep 3  shmreg_big write    1.904   fft    6.432   total    8.336 us    266.752 us/MB
+   rep 4  hostalloc  write    0.288   fft    6.208   total    6.496 us    207.872 us/MB
+   rep 4  ha_def     write    0.288   fft    6.240   total    6.528 us    208.896 us/MB
+   rep 4  ha_wc      write    0.288   fft    6.208   total    6.496 us    207.872 us/MB
+   rep 4  ha_wcmap   write    0.304   fft    6.208   total    6.512 us    208.384 us/MB
+   rep 4  shmreg     write    1.952   fft    6.400   total    8.352 us    267.264 us/MB
+   rep 4  shmreg_def write    1.904   fft    6.432   total    8.336 us    266.752 us/MB
+   rep 4  shmreg_port write    2.000   fft    6.432   total    8.432 us    269.824 us/MB
+   rep 4  shmreg_big write    1.904   fft    6.432   total    8.336 us    266.752 us/MB
+   rep 5  hostalloc  write    0.288   fft    6.176   total    6.464 us    206.848 us/MB
+   rep 5  ha_def     write    0.288   fft    6.176   total    6.464 us    206.848 us/MB
+   rep 5  ha_wc      write    0.288   fft    6.176   total    6.464 us    206.848 us/MB
+   rep 5  ha_wcmap   write    0.304   fft    6.176   total    6.480 us    207.360 us/MB
+   rep 5  shmreg     write    1.968   fft    6.368   total    8.336 us    266.752 us/MB
+   rep 5  shmreg_def write    1.920   fft    6.400   total    8.320 us    266.240 us/MB
+   rep 5  shmreg_port write    2.000   fft    6.400   total    8.400 us    268.800 us/MB
+   rep 5  shmreg_big write    1.904   fft    6.400   total    8.304 us    265.728 us/MB
+
+== 64 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2112kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2112kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2112kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2112kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=64kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=64kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=64kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   ha_def     peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   ha_wc      peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   ha_wcmap   peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   shmreg     peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   shmreg_def peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   shmreg_port peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   shmreg_big peaks: 488.3 Hz 1220.7 Hz 2502.4 Hz 
+   rep 1  hostalloc  write    0.560   fft    8.864   total    9.424 us    150.784 us/MB
+   rep 1  ha_def     write    0.560   fft    8.896   total    9.456 us    151.296 us/MB
+   rep 1  ha_wc      write    0.560   fft    8.864   total    9.424 us    150.784 us/MB
+   rep 1  ha_wcmap   write    0.576   fft    8.864   total    9.440 us    151.040 us/MB
+   rep 1  shmreg     write    3.040   fft    8.704   total   11.744 us    187.904 us/MB
+   rep 1  shmreg_def write    3.040   fft    8.672   total   11.712 us    187.392 us/MB
+   rep 1  shmreg_port write    3.056   fft    8.832   total   11.888 us    190.208 us/MB
+   rep 1  shmreg_big write    3.008   fft    8.768   total   11.776 us    188.416 us/MB
+   rep 2  hostalloc  write    0.576   fft    8.832   total    9.408 us    150.528 us/MB
+   rep 2  ha_def     write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 2  ha_wc      write    0.576   fft    8.864   total    9.440 us    151.040 us/MB
+   rep 2  ha_wcmap   write    0.592   fft    8.864   total    9.456 us    151.296 us/MB
+   rep 2  shmreg     write    3.104   fft    8.992   total   12.096 us    193.536 us/MB
+   rep 2  shmreg_def write    3.056   fft    8.608   total   11.664 us    186.624 us/MB
+   rep 2  shmreg_port write    3.136   fft    8.960   total   12.096 us    193.536 us/MB
+   rep 2  shmreg_big write    3.056   fft    8.928   total   11.984 us    191.744 us/MB
+   rep 3  hostalloc  write    0.576   fft    8.864   total    9.440 us    151.040 us/MB
+   rep 3  ha_def     write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 3  ha_wc      write    0.576   fft    8.864   total    9.440 us    151.040 us/MB
+   rep 3  ha_wcmap   write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 3  shmreg     write    3.120   fft    8.992   total   12.112 us    193.792 us/MB
+   rep 3  shmreg_def write    3.056   fft    8.608   total   11.664 us    186.624 us/MB
+   rep 3  shmreg_port write    3.152   fft    8.960   total   12.112 us    193.792 us/MB
+   rep 3  shmreg_big write    3.024   fft    8.736   total   11.760 us    188.160 us/MB
+   rep 4  hostalloc  write    0.560   fft    8.928   total    9.488 us    151.808 us/MB
+   rep 4  ha_def     write    0.560   fft    8.960   total    9.520 us    152.320 us/MB
+   rep 4  ha_wc      write    0.560   fft    8.896   total    9.456 us    151.296 us/MB
+   rep 4  ha_wcmap   write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 4  shmreg     write    3.024   fft    8.672   total   11.696 us    187.136 us/MB
+   rep 4  shmreg_def write    3.008   fft    8.640   total   11.648 us    186.368 us/MB
+   rep 4  shmreg_port write    3.056   fft    8.736   total   11.792 us    188.672 us/MB
+   rep 4  shmreg_big write    2.992   fft    8.768   total   11.760 us    188.160 us/MB
+   rep 5  hostalloc  write    0.576   fft    8.864   total    9.440 us    151.040 us/MB
+   rep 5  ha_def     write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 5  ha_wc      write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 5  ha_wcmap   write    0.576   fft    8.896   total    9.472 us    151.552 us/MB
+   rep 5  shmreg     write    3.104   fft    8.960   total   12.064 us    193.024 us/MB
+   rep 5  shmreg_def write    3.056   fft    8.736   total   11.792 us    188.672 us/MB
+   rep 5  shmreg_port write    3.152   fft    8.896   total   12.048 us    192.768 us/MB
+   rep 5  shmreg_big write    3.008   fft    8.640   total   11.648 us    186.368 us/MB
+
+== 128 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2176kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2176kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2176kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2176kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=128kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=128kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=128kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   ha_def     peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   ha_wc      peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   ha_wcmap   peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   shmreg     peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   shmreg_def peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   shmreg_port peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   shmreg_big peaks: 488.3 Hz 518.8 Hz 1190.2 Hz 
+   rep 1  hostalloc  write    1.104   fft   15.616   total   16.720 us    133.760 us/MB
+   rep 1  ha_def     write    1.104   fft   15.584   total   16.688 us    133.504 us/MB
+   rep 1  ha_wc      write    1.120   fft   15.616   total   16.736 us    133.888 us/MB
+   rep 1  ha_wcmap   write    1.104   fft   15.616   total   16.720 us    133.760 us/MB
+   rep 1  shmreg     write    5.376   fft   15.424   total   20.800 us    166.400 us/MB
+   rep 1  shmreg_def write    5.376   fft   15.424   total   20.800 us    166.400 us/MB
+   rep 1  shmreg_port write    5.344   fft   15.392   total   20.736 us    165.888 us/MB
+   rep 1  shmreg_big write    5.312   fft   15.424   total   20.736 us    165.888 us/MB
+   rep 2  hostalloc  write    1.104   fft   15.488   total   16.592 us    132.736 us/MB
+   rep 2  ha_def     write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 2  ha_wc      write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 2  ha_wcmap   write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 2  shmreg     write    5.584   fft   15.168   total   20.752 us    166.016 us/MB
+   rep 2  shmreg_def write    5.488   fft   15.104   total   20.592 us    164.736 us/MB
+   rep 2  shmreg_port write    5.504   fft   15.104   total   20.608 us    164.864 us/MB
+   rep 2  shmreg_big write    5.472   fft   15.168   total   20.640 us    165.120 us/MB
+   rep 3  hostalloc  write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 3  ha_def     write    1.104   fft   15.424   total   16.528 us    132.224 us/MB
+   rep 3  ha_wc      write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 3  ha_wcmap   write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 3  shmreg     write    5.504   fft   15.168   total   20.672 us    165.376 us/MB
+   rep 3  shmreg_def write    5.504   fft   15.104   total   20.608 us    164.864 us/MB
+   rep 3  shmreg_port write    5.520   fft   15.168   total   20.688 us    165.504 us/MB
+   rep 3  shmreg_big write    5.456   fft   15.232   total   20.688 us    165.504 us/MB
+   rep 4  hostalloc  write    1.104   fft   15.424   total   16.528 us    132.224 us/MB
+   rep 4  ha_def     write    1.104   fft   15.424   total   16.528 us    132.224 us/MB
+   rep 4  ha_wc      write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 4  ha_wcmap   write    1.088   fft   15.424   total   16.512 us    132.096 us/MB
+   rep 4  shmreg     write    5.536   fft   15.040   total   20.576 us    164.608 us/MB
+   rep 4  shmreg_def write    5.504   fft   15.072   total   20.576 us    164.608 us/MB
+   rep 4  shmreg_port write    5.552   fft   15.040   total   20.592 us    164.736 us/MB
+   rep 4  shmreg_big write    5.487   fft   15.136   total   20.623 us    164.984 us/MB
+   rep 5  hostalloc  write    1.088   fft   15.456   total   16.544 us    132.352 us/MB
+   rep 5  ha_def     write    1.088   fft   15.456   total   16.544 us    132.352 us/MB
+   rep 5  ha_wc      write    1.104   fft   15.456   total   16.560 us    132.480 us/MB
+   rep 5  ha_wcmap   write    1.088   fft   15.456   total   16.544 us    132.352 us/MB
+   rep 5  shmreg     write    5.584   fft   15.072   total   20.656 us    165.248 us/MB
+   rep 5  shmreg_def write    5.472   fft   15.072   total   20.544 us    164.352 us/MB
+   rep 5  shmreg_port write    5.584   fft   15.072   total   20.656 us    165.248 us/MB
+   rep 5  shmreg_big write    5.488   fft   15.072   total   20.560 us    164.480 us/MB
+
+== 256 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2304kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2304kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2304kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2304kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=256kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=256kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=256kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   ha_def     peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   ha_wc      peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   ha_wcmap   peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   shmreg     peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   shmreg_def peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   shmreg_port peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   shmreg_big peaks: 503.5 Hz 1205.4 Hz 488.3 Hz 
+   rep 1  hostalloc  write    2.400   fft   17.280   total   19.680 us     78.720 us/MB
+   rep 1  ha_def     write    2.336   fft   17.312   total   19.648 us     78.592 us/MB
+   rep 1  ha_wc      write    2.304   fft   17.376   total   19.680 us     78.720 us/MB
+   rep 1  ha_wcmap   write    2.304   fft   17.344   total   19.648 us     78.592 us/MB
+   rep 1  shmreg     write   10.464   fft   17.248   total   27.712 us    110.848 us/MB
+   rep 1  shmreg_def write   10.416   fft   17.248   total   27.664 us    110.656 us/MB
+   rep 1  shmreg_port write   10.512   fft   17.504   total   28.016 us    112.064 us/MB
+   rep 1  shmreg_big write   10.336   fft   17.248   total   27.584 us    110.336 us/MB
+   rep 2  hostalloc  write    2.368   fft   17.312   total   19.680 us     78.720 us/MB
+   rep 2  ha_def     write    2.320   fft   17.344   total   19.664 us     78.656 us/MB
+   rep 2  ha_wc      write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 2  ha_wcmap   write    2.288   fft   17.376   total   19.664 us     78.656 us/MB
+   rep 2  shmreg     write   10.480   fft   17.248   total   27.728 us    110.912 us/MB
+   rep 2  shmreg_def write   10.448   fft   17.312   total   27.760 us    111.040 us/MB
+   rep 2  shmreg_port write   10.544   fft   17.440   total   27.984 us    111.936 us/MB
+   rep 2  shmreg_big write   10.368   fft   17.312   total   27.680 us    110.720 us/MB
+   rep 3  hostalloc  write    2.368   fft   17.376   total   19.744 us     78.976 us/MB
+   rep 3  ha_def     write    2.320   fft   17.312   total   19.632 us     78.528 us/MB
+   rep 3  ha_wc      write    2.288   fft   17.376   total   19.664 us     78.656 us/MB
+   rep 3  ha_wcmap   write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 3  shmreg     write   10.528   fft   17.280   total   27.808 us    111.232 us/MB
+   rep 3  shmreg_def write   10.448   fft   17.312   total   27.760 us    111.040 us/MB
+   rep 3  shmreg_port write   10.576   fft   17.440   total   28.016 us    112.064 us/MB
+   rep 3  shmreg_big write   10.400   fft   17.344   total   27.744 us    110.976 us/MB
+   rep 4  hostalloc  write    2.352   fft   17.344   total   19.696 us     78.784 us/MB
+   rep 4  ha_def     write    2.304   fft   17.344   total   19.648 us     78.592 us/MB
+   rep 4  ha_wc      write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 4  ha_wcmap   write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 4  shmreg     write   10.480   fft   17.280   total   27.760 us    111.040 us/MB
+   rep 4  shmreg_def write   10.432   fft   17.312   total   27.744 us    110.976 us/MB
+   rep 4  shmreg_port write   10.544   fft   17.344   total   27.888 us    111.552 us/MB
+   rep 4  shmreg_big write   10.368   fft   17.312   total   27.680 us    110.720 us/MB
+   rep 5  hostalloc  write    2.352   fft   17.344   total   19.696 us     78.784 us/MB
+   rep 5  ha_def     write    2.320   fft   17.344   total   19.664 us     78.656 us/MB
+   rep 5  ha_wc      write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 5  ha_wcmap   write    2.272   fft   17.376   total   19.648 us     78.592 us/MB
+   rep 5  shmreg     write   10.512   fft   17.312   total   27.824 us    111.296 us/MB
+   rep 5  shmreg_def write   10.416   fft   17.312   total   27.728 us    110.912 us/MB
+   rep 5  shmreg_port write   10.576   fft   17.536   total   28.112 us    112.448 us/MB
+   rep 5  shmreg_big write   10.368   fft   17.344   total   27.712 us    110.848 us/MB
+
+== 512 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=2560kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=2560kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=2560kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=2560kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=512kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=512kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=512kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   ha_def     peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   ha_wc      peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   ha_wcmap   peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   shmreg     peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   shmreg_def peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   shmreg_port peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   shmreg_big peaks: 503.5 Hz 495.9 Hz 1197.8 Hz 
+   rep 1  hostalloc  write    5.136   fft   20.800   total   25.936 us     51.872 us/MB
+   rep 1  ha_def     write    4.672   fft   20.928   total   25.600 us     51.200 us/MB
+   rep 1  ha_wc      write    4.752   fft   21.024   total   25.776 us     51.552 us/MB
+   rep 1  ha_wcmap   write    4.736   fft   20.992   total   25.728 us     51.456 us/MB
+   rep 1  shmreg     write   19.424   fft   20.576   total   40.000 us     80.000 us/MB
+   rep 1  shmreg_def write   19.600   fft   20.704   total   40.304 us     80.608 us/MB
+   rep 1  shmreg_port write   19.519   fft   20.768   total   40.287 us     80.574 us/MB
+   rep 1  shmreg_big write   19.472   fft   20.800   total   40.272 us     80.544 us/MB
+   rep 2  hostalloc  write    5.120   fft   20.704   total   25.824 us     51.648 us/MB
+   rep 2  ha_def     write    4.656   fft   21.024   total   25.680 us     51.360 us/MB
+   rep 2  ha_wc      write    4.687   fft   21.056   total   25.743 us     51.486 us/MB
+   rep 2  ha_wcmap   write    4.688   fft   21.024   total   25.712 us     51.424 us/MB
+   rep 2  shmreg     write   19.760   fft   20.640   total   40.400 us     80.800 us/MB
+   rep 2  shmreg_def write   20.368   fft   20.672   total   41.040 us     82.080 us/MB
+   rep 2  shmreg_port write   20.224   fft   20.736   total   40.960 us     81.920 us/MB
+   rep 2  shmreg_big write   20.192   fft   20.832   total   41.024 us     82.048 us/MB
+   rep 3  hostalloc  write    5.120   fft   20.704   total   25.824 us     51.648 us/MB
+   rep 3  ha_def     write    4.672   fft   21.024   total   25.696 us     51.392 us/MB
+   rep 3  ha_wc      write    4.672   fft   21.120   total   25.792 us     51.584 us/MB
+   rep 3  ha_wcmap   write    4.688   fft   21.056   total   25.744 us     51.488 us/MB
+   rep 3  shmreg     write   19.744   fft   20.576   total   40.320 us     80.640 us/MB
+   rep 3  shmreg_def write   20.320   fft   20.672   total   40.992 us     81.984 us/MB
+   rep 3  shmreg_port write   20.240   fft   20.736   total   40.976 us     81.952 us/MB
+   rep 3  shmreg_big write   20.208   fft   20.800   total   41.008 us     82.016 us/MB
+   rep 4  hostalloc  write    5.152   fft   20.672   total   25.824 us     51.648 us/MB
+   rep 4  ha_def     write    4.672   fft   20.992   total   25.664 us     51.328 us/MB
+   rep 4  ha_wc      write    4.688   fft   21.088   total   25.776 us     51.552 us/MB
+   rep 4  ha_wcmap   write    4.720   fft   20.992   total   25.712 us     51.424 us/MB
+   rep 4  shmreg     write   19.744   fft   20.576   total   40.320 us     80.640 us/MB
+   rep 4  shmreg_def write   20.352   fft   20.640   total   40.992 us     81.984 us/MB
+   rep 4  shmreg_port write   20.208   fft   20.704   total   40.912 us     81.824 us/MB
+   rep 4  shmreg_big write   20.240   fft   20.768   total   41.008 us     82.016 us/MB
+   rep 5  hostalloc  write    5.120   fft   20.672   total   25.792 us     51.584 us/MB
+   rep 5  ha_def     write    4.656   fft   21.024   total   25.680 us     51.360 us/MB
+   rep 5  ha_wc      write    4.672   fft   21.088   total   25.760 us     51.520 us/MB
+   rep 5  ha_wcmap   write    4.672   fft   21.056   total   25.728 us     51.456 us/MB
+   rep 5  shmreg     write   19.744   fft   20.512   total   40.256 us     80.512 us/MB
+   rep 5  shmreg_def write   20.368   fft   20.672   total   41.040 us     82.080 us/MB
+   rep 5  shmreg_port write   20.208   fft   20.704   total   40.912 us     81.824 us/MB
+   rep 5  shmreg_big write   20.208   fft   20.800   total   41.008 us     82.016 us/MB
+
+== 1024 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=3072kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=3072kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=3072kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=3072kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=1024kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=1024kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=1024kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   ha_def     peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   ha_wc      peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   ha_wcmap   peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   shmreg     peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   shmreg_def peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   shmreg_port peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   shmreg_big peaks: 499.7 Hz 1201.6 Hz 1197.8 Hz 
+   rep 1  hostalloc  write   10.704   fft   23.520   total   34.224 us     34.224 us/MB
+   rep 1  ha_def     write   10.880   fft   24.128   total   35.008 us     35.008 us/MB
+   rep 1  ha_wc      write   10.960   fft   24.064   total   35.024 us     35.024 us/MB
+   rep 1  ha_wcmap   write   10.608   fft   23.584   total   34.192 us     34.192 us/MB
+   rep 1  shmreg     write   33.696   fft   23.904   total   57.600 us     57.600 us/MB
+   rep 1  shmreg_def write   31.168   fft   23.744   total   54.912 us     54.912 us/MB
+   rep 1  shmreg_port write   33.839   fft   23.840   total   57.679 us     57.679 us/MB
+   rep 1  shmreg_big write   35.296   fft   24.032   total   59.328 us     59.328 us/MB
+   rep 2  hostalloc  write   10.624   fft   23.520   total   34.144 us     34.144 us/MB
+   rep 2  ha_def     write   10.816   fft   24.192   total   35.008 us     35.008 us/MB
+   rep 2  ha_wc      write   10.736   fft   24.096   total   34.832 us     34.832 us/MB
+   rep 2  ha_wcmap   write   10.512   fft   23.648   total   34.160 us     34.160 us/MB
+   rep 2  shmreg     write   33.568   fft   23.968   total   57.536 us     57.536 us/MB
+   rep 2  shmreg_def write   30.912   fft   23.744   total   54.656 us     54.656 us/MB
+   rep 2  shmreg_port write   33.776   fft   23.808   total   57.584 us     57.584 us/MB
+   rep 2  shmreg_big write   35.200   fft   23.968   total   59.168 us     59.168 us/MB
+   rep 3  hostalloc  write   10.623   fft   23.584   total   34.207 us     34.207 us/MB
+   rep 3  ha_def     write   10.736   fft   24.288   total   35.024 us     35.024 us/MB
+   rep 3  ha_wc      write   10.672   fft   23.616   total   34.288 us     34.288 us/MB
+   rep 3  ha_wcmap   write   10.496   fft   23.680   total   34.176 us     34.176 us/MB
+   rep 3  shmreg     write   33.568   fft   24.000   total   57.568 us     57.568 us/MB
+   rep 3  shmreg_def write   30.975   fft   23.776   total   54.751 us     54.751 us/MB
+   rep 3  shmreg_port write   33.808   fft   23.840   total   57.648 us     57.648 us/MB
+   rep 3  shmreg_big write   35.248   fft   24.032   total   59.280 us     59.280 us/MB
+   rep 4  hostalloc  write   10.608   fft   23.584   total   34.192 us     34.192 us/MB
+   rep 4  ha_def     write   10.768   fft   24.224   total   34.992 us     34.992 us/MB
+   rep 4  ha_wc      write   10.704   fft   23.616   total   34.320 us     34.320 us/MB
+   rep 4  ha_wcmap   write   10.480   fft   23.680   total   34.160 us     34.160 us/MB
+   rep 4  shmreg     write   33.552   fft   23.968   total   57.520 us     57.520 us/MB
+   rep 4  shmreg_def write   30.944   fft   23.776   total   54.720 us     54.720 us/MB
+   rep 4  shmreg_port write   33.823   fft   23.808   total   57.631 us     57.631 us/MB
+   rep 4  shmreg_big write   35.248   fft   23.968   total   59.216 us     59.216 us/MB
+   rep 5  hostalloc  write   10.592   fft   23.584   total   34.176 us     34.176 us/MB
+   rep 5  ha_def     write   10.768   fft   24.192   total   34.960 us     34.960 us/MB
+   rep 5  ha_wc      write   10.704   fft   23.520   total   34.224 us     34.224 us/MB
+   rep 5  ha_wcmap   write   10.512   fft   23.648   total   34.160 us     34.160 us/MB
+   rep 5  shmreg     write   33.552   fft   24.000   total   57.552 us     57.552 us/MB
+   rep 5  shmreg_def write   31.040   fft   23.776   total   54.816 us     54.816 us/MB
+   rep 5  shmreg_port write   33.984   fft   23.744   total   57.728 us     57.728 us/MB
+   rep 5  shmreg_big write   35.264   fft   23.968   total   59.232 us     59.232 us/MB
+
+== 2048 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 2 MB
+   shmreg_big SMAPS pagesize=4kB rss=2048kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   ha_def     peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   ha_wc      peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   ha_wcmap   peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   shmreg     peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   shmreg_def peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   shmreg_port peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   shmreg_big peaks: 499.7 Hz 1199.7 Hz 2500.5 Hz 
+   rep 1  hostalloc  write   24.032   fft   32.416   total   56.448 us     28.224 us/MB
+   rep 1  ha_def     write   24.688   fft   32.448   total   57.136 us     28.568 us/MB
+   rep 1  ha_wc      write   24.352   fft   32.608   total   56.960 us     28.480 us/MB
+   rep 1  ha_wcmap   write   24.576   fft   32.640   total   57.216 us     28.608 us/MB
+   rep 1  shmreg     write   34.752   fft   34.528   total   69.280 us     34.640 us/MB
+   rep 1  shmreg_def write   33.456   fft   34.016   total   67.472 us     33.736 us/MB
+   rep 1  shmreg_port write   30.112   fft   35.200   total   65.312 us     32.656 us/MB
+   rep 1  shmreg_big write   36.016   fft   34.720   total   70.736 us     35.368 us/MB
+   rep 2  hostalloc  write   23.216   fft   32.352   total   55.568 us     27.784 us/MB
+   rep 2  ha_def     write   23.840   fft   32.128   total   55.968 us     27.984 us/MB
+   rep 2  ha_wc      write   23.456   fft   32.448   total   55.904 us     27.952 us/MB
+   rep 2  ha_wcmap   write   23.807   fft   32.736   total   56.543 us     28.271 us/MB
+   rep 2  shmreg     write   34.560   fft   34.560   total   69.120 us     34.560 us/MB
+   rep 2  shmreg_def write   33.424   fft   34.112   total   67.536 us     33.768 us/MB
+   rep 2  shmreg_port write   30.064   fft   35.360   total   65.424 us     32.712 us/MB
+   rep 2  shmreg_big write   35.952   fft   34.912   total   70.864 us     35.432 us/MB
+   rep 3  hostalloc  write   23.152   fft   32.384   total   55.536 us     27.768 us/MB
+   rep 3  ha_def     write   23.776   fft   32.672   total   56.448 us     28.224 us/MB
+   rep 3  ha_wc      write   23.360   fft   32.544   total   55.904 us     27.952 us/MB
+   rep 3  ha_wcmap   write   23.664   fft   32.096   total   55.760 us     27.880 us/MB
+   rep 3  shmreg     write   34.544   fft   34.592   total   69.136 us     34.568 us/MB
+   rep 3  shmreg_def write   33.408   fft   34.016   total   67.424 us     33.712 us/MB
+   rep 3  shmreg_port write   30.080   fft   35.456   total   65.536 us     32.768 us/MB
+   rep 3  shmreg_big write   35.952   fft   34.752   total   70.704 us     35.352 us/MB
+   rep 4  hostalloc  write   23.120   fft   32.512   total   55.632 us     27.816 us/MB
+   rep 4  ha_def     write   23.744   fft   32.128   total   55.872 us     27.936 us/MB
+   rep 4  ha_wc      write   23.296   fft   32.800   total   56.096 us     28.048 us/MB
+   rep 4  ha_wcmap   write   23.696   fft   32.640   total   56.336 us     28.168 us/MB
+   rep 4  shmreg     write   34.640   fft   34.272   total   68.912 us     34.456 us/MB
+   rep 4  shmreg_def write   33.488   fft   33.760   total   67.248 us     33.624 us/MB
+   rep 4  shmreg_port write   30.144   fft   35.392   total   65.536 us     32.768 us/MB
+   rep 4  shmreg_big write   36.064   fft   34.816   total   70.880 us     35.440 us/MB
+   rep 5  hostalloc  write   23.152   fft   32.384   total   55.536 us     27.768 us/MB
+   rep 5  ha_def     write   23.776   fft   32.672   total   56.448 us     28.224 us/MB
+   rep 5  ha_wc      write   23.312   fft   32.928   total   56.240 us     28.120 us/MB
+   rep 5  ha_wcmap   write   23.696   fft   32.384   total   56.080 us     28.040 us/MB
+   rep 5  shmreg     write   34.624   fft   35.200   total   69.824 us     34.912 us/MB
+   rep 5  shmreg_def write   33.584   fft   34.080   total   67.664 us     33.832 us/MB
+   rep 5  shmreg_port write   30.224   fft   35.360   total   65.584 us     32.792 us/MB
+   rep 5  shmreg_big write   36.128   fft   34.784   total   70.912 us     35.456 us/MB
+
+== 4096 KB ==
+   hostalloc  ptr % 2MB = 0        
+   hostalloc  SMAPS pagesize=4kB rss=6144kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_def     ptr % 2MB = 0        cudaHostAlloc Default
+   ha_def     SMAPS pagesize=4kB rss=6144kB anonhuge=0kB filepmd=0kB back=/dev/zero (deleted) vmflags: rd wr sh mr mw me ms
+   ha_wc      ptr % 2MB = 0        cudaHostAlloc WriteCombined (uncached for CPU reads; our producer only writes)
+   ha_wc      SMAPS pagesize=4kB rss=6144kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   ha_wcmap   ptr % 2MB = 0        cudaHostAlloc Mapped|WriteCombined
+   ha_wcmap   SMAPS pagesize=4kB rss=6144kB anonhuge=0kB filepmd=0kB back=/dev/nvidiactl vmflags: rd wr sh mr mw me ms de dd mm
+   shmreg     ptr % 2MB = 0        
+   shmreg     SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_def ptr % 2MB = 0        cudaHostRegister Default
+   shmreg_def SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_def (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_port ptr % 2MB = 0        cudaHostRegister Portable
+   shmreg_port SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_port (deleted) vmflags: rd wr sh mr mw me ms
+   shmreg_ro  ptr % 2MB = 0        cudaHostRegister Mapped|ReadOnly (the transform is out-of-place, so read-only input is legal here); EXCLUDED: cudaHostRegister rejected: operation not supported
+   EXCLUDED: arm 'shmreg_ro' cannot be measured here
+   shmreg_big ptr % 2MB = 0        registration span rounded up to 4 MB
+   shmreg_big SMAPS pagesize=4kB rss=4096kB anonhuge=0kB filepmd=0kB back=/dev/shm/fft_memsrc_shmreg_big (deleted) vmflags: rd wr sh mr mw me ms
+   hostalloc  peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   ha_def     peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   ha_wc      peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   ha_wcmap   peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   shmreg     peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   shmreg_def peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   shmreg_port peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   shmreg_big peaks: 499.7 Hz 1199.7 Hz 500.7 Hz 
+   rep 1  hostalloc  write   63.120   fft   50.144   total  113.264 us     28.316 us/MB
+   rep 1  ha_def     write   65.936   fft   48.512   total  114.448 us     28.612 us/MB
+   rep 1  ha_wc      write   63.152   fft   50.304   total  113.456 us     28.364 us/MB
+   rep 1  ha_wcmap   write   63.888   fft   48.992   total  112.880 us     28.220 us/MB
+   rep 1  shmreg     write   98.767   fft   63.712   total  162.479 us     40.620 us/MB
+   rep 1  shmreg_def write   99.408   fft   65.728   total  165.136 us     41.284 us/MB
+   rep 1  shmreg_port write   97.839   fft   65.024   total  162.863 us     40.716 us/MB
+   rep 1  shmreg_big write  101.488   fft   65.088   total  166.576 us     41.644 us/MB
+   rep 2  hostalloc  write   63.472   fft   48.960   total  112.432 us     28.108 us/MB
+   rep 2  ha_def     write   64.032   fft   49.312   total  113.344 us     28.336 us/MB
+   rep 2  ha_wc      write   62.896   fft   49.824   total  112.720 us     28.180 us/MB
+   rep 2  ha_wcmap   write   63.632   fft   49.056   total  112.688 us     28.172 us/MB
+   rep 2  shmreg     write   98.160   fft   63.872   total  162.032 us     40.508 us/MB
+   rep 2  shmreg_def write   99.696   fft   65.856   total  165.552 us     41.388 us/MB
+   rep 2  shmreg_port write   99.456   fft   64.960   total  164.416 us     41.104 us/MB
+   rep 2  shmreg_big write  101.344   fft   65.312   total  166.656 us     41.664 us/MB
+   rep 3  hostalloc  write   64.720   fft   48.576   total  113.296 us     28.324 us/MB
+   rep 3  ha_def     write   63.936   fft   49.376   total  113.312 us     28.328 us/MB
+   rep 3  ha_wc      write   63.840   fft   48.992   total  112.832 us     28.208 us/MB
+   rep 3  ha_wcmap   write   62.144   fft   50.848   total  112.992 us     28.248 us/MB
+   rep 3  shmreg     write   97.952   fft   63.872   total  161.824 us     40.456 us/MB
+   rep 3  shmreg_def write  100.143   fft   65.952   total  166.095 us     41.524 us/MB
+   rep 3  shmreg_port write   97.808   fft   65.088   total  162.896 us     40.724 us/MB
+   rep 3  shmreg_big write  101.248   fft   65.088   total  166.336 us     41.584 us/MB
+   rep 4  hostalloc  write   65.024   fft   48.608   total  113.632 us     28.408 us/MB
+   rep 4  ha_def     write   63.680   fft   50.464   total  114.144 us     28.536 us/MB
+   rep 4  ha_wc      write   66.224   fft   48.256   total  114.480 us     28.620 us/MB
+   rep 4  ha_wcmap   write   62.144   fft   51.552   total  113.696 us     28.424 us/MB
+   rep 4  shmreg     write   98.032   fft   63.840   total  161.872 us     40.468 us/MB
+   rep 4  shmreg_def write  102.000   fft   65.568   total  167.568 us     41.892 us/MB
+   rep 4  shmreg_port write   97.359   fft   65.184   total  162.543 us     40.636 us/MB
+   rep 4  shmreg_big write  100.992   fft   65.088   total  166.080 us     41.520 us/MB
+   rep 5  hostalloc  write   64.688   fft   48.864   total  113.552 us     28.388 us/MB
+   rep 5  ha_def     write   64.160   fft   49.760   total  113.920 us     28.480 us/MB
+   rep 5  ha_wc      write   65.568   fft   48.704   total  114.272 us     28.568 us/MB
+   rep 5  ha_wcmap   write   62.368   fft   51.232   total  113.600 us     28.400 us/MB
+   rep 5  shmreg     write   98.544   fft   63.808   total  162.352 us     40.588 us/MB
+   rep 5  shmreg_def write   99.984   fft   65.536   total  165.520 us     41.380 us/MB
+   rep 5  shmreg_port write   97.728   fft   64.832   total  162.560 us     40.640 us/MB
+   rep 5  shmreg_big write  101.183   fft   65.248   total  166.431 us     41.608 us/MB
+
+DONE_MEMSRC -> data/memsrc_flags.csv
