@@ -70,6 +70,14 @@
 These are the durable lessons. Several headline numbers on this project turned out to be
 measurement artifacts, and each one survived for a while because it was plausible.
 
+- **Never quote the first run after a Spark reboot.** Phase 3 step 5 measured `fft` p50 at
+  21.25 us and end-to-end p50 at 38.61 us on a freshly booted machine, then 7.62 us and 12.66 us
+  on the very next run with nothing changed. `nvidia-smi` explained it: `clocks.sm` was 208 MHz
+  against a maximum of 3003 MHz, because the GPU parks at idle clocks and only ramps under
+  sustained load. A factor of three, from the machine alone. Both halves of the decomposition
+  inflated together, which is the signature to look for: a transport regression moves the
+  residual and leaves the transform alone. Query `clocks.sm` alongside every run and discard
+  anything taken below roughly 2400 MHz.
 - **Include a control that should NOT move.** When the RoCE MTU was raised, the 4 MB write got
   4.9% faster. On its own that is indistinguishable from drift between two runs. The 2-byte
   message was measured in the same pair of runs, and it could not possibly be affected because it

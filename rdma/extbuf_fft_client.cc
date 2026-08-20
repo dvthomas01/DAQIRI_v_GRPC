@@ -73,7 +73,9 @@ static void usage() {
         "  --npts    N    samples per message (default 4096)\n"
         "  --msgs    N    messages to send (default 200)\n"
         "  --pace-us N    sleep between sends; 0 = as fast as credit allows\n"
-        "  --warmup  N    messages sent before timing starts (default 20)\n");
+        "  --warmup  N    messages sent before timing starts (default 20)\n"
+        "  --linger-ms N  wait before teardown so in-flight sends drain\n"
+        "                 (default 200)\n");
 }
 
 int main(int argc, char** argv) {
@@ -83,6 +85,7 @@ int main(int argc, char** argv) {
     int         msgs    = 200;
     int         pace_us = 0;
     int         warmup  = 20;
+    int         linger_ms = 200;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -96,6 +99,7 @@ int main(int argc, char** argv) {
         else if (a == "--msgs")    msgs = std::stoi(next());
         else if (a == "--pace-us") pace_us = std::stoi(next());
         else if (a == "--warmup")  warmup = std::stoi(next());
+        else if (a == "--linger-ms") linger_ms = std::stoi(next());
         else { usage(); return 1; }
     }
 
@@ -187,6 +191,24 @@ int main(int argc, char** argv) {
     std::printf("blocked in send   : %.1f us total, %.1f%% of wall time\n",
                 sum, t_total > 0 ? 100.0 * sum / t_total : 0.0);
     std::printf("wall              : %.1f us\n", t_total);
+
+    // Wait before tearing the session down.  client_send returns once the
+    // buffer is queued, not once the peer has consumed it, so destroying the
+    // client immediately aborts the session underneath whatever is still in
+    // flight.  The first run lost the last three messages to exactly that: the
+    // receiver reported a completion status of -734017 and stopped at 197.
+    //
+    // A wait is the honest fix here rather than a lazy one, because this
+    // protocol has no acknowledgement to wait on.  The server never replies,
+    // by design: a reply per message would add a round trip to the very path
+    // being measured.  Draining by sender-side completion would not settle it
+    // either, since a send completing means the bytes reached the peer's
+    // memory and not that the peer's FFT has run.
+    //
+    // This is outside every timed region and after the last measurement, so it
+    // cannot flatter any number.
+    if (linger_ms > 0)
+        std::this_thread::sleep_for(std::chrono::milliseconds(linger_ms));
 
     grpc_direct_client_destroy(cli);
     std::printf("DONE_EXTBUF_CLIENT rc=%d\n", failed ? 1 : 0);

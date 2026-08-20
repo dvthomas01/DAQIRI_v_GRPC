@@ -12,6 +12,7 @@
 //
 // No CUDA and no verbs here: the PXI compiles this too.
 
+#include <cstddef>
 #include <cstdint>
 
 namespace contract {
