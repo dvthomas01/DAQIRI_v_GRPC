@@ -1,0 +1,21 @@
+### pwd: /home/admin/rdma_p2
+BUILD_EXIT=0
+HCA               : rocep117s0
+GID probe         : index 5 = 192.168.20.2 (RoCE v2, reaches 192.168.20.1)
+RESULT: gid_index=5 gid=0000:0000:0000:0000:0000:ffff:c0a8:1402
+RUN_EXIT=0
+
+### ground truth from the GID table ###
+  0  IB/RoCE v1 fe80:0000:0000:0000:bace:f6ff:fe40:5eea
+  1  RoCE v2    fe80:0000:0000:0000:bace:f6ff:fe40:5eea
+  2  IB/RoCE v1 0000:0000:0000:0000:0000:ffff:a9fe:47da
+  3  RoCE v2    0000:0000:0000:0000:0000:ffff:a9fe:47da
+  4  IB/RoCE v1 0000:0000:0000:0000:0000:ffff:c0a8:1402
+  5  RoCE v2    0000:0000:0000:0000:0000:ffff:c0a8:1402
+  6             0000:0000:0000:0000:0000:0000:0000:0000
+  7             0000:0000:0000:0000:0000:0000:0000:0000
+  8             0000:0000:0000:0000:0000:0000:0000:0000
+  9             0000:0000:0000:0000:0000:0000:0000:0000
+
+### the address that index follows ###
+    inet 192.168.20.2/24 scope global enp117s0

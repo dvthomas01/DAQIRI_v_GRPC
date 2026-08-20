@@ -1,0 +1,21 @@
+### pwd: /home/nitest/daqiri_gpu/rdma
+BUILD_EXIT=0
+HCA               : rocep1s0f0
+GID probe         : index 3 = 192.168.20.1 (RoCE v2, reaches 192.168.20.2)
+RESULT: gid_index=3 gid=0000:0000:0000:0000:0000:ffff:c0a8:1401
+RUN_EXIT=0
+
+### ground truth from the GID table ###
+  0  IB/RoCE v1 fe80:0000:0000:0000:4ebb:47ff:fe2e:ac6a
+  1  RoCE v2    fe80:0000:0000:0000:4ebb:47ff:fe2e:ac6a
+  2  IB/RoCE v1 0000:0000:0000:0000:0000:ffff:c0a8:1401
+  3  RoCE v2    0000:0000:0000:0000:0000:ffff:c0a8:1401
+  4             0000:0000:0000:0000:0000:0000:0000:0000
+  5             0000:0000:0000:0000:0000:0000:0000:0000
+  6             0000:0000:0000:0000:0000:0000:0000:0000
+  7             0000:0000:0000:0000:0000:0000:0000:0000
+  8             0000:0000:0000:0000:0000:0000:0000:0000
+  9             0000:0000:0000:0000:0000:0000:0000:0000
+
+### the address that index follows ###
+    inet 192.168.20.1/24 brd 192.168.20.255 scope global noprefixroute enp1s0f0np0

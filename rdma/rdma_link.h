@@ -174,7 +174,8 @@ struct Endpoint {
     ibv_cq*      cq   = nullptr;
     ibv_qp*      qp   = nullptr;
     uint8_t      port = 1;
-    int          gid_index = 0;
+    int          gid_index = -1;   // <0 = read it from the GID table
+    const char*  peer_ip = nullptr; // used to disambiguate the GID table
     ibv_gid      gid{};
     uint32_t     psn  = 0;
 };
@@ -213,6 +214,105 @@ inline void gid_to_string(const ibv_gid& g, char* out, size_t n) {
                   g.raw[12], g.raw[13], g.raw[14], g.raw[15]);
 }
 
+// Find the GID index for RoCE v2 on the fabric subnet.
+//
+// The index is a position in a table, not a property of the port, and it moves
+// when addresses are added or removed. Two things make a naive search wrong:
+//
+//   1. Every IPv4 address appears TWICE, once as IB/RoCE v1 and once as
+//      RoCE v2, at adjacent indices. Matching on the address alone picks the
+//      v1 entry, which will not talk to a v2 peer.
+//   2. The PXI carries a link-local 169.254.x address as well as the fabric
+//      address, and the link-local one sorts FIRST. Observed table:
+//        2 IB/RoCE v1 ::ffff:169.254.71.218
+//        3 RoCE v2    ::ffff:169.254.71.218   <- first RoCE v2 IPv4, and wrong
+//        4 IB/RoCE v1 ::ffff:192.168.20.2
+//        5 RoCE v2    ::ffff:192.168.20.2     <- the one we want
+//      So "first RoCE v2 IPv4" silently selects the wrong subnet.
+//
+// Selecting by peer address removes both hazards: we ask for the local GID that
+// can actually reach the peer. peer_ip may be null, in which case link-local is
+// skipped and the choice must be unambiguous.
+//
+// Returns -1 if there is no usable GID, which is itself the answer: the
+// interface has no fabric address.
+inline int find_roce_v2_ipv4_gid(ibv_context* ctx, uint8_t port,
+                                 const char* peer_ip = nullptr) {
+    const char* dev = ibv_get_device_name(ctx->device);
+
+    ibv_port_attr pa{};
+    if (ibv_query_port(ctx, port, &pa)) die("ibv_query_port");
+
+    uint32_t peer_be = 0;
+    if (peer_ip && *peer_ip && ::inet_pton(AF_INET, peer_ip, &peer_be) != 1)
+        die_msg("find_roce_v2_ipv4_gid: peer_ip is not a dotted quad");
+
+    int  best = -1, n_candidates = 0;
+    char seen[512] = {0};
+
+    for (int i = 0; i < pa.gid_tbl_len; ++i) {
+        char path[256];
+        std::snprintf(path, sizeof(path),
+                      "/sys/class/infiniband/%s/ports/%u/gid_attrs/types/%d",
+                      dev, port, i);
+        std::FILE* f = std::fopen(path, "r");
+        if (!f) continue;               // holes in the table are normal
+        char type[64] = {0};
+        char* got = std::fgets(type, sizeof(type), f);
+        std::fclose(f);
+        // Must be RoCE v2 exactly. "IB/RoCE v1" also contains "RoCE v", so
+        // anchor at the start of the string.
+        if (!got || std::strncmp(type, "RoCE v2", 7) != 0) continue;
+
+        // RoCE v2 covers IPv4 and IPv6. We want the IPv4-mapped form
+        // ::ffff:a.b.c.d, so bytes 0-9 zero and bytes 10-11 = 0xff.
+        ibv_gid g{};
+        if (ibv_query_gid(ctx, port, i, &g)) continue;
+        bool v4 = (g.raw[10] == 0xff && g.raw[11] == 0xff);
+        for (int b = 0; b < 10 && v4; ++b)
+            if (g.raw[b] != 0x00) v4 = false;
+        if (!v4) continue;
+
+        // 169.254.0.0/16 is an autoconfigured address, never our fabric.
+        if (g.raw[12] == 169 && g.raw[13] == 254) continue;
+
+        uint32_t addr_be = 0;
+        std::memcpy(&addr_be, &g.raw[12], 4);
+
+        char line[64];
+        std::snprintf(line, sizeof(line), "  index %d = %u.%u.%u.%u\n",
+                      i, g.raw[12], g.raw[13], g.raw[14], g.raw[15]);
+        std::strncat(seen, line, sizeof(seen) - std::strlen(seen) - 1);
+
+        if (peer_be) {
+            // Same /24 as the peer, i.e. the GID that can reach it.
+            if ((addr_be & 0x00ffffffu) != (peer_be & 0x00ffffffu)) continue;
+            std::printf("GID probe         : index %d = %u.%u.%u.%u "
+                        "(RoCE v2, reaches %s)\n",
+                        i, g.raw[12], g.raw[13], g.raw[14], g.raw[15], peer_ip);
+            return i;
+        }
+        if (best < 0) best = i;
+        ++n_candidates;
+    }
+
+    if (best < 0) {
+        if (seen[0])
+            std::fprintf(stderr, "RoCE v2 IPv4 GIDs present but none on the "
+                                 "peer's subnet:\n%s", seen);
+        return -1;
+    }
+    if (n_candidates > 1)
+        die_msg("more than one candidate RoCE v2 IPv4 GID and no peer address "
+                "to disambiguate. Pass --gid explicitly.");
+
+    ibv_gid g{};
+    ibv_query_gid(ctx, port, best, &g);
+    std::printf("GID probe         : index %d = %u.%u.%u.%u (RoCE v2)\n",
+                best, g.raw[12], g.raw[13], g.raw[14], g.raw[15]);
+    return best;
+}
+
 // Create a reliable-connection QP and drive it to INIT.
 inline void create_qp(Endpoint& ep, int cq_depth, int sq_depth, int rq_depth) {
     ep.pd = ibv_alloc_pd(ep.ctx);
@@ -238,6 +338,16 @@ inline void create_qp(Endpoint& ep, int cq_depth, int sq_depth, int rq_depth) {
     if (ibv_query_port(ep.ctx, ep.port, &pa)) die("ibv_query_port");
     if (pa.state != IBV_PORT_ACTIVE)
         die_msg("RDMA port is not ACTIVE. Check the link and the IP config.");
+
+    // gid_index < 0 means "read it", which is the default. An explicit --gid
+    // still overrides, but nothing relies on the override being supplied.
+    if (ep.gid_index < 0) {
+        ep.gid_index = find_roce_v2_ipv4_gid(ep.ctx, ep.port, ep.peer_ip);
+        if (ep.gid_index < 0)
+            die_msg("no RoCE v2 IPv4 GID on the fabric subnet. The interface "
+                    "has no 192.168.20.x address, or the address was lost. "
+                    "Re-add it, then retry.");
+    }
     if (ibv_query_gid(ep.ctx, ep.port, ep.gid_index, &ep.gid)) die("ibv_query_gid");
 
     char gs[64];

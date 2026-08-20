@@ -181,7 +181,8 @@ static void post_recv(ibv_qp* qp, uint64_t id) {
 // ─────────────────────────────────────────────────────────────────────────────
 int main(int argc, char** argv) {
     const char* dev        = "rocep1s0f0";
-    int         gid_index  = 3;
+    const char* peer_ip    = "192.168.20.2";  // the PXI, for GID selection
+    int         gid_index  = -1;  // <0 = read it; see find_roce_v2_ipv4_gid
     int         tcp_port   = 18600;
     int         n_slots    = 4;
     int         msgs       = 200;
@@ -197,6 +198,7 @@ int main(int argc, char** argv) {
         };
         if (a == "--dev")                  dev = next();
         else if (a == "--gid")             gid_index = std::atoi(next());
+        else if (a == "--peer")            peer_ip = next();
         else if (a == "--port")            tcp_port = std::atoi(next());
         else if (a == "--slots")           n_slots = std::atoi(next());
         else if (a == "--msgs")            msgs = std::atoi(next());
@@ -237,6 +239,7 @@ int main(int argc, char** argv) {
     // ── startup: device, QP ──────────────────────────────────────────────
     Endpoint ep;
     ep.gid_index = gid_index;
+    ep.peer_ip   = peer_ip;  // pick the local GID that can reach the sender
     ep.ctx       = open_device(dev);
     ep.psn       = 0x1234;
     create_qp(ep, 2 * n_slots + 16, 16, 2 * n_slots + 16);

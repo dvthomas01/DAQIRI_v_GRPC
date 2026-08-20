@@ -345,21 +345,37 @@ check cannot. Beware `4c:bb:47:2a:b7:*`: those are other DGX Sparks in the same 
 
 - **CURRENT (2026-08-06):** 50G RoCE link Spark `enp1s0f0np0` = `192.168.20.1/24` ↔ PXI
   `enp117s0` = `192.168.20.2/24`. RDMA verified with `rping` (RC read/write, 10/10).
-- PXI IP is runtime-only. **Corrected 2026-08-20: it does not only die on a PXI reboot, it dies
-  whenever the carrier flaps, which means every time the Spark is power-cycled.** Observed with
-  the PXI at `up 13 days` and no reboot of its own: `192.168.20.2/24` had been replaced by a
-  `169.254/16` link-local address, while `mtu 9000` survived. Recovery is
+- PXI IP is runtime-only. **The PXI's `192.168.20.2/24` does not survive a *Spark* power cycle,
+  not only a PXI reboot.** The PXI had 13 days uptime when it lost the address, and had not
+  rebooted; the carrier flapped when the Spark went down, and the address went with it. What
+  remained was a `169.254/16` link-local address, while `mtu 9000` survived. Recovery is
   `scripts/roce_restore_pxi.sh` (root on PXI), which is `ip addr add 192.168.20.2/24 dev
   enp117s0` plus the MTU, and then re-reads the GID indices. To persist: NI MAX or `connmanctl`.
   **Check this after every Spark reboot, not just after a PXI reboot**, because the failure is
   silent: the link stays UP, the ibverbs port stays ACTIVE, and only the route is gone.
-- **The GID index is a position in a list, not an identity. Read it, never quote it.** After the
-  2026-08-20 recovery the PXI's RoCE v2 IPv4 GID was back at index 5, which is what
-  `rdma/rdma_fft_client.cc` defaults to. That is only true because the stale link-local address
-  is *also* still on the interface, occupying indices 2 and 3 ahead of it. Flush the link-local
-  and `192.168.20.2` slides down to index 3. The Spark's is index 3 for the same reason in
-  reverse: it has only the one address. Both scripts print the indices with the address each one
-  carries; use that output rather than memory.
+- **The RoCE GID index follows the address, so it moves when the address changes. Read it
+  rather than hardcoding it.** `rdma/rdma_fft_client.cc` defaulted to 5 and the index was
+  observed at 3. Fixed 2026-08-20: both endpoints now default to `gid_index = -1`, meaning
+  `rdma::find_roce_v2_ipv4_gid()` in `rdma/rdma_link.h` reads the table at startup. `--gid`
+  still overrides. Measured tables, which show why the naive search is wrong twice over:
+
+  | | PXI `rocep117s0` | Spark `rocep1s0f0` |
+  |---|---|---|
+  | 0 | IB/RoCE v1 `fe80::…5eea` | IB/RoCE v1 `fe80::…ac6a` |
+  | 1 | RoCE v2 `fe80::…5eea` | RoCE v2 `fe80::…ac6a` |
+  | 2 | IB/RoCE v1 `::ffff:169.254.71.218` | IB/RoCE v1 `::ffff:192.168.20.1` |
+  | 3 | RoCE v2 `::ffff:169.254.71.218` | **RoCE v2 `::ffff:192.168.20.1`** ← Spark uses this |
+  | 4 | IB/RoCE v1 `::ffff:192.168.20.2` | — |
+  | 5 | **RoCE v2 `::ffff:192.168.20.2`** ← PXI uses this | — |
+
+  Two traps, both of which the first implementation of the search fell into. (a) Every IPv4
+  address appears **twice**, once as `IB/RoCE v1` and once as `RoCE v2`, at adjacent indices, so
+  matching on the address alone picks the v1 entry and it will not talk to a v2 peer. (b) The
+  PXI carries the link-local `169.254.x` **and** the fabric address, and the link-local sorts
+  *first*, so "the first RoCE v2 IPv4 GID" selects index 3, which is the wrong subnet. Selection
+  is therefore by peer address: each side asks for the local GID on the peer's `/24`. Verified
+  end to end 2026-08-20 with no `--gid` on either side, Spark picking 3 and PXI picking 5,
+  20/20 messages verified, 0 failures. `rdma/gid_probe.cc` reproduces the tables above.
 - (Historical: an earlier 192.168.10.x link on the 1G ports is obsolete after a room move.)
 - easyrdma built on BOTH arches (`core/` subdir only: `cmake .. -DCMAKE_BUILD_TYPE=Release; make`)
 - grpc-direct rebuilt with `--features rdma` on BOTH machines

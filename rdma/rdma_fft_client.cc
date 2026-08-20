@@ -29,7 +29,10 @@ using namespace rdma;
 int main(int argc, char** argv) {
     const char* host      = "192.168.20.1";  // the Spark, over RoCE
     const char* dev       = "rocep117s0";
-    int         gid_index = 5;
+    // -1 means read the RoCE v2 IPv4 GID out of the table. It used to be 5,
+    // which was right until the address moved and then it was 3. The index is
+    // a position in a list, not a property of the port.
+    int         gid_index = -1;
     int         tcp_port  = 18600;
 
     for (int i = 1; i < argc; ++i) {
@@ -52,6 +55,7 @@ int main(int argc, char** argv) {
 
     Endpoint ep;
     ep.gid_index = gid_index;
+    ep.peer_ip   = host;   // pick the local GID that can reach the receiver
     ep.ctx       = open_device(dev);
     ep.psn       = 0x4321;
     create_qp(ep, 32, 16, 16);

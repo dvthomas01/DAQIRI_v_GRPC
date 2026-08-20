@@ -76,7 +76,31 @@ alive with its correct MAC from a stale cache entry; and the PXI's RoCE address 
 power cycle**, not only on a PXI reboot. The PXI had 13 days of uptime and had still reverted to
 a `169.254/16` link-local address, because the carrier flapped. Recovery is
 `scripts/roce_restore_pxi.sh` as root on the PXI. The GID index moves with the address, so read
-it rather than quoting one from memory.
+it rather than quoting one from memory. **Fixed 2026-08-20:** both RDMA endpoints now default to
+`gid_index = -1` and call `rdma::find_roce_v2_ipv4_gid()`, which selects by peer address.
+Verified end to end with no `--gid` on either side. See `LONGTERM_CONTEXT.md` for the measured
+GID tables and the two ways a naive search gets this wrong.
+
+**Every gRPC number in this repo was produced against a modified `grpc-direct`, and the
+modification is inert for our workload.** The Spark's working tree carries an uncommitted
++16/-5 edit to `cpp/client_interceptor.cc`, and that file is on our path beyond any doubt:
+`CMakeLists.txt:299-301` compiles it into `grpc_direct_cpp`, `cpp/client_interceptor.cc:389`
+defines `DirectTransportInterceptorFactory::CreateClientInterceptor`, and
+`grpc_direct/bench_grpc_client.cc:114` constructs that exact factory and hands it to
+`CreateCustomChannelWithInterceptors` at line 118. So the answer to "is it linked" is yes.
+The answer to "does it change our numbers" is no, and the reason is specific rather than
+reassuring. Our RPC is **client-streaming**, not unary: `pipeline_fft.proto:14` declares
+`rpc StreamBuffers(stream BufferRequest) returns (PipelineSummary)`. The edit's one behavioural
+branch is guarded at `client_interceptor.cc:267-268` by
+`callType == ClientRpcInfo::Type::SERVER_STREAMING`, which we are not. The three unguarded
+additions all key off `serverStreamEnded_`, which is only ever set at lines 300 and 327, both
+of which require `responseSize == 0`. That cannot happen for us: `PipelineSummary` carries
+fourteen non-default numeric fields, and `data/headline_runs.csv` shows a non-zero `fft_p50` in
+every row. `fft_p50` is measured on the server with CUDA events and reaches the client only
+inside that response, so a populated column is proof the response was received and parsed and
+that `FailHijackedRecvMessage()` never fired. Our send path (lines 238-249, the
+`CLIENT_STREAMING` branch) is untouched by the diff. The remaining hunk is a whitespace mangle
+at line 200 with identical semantics.
 
 **If you read only one more thing, read section 1.** Four of this project's headline numbers
 turned out to be measurement artifacts rather than results, and all four were caught late.
