@@ -601,6 +601,47 @@ the RX-polling lines being moved. They are incremental saves, not abandoned vari
 **Still open:** the Spark's copy at `/home/nitest/grpc-direct` has not been compared. Run the
 same hash comparison against it before building there.
 
+**Closed 2026-08-20, and it was worth doing: the two machines are not running the same code.**
+`scripts/hash_grpc_direct.sh` on the Spark, then
+`scripts/diff_grpc_direct_spark_vs_pxi.ps1`. Two things came out of it.
+
+*First, the Spark's copy has a `.git`.* The PXI's does not, which is why that audit had to
+reconstruct provenance from hashes. The Spark's clone confirms the reconstruction
+independently: HEAD is `2d404a5`, on `main`, tracking `origin/main`, with nothing local
+committed. Every fork change is an uncommitted working-tree edit. So the base commit conclusion
+in this section was arrived at by two methods that agree.
+
+*Second, and this is the finding:* 144 files identical, **2 different**, 8 Spark-only. `src/lib.rs`
+is byte-identical across both machines (md5 `b61b26dae6ecfbf0bfae2103881f45ab`), so the Rust is
+the same. But the Spark carries two edits the PXI does not, and the PXI audit recorded both
+files as untouched:
+
+| file | size | what |
+|---|---|---|
+| `cpp/client_interceptor.cc` | +16/-5 | server-streaming end-of-stream handling |
+| `plugin/cmd/protoc-gen-grpc-direct/gen_cpp.go` | 2 lines | `_actual` → `_response` in the generated move ctor and move assignment |
+
+The plugin change is a compile fix: upstream's generator emits a `_actual` member in
+`Direct<Msg>`'s move operations that does not exist, so upstream's generated C++ does not
+build. The interceptor change adds a `firstRecv_` flag distinct from `isFirstMessage_` and
+calls `methods->FailHijackedRecvMessage()` on the two end-of-stream paths, with an early exit
+when the stream already ended. Upstream sets neither, so a hijacked server-streaming `Read()`
+would not terminate cleanly. Both look like genuine fixes rather than experiments, and the
+`client_interceptor.cc.bak` → `.bak_stream` → current chain shows the usual pattern: add
+`[DBG ...]` prints, find it, remove the prints. Nothing hidden.
+
+**Consequence, and it is the same lesson as the PXI audit one level down.** We link
+`libgrpc_direct_cpp.a` out of `GD_BUILD`, so `cpp/client_interceptor.cc` is in every gRPC
+number this project has produced on the Spark. That file is *not* the file that was audited.
+The audit was run against the PXI because that is where the copy without a `.git` was, and the
+machine we actually benchmark on turned out to be the one with extra uncommitted edits. Before
+any Phase 4 arm is built: the fork must be created from the **Spark's** tree, not the PXI's, or
+from the union of both with the difference made explicit.
+
+One more Spark-only file worth naming: `.cargo/config.toml`, which pins
+`linker = "x86_64-linux-gnu-gcc"` for `x86_64-unknown-linux-gnu`. Inert when building natively
+on the aarch64 Spark; it matters the moment anything is cross-built for the PXI.
+
 - **Build knobs are already documented** by the vendor: Cargo feature `rdma = []` with
   `EASYRDMA_LIB_DIR` and `EASYRDMA_INC_DIR`, or CMake `-DGRPC_DIRECT_ENABLE_RDMA=ON`, which
   fetches and builds easyrdma itself. `LONGTERM_CONTEXT.md` records that grpc-direct was once

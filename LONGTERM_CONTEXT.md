@@ -468,6 +468,40 @@ checking the clone out as CRLF, not a finding. `git -c core.autocrlf=false -c co
 drops it to 2. A comparison that says almost everything changed is describing its own
 configuration.
 
+### The Spark and the PXI are not running the same grpc-direct
+
+Compared 2026-08-20 with `scripts/hash_grpc_direct.sh` and
+`scripts/diff_grpc_direct_spark_vs_pxi.ps1`. 144 files identical, 2 different, 8 Spark-only.
+`src/lib.rs` is byte-identical on both (md5 `b61b26dae6ecfbf0bfae2103881f45ab`), so the Rust
+matches. The divergence is in C++ and Go, and the PXI audit above recorded both files as
+untouched:
+
+- `cpp/client_interceptor.cc`, +16/-5. Adds a `firstRecv_` flag separate from `isFirstMessage_`
+  and calls `methods->FailHijackedRecvMessage()` on both end-of-stream paths, plus an early exit
+  when the stream already ended. Upstream calls it on neither, so a hijacked server-streaming
+  `Read()` would not terminate cleanly.
+- `plugin/cmd/protoc-gen-grpc-direct/gen_cpp.go`, 2 lines. `_actual` → `_response` in the
+  generated `Direct<Msg>` move constructor and move assignment. Upstream emits a member that
+  does not exist, so upstream's generated C++ does not compile.
+
+**Why this matters more than its size suggests.** We link `libgrpc_direct_cpp.a` from
+`GD_BUILD`, so `cpp/client_interceptor.cc` is inside every gRPC number produced on the Spark,
+and that file is not the file that was audited. The audit ran on the PXI because that was the
+copy without a `.git`; the machine we benchmark on is the one carrying extra uncommitted edits.
+Fork from the **Spark's** tree, or from both with the difference stated.
+
+**The Spark's copy does have a `.git`**, HEAD `2d404a5` on `main` tracking `origin/main`, with
+nothing committed locally. Every fork change is an uncommitted working-tree edit. It confirms
+the PXI's hash-reconstructed base commit by a second, independent method.
+
+Also Spark-only: `.cargo/config.toml` pinning `linker = "x86_64-linux-gnu-gcc"` for
+`x86_64-unknown-linux-gnu`. Inert natively on aarch64; it bites the moment anything is
+cross-built for the PXI.
+
+**Its `.git/config` had a GitHub personal access token in the remote URL in plaintext.** Do not
+copy that directory, do not commit anything derived from `git remote -v`, and scrub any probe
+output before it lands in `data/`. Flagged to the user 2026-08-20 for revocation.
+
 ### C++ interceptor pattern (from prior benchmark)
 ```cpp
 // Client side: inject at channel creation
