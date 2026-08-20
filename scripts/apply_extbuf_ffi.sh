@@ -31,7 +31,7 @@ grep -n 'ConfigureExternalBuffer\|QueueExternalBufferRegion\|BufferCompletionCal
 echo
 echo "### cargo build --features rdma ###"
 export EASYRDMA_LIB_DIR="$HOME/easyrdma/core/build"
-export EASYRDMA_INCLUDE_DIR="$HOME/easyrdma/core/api"
+export EASYRDMA_INC_DIR="$HOME/easyrdma/core/api"
 ls -l "$EASYRDMA_LIB_DIR/libeasyrdma.so" || echo "MISSING libeasyrdma.so"
 cargo build --release --features rdma 2>&1 | tail -40
 echo "BUILD_EXIT=${PIPESTATUS[0]}"
