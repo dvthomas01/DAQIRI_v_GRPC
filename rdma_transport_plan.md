@@ -729,10 +729,18 @@ latency. The sequence accounting from `b8c0b96` covers the first half already.
 2. ~~Write and run Gate 5, with its negative control.~~ **DONE 2026-08-20, PASS.** 17 checks,
    3 reps, control live. See §6.4. Three protocol corrections came out of it and one Phase 4
    constraint.
-3. Bind the external-buffer functions in the Rust FFI block. **Two, not three:**
+3. ~~Bind the external-buffer functions in the Rust FFI block. **Two, not three:**
    `ConfigureExternalBuffer` and `QueueExternalBufferRegion`, plus the
    `easyrdma_BufferCompletionCallbackData` struct and its function-pointer typedef.
-   `ReleaseUserBufferRegionToIdle` is not on this path.
+   `ReleaseUserBufferRegionToIdle` is not on this path.~~ **DONE 2026-08-20.** Applied by
+   `scripts/bind_extbuf_ffi.py` (idempotent, anchored, fails loudly if an anchor is not unique)
+   via `scripts/apply_extbuf_ffi.sh`. `src/lib.rs` 2871 → 2942 lines, md5
+   `b61b26d…` → `cbf91c7…`, backup at `src/lib.rs.bak5`. Also bound: `PROPERTY_USER_BUFFERS`
+   (0x102), `CLOSE_DEFER_WHILE_USER_BUFFERS_OUTSTANDING` (0x01), and the three error codes Gate 5
+   turned up. `cargo build --release --features rdma` exits 0 with
+   `EASYRDMA_LIB_DIR=$HOME/easyrdma/core/build`; the only new warnings are dead-code, which is
+   correct until step 4 wires the call sites. `Option<BufferCompletionCallback>` is
+   null-pointer-optimised, so `BufferCompletionCallbackData` matches the C layout exactly.
 4. Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
    `ConfigureBuffers` reachable so `rdma-stock` stays measurable. The flag has to switch the
    *completion mechanism* as well as the configure call, because the external path is callback
