@@ -78,6 +78,17 @@ measurement artifacts, and each one survived for a while because it was plausibl
   inflated together, which is the signature to look for: a transport regression moves the
   residual and leaves the transform alone. Query `clocks.sm` alongside every run and discard
   anything taken below roughly 2400 MHz.
+- **Sample the clock during the run, not before or after it, and take the peak.** The first
+  attempt at the gate above read `clocks.sm` between runs and reported 208 MHz every single time,
+  including immediately after a run that was demonstrably fine. Sampling once a second across one
+  cell gave `208 208 208 2405 2405 2405 2405 2457 2405 234 208 208`. The part ramps about three
+  seconds into sustained load and falls back to idle within one second of the load stopping, so a
+  reading taken between runs measures the gap, not the work. The peak is the right statistic
+  rather than the mean, because the sampling window contains startup that is idle by
+  construction and averaging it in gates out healthy cells. This also sets a floor on run
+  length: a cell that finishes in under three seconds never ramps at all, which is exactly what
+  happened to the 500-message Phase 3 runs, so the RDMA arms need enough unmeasured traffic
+  ahead of the measured section to get the clock up first.
 - **Include a control that should NOT move.** When the RoCE MTU was raised, the 4 MB write got
   4.9% faster. On its own that is indistinguishable from drift between two runs. The 2-byte
   message was measured in the same pair of runs, and it could not possibly be affected because it

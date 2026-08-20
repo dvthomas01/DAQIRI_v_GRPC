@@ -65,6 +65,8 @@
 
 #include <cuda_runtime.h>
 
+#include <unistd.h>
+
 #include <algorithm>
 #include <chrono>
 #include <cmath>
@@ -88,7 +90,7 @@ using contract::payload_tone_hz;
 // ─────────────────────────────────────────────────────────────────────────────
 namespace guard {
 static bool     frozen = false;
-static uint64_t allocs = 0, xlates = 0;
+static uint64_t allocs = 0, xlates = 0, regs = 0;
 
 static void account(uint64_t& counter, const char* what) {
     if (frozen) {
@@ -129,6 +131,67 @@ static void* pool_device_ptr(void* host) {
     return d;
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The stock arm's registration table
+//
+// The stock path does not let us choose the landing buffer: easyrdma allocates
+// four 16 MiB slots itself, out of ordinary memory that no CUDA call has ever
+// seen. A kernel cannot read that, so to transform it in place we have to
+// cudaHostRegister it, and that is the entire point of this arm rather than an
+// inconvenience. Section 7c of the handoff measured driver-allocated pinned
+// memory beating user-allocated-then-registered memory by 10.94 us of GPU time
+// at 4 MB, 15 of 15 paired. This arm asks whether that survives contact with a
+// real transport, with the allocator as the only difference between the two
+// RDMA arms.
+//
+// The alternative, copying each message into a pinned staging buffer, would
+// measure a copy rather than an allocator and would be a different experiment.
+//
+// Registration happens during a warmup that is not measured, and then the guard
+// freezes. A cudaHostRegister on the hot path would swamp everything here.
+// ─────────────────────────────────────────────────────────────────────────────
+struct RegRegion {
+    unsigned char* host = nullptr;
+    unsigned char* dev  = nullptr;
+    size_t         bytes = 0;
+};
+
+static std::vector<RegRegion> g_regs;
+static size_t                 g_page = 4096;
+
+// Returns the device address for [p, p+len), registering the pages that hold it
+// on first sight. Registration is refused once the guard has frozen.
+static const unsigned char* stock_device_ptr(const unsigned char* p, size_t len) {
+    for (const auto& r : g_regs)
+        if (p >= r.host && p + len <= r.host + r.bytes)
+            return r.dev + (p - r.host);
+
+    guard::account(guard::regs, "cudaHostRegister");
+
+    auto  addr  = reinterpret_cast<uintptr_t>(p);
+    auto  base  = reinterpret_cast<unsigned char*>(addr & ~(uintptr_t)(g_page - 1));
+    size_t span = ((addr + len) - reinterpret_cast<uintptr_t>(base) + g_page - 1)
+                  & ~(uintptr_t)(g_page - 1);
+
+    cudaError_t e = cudaHostRegister(base, span, cudaHostRegisterMapped);
+    if (e != cudaSuccess) {
+        std::fprintf(stderr,
+                     "\nFATAL: cudaHostRegister(%p, %zu) -> %s\n"
+                     "The stock arm cannot transform a buffer it has not "
+                     "registered, so there is no measurement to salvage here.\n",
+                     (void*)base, span, cudaGetErrorString(e));
+        std::abort();
+    }
+    void* d = nullptr;
+    CUDA_OK(cudaHostGetDevicePointer(&d, base, 0));
+
+    RegRegion r{base, static_cast<unsigned char*>(d), span};
+    g_regs.push_back(r);
+    std::printf("  registered stock slot %zu: %p .. %p (%zu bytes)\n",
+                g_regs.size(), (void*)base, (void*)(base + span), span);
+    return r.dev + (p - r.host);
+}
+
 static double now_us() {
     using namespace std::chrono;
     return duration<double, std::micro>(steady_clock::now().time_since_epoch())
@@ -149,6 +212,11 @@ static void usage() {
         "  --verify  every|off  spectral check per message (default every)\n"
         "  --own-stream    run cuFFT on its own stream\n"
         "  --tol-bins N    peak tolerance in bins (default 2)\n"
+        "  --stock         rdma-stock-nopoll arm: driver-allocated buffers,\n"
+        "                  registered once during warmup instead of a pool we\n"
+        "                  own. No re-queue; the library owns slot lifetime.\n"
+        "  --reg-warmup N  unmeasured messages before timing, used to see and\n"
+        "                  register every stock slot (default 32)\n"
         "  --csv     PATH  per-message CSV\n"
         "  --sha     STR   git SHA stamped into every CSV row\n");
 }
@@ -161,7 +229,9 @@ int main(int argc, char** argv) {
     int         msgs     = 200;
     int         slots    = 4;
     int         tol_bins = 2;
+    int         reg_warmup = 32;
     bool        poison_on = true, verify_on = true, own_stream = false;
+    bool        stock = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -178,6 +248,8 @@ int main(int argc, char** argv) {
         else if (a == "--poison")     poison_on = (next() == "on");
         else if (a == "--verify")     verify_on = (next() != "off");
         else if (a == "--own-stream") own_stream = true;
+        else if (a == "--stock")      stock = true;
+        else if (a == "--reg-warmup") reg_warmup = std::stoi(next());
         else if (a == "--csv")        csv_path = next();
         else if (a == "--sha")        git_sha = next();
         else { usage(); return 1; }
@@ -197,13 +269,30 @@ int main(int argc, char** argv) {
                                * kPayloadOffset;
     const size_t pool_bytes  = slot_bytes * static_cast<size_t>(slots);
 
-    auto* h_pool = static_cast<unsigned char*>(pool_host_alloc(pool_bytes));
-    auto* d_pool = static_cast<unsigned char*>(pool_device_ptr(h_pool));
+    g_page = static_cast<size_t>(sysconf(_SC_PAGESIZE));
 
-    std::printf("pool              : %zu bytes, %d slots of %zu\n",
-                pool_bytes, slots, slot_bytes);
-    std::printf("host / device ptr : %p / %p%s\n", (void*)h_pool, (void*)d_pool,
-                (h_pool == d_pool) ? "  (identical, GB10 is coherent)" : "");
+    unsigned char* h_pool = nullptr;
+    unsigned char* d_pool = nullptr;
+    if (!stock) {
+        h_pool = static_cast<unsigned char*>(pool_host_alloc(pool_bytes));
+        d_pool = static_cast<unsigned char*>(pool_device_ptr(h_pool));
+        std::printf("arm               : rdma (our pool)\n");
+        std::printf("pool              : %zu bytes, %d slots of %zu\n",
+                    pool_bytes, slots, slot_bytes);
+        std::printf("host / device ptr : %p / %p%s\n", (void*)h_pool, (void*)d_pool,
+                    (h_pool == d_pool) ? "  (identical, GB10 is coherent)" : "");
+    } else {
+        // The library fixes this at RDMA_MAX_FRAME_SIZE x RDMA_MAX_CONCURRENT,
+        // 4 slots of 16 MiB, and offers no way to ask for fewer. So --slots is
+        // meaningless here and saying so beats silently ignoring it.
+        std::printf("arm               : rdma-stock-nopoll "
+                    "(easyrdma's buffers, registered by us)\n");
+        std::printf("pool              : chosen by the library, 4 slots of 16 MiB; "
+                    "--slots ignored\n");
+        std::printf("registration      : during %d unmeasured warmup messages\n",
+                    reg_warmup);
+    }
+    std::printf("page size         : %zu bytes\n", g_page);
     std::printf("payload offset    : %zu bytes into each slot\n", kPayloadOffset);
 
     // ── poison, generated once ───────────────────────────────────────────
@@ -217,9 +306,10 @@ int main(int argc, char** argv) {
 
     // Paint every slot before the NIC is armed.  From here on a slot may only
     // be repainted while we own it, which is between receive_ext and requeue.
-    for (int s = 0; s < slots; ++s)
-        std::memcpy(h_pool + static_cast<size_t>(s) * slot_bytes + kPayloadOffset,
-                    poison.data(), npts * sizeof(float));
+    if (!stock)
+        for (int s = 0; s < slots; ++s)
+            std::memcpy(h_pool + static_cast<size_t>(s) * slot_bytes + kPayloadOffset,
+                        poison.data(), npts * sizeof(float));
 
     CuFFTExecutor fft(npts, own_stream);
     cufftComplex* d_out = nullptr;
@@ -228,21 +318,64 @@ int main(int argc, char** argv) {
     cudaEvent_t consumed;
     CUDA_OK(cudaEventCreateWithFlags(&consumed, cudaEventDisableTiming));
 
-    guard::freeze();
-    const uint64_t frozen_allocs = guard::allocs, frozen_xlates = guard::xlates;
+    // The external arm has nothing left to allocate, so it can freeze here.
+    // The stock arm cannot: it has not seen the library's buffers yet, and
+    // registering them is the one startup cost it is entitled to. It freezes
+    // after the warmup below.
+    if (!stock) guard::freeze();
 
     // ── connect ──────────────────────────────────────────────────────────
     std::printf("\nwaiting for the sender on %s:%u ...\n", addr.c_str(), port);
     std::fflush(stdout);
 
-    GrpcDirectServer* srv = grpc_direct_server_create_ext(
-        "extbuf_fft", GRPC_DIRECT_TRANSPORT_RDMA, addr.c_str(), port,
-        h_pool, pool_bytes, slot_bytes);
+    GrpcDirectServer* srv =
+        stock ? grpc_direct_server_create("extbuf_fft",
+                                          GRPC_DIRECT_TRANSPORT_RDMA,
+                                          addr.c_str(), port)
+              : grpc_direct_server_create_ext("extbuf_fft",
+                                              GRPC_DIRECT_TRANSPORT_RDMA,
+                                              addr.c_str(), port,
+                                              h_pool, pool_bytes, slot_bytes);
     if (!srv) {
-        std::fprintf(stderr, "FATAL: grpc_direct_server_create_ext returned NULL\n");
+        std::fprintf(stderr, "FATAL: server create returned NULL (arm=%s)\n",
+                     stock ? "stock" : "ext");
         return 2;
     }
     std::printf("connected\n\n");
+
+    // ── stock warmup: see every slot once, register it, then freeze ──────
+    // GRPC_DIRECT_TRANSPORT_RDMA rather than RDMA_LOW_LATENCY, so RX polling
+    // is off. That is deliberate and is why the arm is named nopoll: our path
+    // cannot poll with external buffers, so a polling stock arm would confound
+    // allocation ownership with wakeup mechanism and answer neither question.
+    if (stock) {
+        std::printf("warmup (unmeasured), registering stock slots:\n");
+        for (int m = 0; m < reg_warmup; ++m) {
+            const uint8_t* p = nullptr;
+            size_t         n = 0;
+            GrpcDirectActiveRequest* a = grpc_direct_server_receive(srv, &p, &n);
+            if (!a) {
+                std::fprintf(stderr, "FATAL: warmup receive failed at %d\n", m);
+                return 2;
+            }
+            const auto* dp = stock_device_ptr(reinterpret_cast<const unsigned char*>(p), n);
+            fft.execute(reinterpret_cast<const float*>(dp + kPayloadOffset), d_out);
+            CUDA_OK(cudaEventRecord(consumed, fft.stream()));
+            CUDA_OK(cudaEventSynchronize(consumed));
+            grpc_direct_request_destroy(a);
+        }
+        std::printf("registered %zu distinct regions in %d warmup messages\n\n",
+                    g_regs.size(), reg_warmup);
+        if (g_regs.size() < 2)
+            std::fprintf(stderr,
+                         "WARNING: only %zu region(s) seen. If a later message "
+                         "lands somewhere new the guard will abort, which is "
+                         "correct but wastes a run. Raise --reg-warmup.\n",
+                         g_regs.size());
+        guard::freeze();
+    }
+    const uint64_t frozen_allocs = guard::allocs, frozen_xlates = guard::xlates,
+                   frozen_regs = guard::regs;
 
     std::FILE* csv = nullptr;
     if (!csv_path.empty()) {
@@ -266,9 +399,10 @@ int main(int argc, char** argv) {
         size_t         slot = 0;
 
         GrpcDirectActiveRequest* ar =
-            grpc_direct_server_receive_ext(srv, &ptr, &len, &slot);
+            stock ? grpc_direct_server_receive(srv, &ptr, &len)
+                  : grpc_direct_server_receive_ext(srv, &ptr, &len, &slot);
         if (!ar) {
-            std::fprintf(stderr, "receive_ext returned NULL after %llu messages "
+            std::fprintf(stderr, "receive returned NULL after %llu messages "
                                  "(sender gone, or a completion reported an error)\n",
                          (unsigned long long)received);
             break;
@@ -276,22 +410,32 @@ int main(int argc, char** argv) {
         const double t0 = now_us();
         ++received;
 
-        // The landing buffer is demonstrably ours.  Asserted, not intended:
-        // if grpc-direct ever falls back to driver-allocated buffers, every
-        // transfer keeps working and only this check notices.
-        const unsigned char* expect_base = h_pool + slot * slot_bytes;
-        if (ptr != expect_base || slot >= static_cast<size_t>(slots) ||
-            !(ptr >= h_pool && ptr + len <= h_pool + pool_bytes)) {
-            std::fprintf(stderr,
-                         "\nFATAL: payload landed outside our pool, or in the "
-                         "wrong slot.\n  ptr %p, slot %zu, expected %p, pool "
-                         "[%p, %p)\n"
-                         "This is the failure the external-buffer path exists to "
-                         "make impossible. Do not measure anything until it is "
-                         "explained.\n",
-                         (const void*)ptr, slot, (const void*)expect_base,
-                         (const void*)h_pool, (const void*)(h_pool + pool_bytes));
-            std::abort();
+        const unsigned char* d_slot = nullptr;
+        if (stock) {
+            // No pool of ours to check against. The registration table is the
+            // check instead: a pointer outside every region we registered
+            // during warmup aborts inside stock_device_ptr, because the guard
+            // has frozen and it is not allowed to register a new one.
+            d_slot = stock_device_ptr(reinterpret_cast<const unsigned char*>(ptr), len);
+        } else {
+            // The landing buffer is demonstrably ours.  Asserted, not intended:
+            // if grpc-direct ever falls back to driver-allocated buffers, every
+            // transfer keeps working and only this check notices.
+            const unsigned char* expect_base = h_pool + slot * slot_bytes;
+            if (ptr != expect_base || slot >= static_cast<size_t>(slots) ||
+                !(ptr >= h_pool && ptr + len <= h_pool + pool_bytes)) {
+                std::fprintf(stderr,
+                             "\nFATAL: payload landed outside our pool, or in the "
+                             "wrong slot.\n  ptr %p, slot %zu, expected %p, pool "
+                             "[%p, %p)\n"
+                             "This is the failure the external-buffer path exists to "
+                             "make impossible. Do not measure anything until it is "
+                             "explained.\n",
+                             (const void*)ptr, slot, (const void*)expect_base,
+                             (const void*)h_pool, (const void*)(h_pool + pool_bytes));
+                std::abort();
+            }
+            d_slot = d_pool + slot * slot_bytes;
         }
 
         const auto* hdr = reinterpret_cast<const ExtFrameHeader*>(ptr);
@@ -314,7 +458,7 @@ int main(int argc, char** argv) {
         // the transform launched, on this same thread. These two statements
         // must stay adjacent and in this order.
         const float* d_payload =
-            reinterpret_cast<const float*>(d_pool + slot * slot_bytes + kPayloadOffset);
+            reinterpret_cast<const float*>(d_slot + kPayloadOffset);
         if (frame_ok) fft.execute(d_payload, d_out);
 
         // ── THE GATE ─────────────────────────────────────────────────────
@@ -349,8 +493,12 @@ int main(int argc, char** argv) {
             }
         }
 
+        // Poisoning writes through the same mapping the NIC will reuse, in
+        // both arms. The stock arm has no slot index, so the pointer we were
+        // handed is the only address available, which is fine because the
+        // library will not reuse it until the next receive releases it.
         if (poison_on)
-            std::memcpy(h_pool + slot * slot_bytes + kPayloadOffset,
+            std::memcpy(const_cast<uint8_t*>(ptr) + kPayloadOffset,
                         poison.data(), npts * sizeof(float));
 
         if (csv)
@@ -361,14 +509,23 @@ int main(int argc, char** argv) {
         grpc_direct_request_destroy(ar);
 
         // Hand the slot back. After this instruction the NIC may overwrite it.
-        const int32_t rq = grpc_direct_server_slot_requeue(srv, slot);
-        if (rq != 0) {
-            std::fprintf(stderr, "\nFATAL: slot_requeue(%zu) -> %d\n", slot, rq);
-            std::abort();
+        //
+        // The stock arm has no equivalent and that asymmetry is the arm. Its
+        // slot is released at the top of the next receive, by the library, on
+        // a schedule we do not control and cannot gate on a CUDA event. That
+        // is safe here only because execute() blocks, which is exactly the
+        // hazard step 6 is about.
+        if (!stock) {
+            const int32_t rq = grpc_direct_server_slot_requeue(srv, slot);
+            if (rq != 0) {
+                std::fprintf(stderr, "\nFATAL: slot_requeue(%zu) -> %d\n", slot, rq);
+                std::abort();
+            }
         }
 
-        if (guard::allocs != frozen_allocs || guard::xlates != frozen_xlates) {
-            std::fprintf(stderr, "\nFATAL: the pool changed during the run\n");
+        if (guard::allocs != frozen_allocs || guard::xlates != frozen_xlates ||
+            guard::regs != frozen_regs) {
+            std::fprintf(stderr, "\nFATAL: the buffer set changed during the run\n");
             std::abort();
         }
         if (last) break;
@@ -385,6 +542,7 @@ int main(int argc, char** argv) {
     };
 
     std::printf("\n");
+    std::printf("arm               : %s\n", stock ? "rdma-stock-nopoll" : "rdma");
     std::printf("received          : %llu of %d\n", (unsigned long long)received, msgs);
     std::printf("verified          : %llu\n", (unsigned long long)verified);
     std::printf("bad spectrum      : %llu\n", (unsigned long long)bad_spectrum);
@@ -394,10 +552,12 @@ int main(int argc, char** argv) {
                     worst_seen_hz, worst_expect_hz);
     std::printf("e2e p50 / p99     : %.2f / %.2f us  (post-arrival, %zu samples)\n",
                 pct(0.50), pct(0.99), e2e.size());
-    std::printf("pool operations   : %llu alloc, %llu translate "
+    std::printf("pool operations   : %llu alloc, %llu translate, %llu register "
                 "(unchanged since startup: %s)\n",
                 (unsigned long long)guard::allocs, (unsigned long long)guard::xlates,
-                (guard::allocs == frozen_allocs && guard::xlates == frozen_xlates)
+                (unsigned long long)guard::regs,
+                (guard::allocs == frozen_allocs && guard::xlates == frozen_xlates &&
+                 guard::regs == frozen_regs)
                     ? "YES" : "NO");
 
     const bool pass = received > 0 && bad_frame == 0 &&
@@ -408,7 +568,8 @@ int main(int argc, char** argv) {
     grpc_direct_server_destroy(srv);
     cudaFree(d_out);
     cudaEventDestroy(consumed);
-    cudaFreeHost(h_pool);
+    if (h_pool) cudaFreeHost(h_pool);
+    for (const auto& r : g_regs) cudaHostUnregister(r.host);
 
     std::printf("DONE_EXTBUF rc=%d\n", pass ? 0 : 1);
     return pass ? 0 : 1;
