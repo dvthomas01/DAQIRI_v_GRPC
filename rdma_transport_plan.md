@@ -12,7 +12,22 @@ nothing hidden in the four `.bak` snapshots. Gate 5 passed: easyrdma does accept
 `cudaHostAlloc`'d pool and the bytes land in it, the GPU reads them in place, and the negative
 control lands outside. The gate also found that external buffers complete by callback only and
 cannot be combined with RX polling, which changes the binding work and adds a confound Phase 4
-has to control for. Next: bind the FFI.
+has to control for.
+
+**Phase 3 steps 3 and 4 are done and building.** The FFI is bound and the library now has a
+second server entry point, `grpc_direct_server_create_ext`, that receives directly into a
+caller-allocated pool. `rdma_server_create` was left with zero deletions, so the stock arm is
+still exactly the code the existing numbers came from. The whole change lives on branch
+`daqiri-extbuf` of `dvthomas01/grpc-direct`, forked from `ni/grpc-direct` at `2d404a5`, with the
+measured state isolated as its own commit ahead of anything we added.
+
+**Two scope decisions were taken on 2026-08-20 against a week and a half.** Steps 5 and 6 are
+swapped so the working path is built before the race demonstration, because the race is the only
+unschedulable item here and an overrun should cost a section rather than the result; and the
+race demonstration is timeboxed to two days with the window arithmetic written down in advance,
+including the fact that at 4 MB it cannot reproduce and the arithmetic is the deliverable.
+Phase 4 is reduced to three arms, two sizes and five reps, with the four dropped arms and the
+cost of each loss recorded in section 7 so it reads as a decision. Next: step 5, the real path.
 
 ---
 
@@ -741,13 +756,69 @@ latency. The sequence accounting from `b8c0b96` covers the first half already.
    `EASYRDMA_LIB_DIR=$HOME/easyrdma/core/build`; the only new warnings are dead-code, which is
    correct until step 4 wires the call sites. `Option<BufferCompletionCallback>` is
    null-pointer-optimised, so `BufferCompletionCallbackData` matches the C layout exactly.
-4. Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
-   `ConfigureBuffers` reachable so `rdma-stock` stays measurable. The flag has to switch the
-   *completion mechanism* as well as the configure call, because the external path is callback
-   driven and the stock path blocks in `AcquireReceivedRegion`.
-5. Write the release-before-completion failure case and confirm it fails. Per §6.6(b) this is
-   now re-queue-before-completion.
-6. Then the real path, then the checks below.
+4. ~~Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
+   `ConfigureBuffers` reachable so `rdma-stock` stays measurable.~~ **DONE 2026-08-20.** Applied
+   by `scripts/bind_extbuf_server.py` (seven anchors, each required to be unique) via
+   `scripts/apply_extbuf_server.sh`. `src/lib.rs` 2942 → 3476 lines. Fork commit `f0f5341` on
+   `daqiri-extbuf`.
+
+   **Not a build flag in the end, and that is a better answer.** A flag would have made the
+   stock arm a compile-time variant of code we edited. Instead `rdma_server_create` is left with
+   zero deletions and one added field initialiser, and the external path is a second function,
+   `rdma_server_create_ext`. The cost is about ninety duplicated lines of listener and accept
+   handling. The benefit is that no `rdma-stock-nopoll` measurement can be attributed to
+   something we introduced. New C ABI: `grpc_direct_server_create_ext`,
+   `grpc_direct_server_receive_ext`, `grpc_direct_server_slot_requeue`, all three confirmed in
+   `nm -D`.
+
+   `rdma_server_reaccept` **is** modified, and this is the part worth remembering. It configures
+   buffers a second time on reconnect, so without the branch a reconnected session silently
+   reverts to driver-allocated buffers. Every transfer still succeeds; the payload just stops
+   landing in our pool. No throughput or latency number would show it.
+
+   `create_ext` rejects `RdmaLowLatency`, since easyrdma will not enable RX polling on an
+   externally buffered session, and `grpc_direct_server_receive` rejects an externally buffered
+   server rather than inventing a lifetime for it. TX keeps stock `ConfigureBuffers`; only the
+   receive side has a GPU consumer.
+
+5. **The real path, then the checks below.** Wire `create_ext` into the benchmark server:
+   allocate the pool with `cudaHostAlloc`, receive through `receive_ext`, run the FFT in place,
+   record a CUDA event, synchronise it, then `slot_requeue`. Build a grpc-direct RDMA client on
+   the PXI to drive it. Assert the received pointer lies inside the pool and abort if it does
+   not, and assert nothing allocates, registers or translates after startup.
+
+6. **The re-queue-before-completion failure case, failing test first, timeboxed to two days.**
+   Per §6.6(b) the hazard is re-queue-before-completion rather than release-before-completion,
+   because Gate 5 established there is no release call: the slot returns to idle when its
+   callback fires and `QueueExternalBufferRegion` is both the re-arm and the credit. Write the
+   unsafe timing first, re-queueing immediately after the FFT launch, and demonstrate corruption.
+   Then gate the re-queue on the CUDA event and demonstrate it stops.
+
+**Steps 5 and 6 were swapped on 2026-08-20, deliberately.** The race demonstration was
+originally first. It is the only item in this plan whose duration is bounded by giving up rather
+than by effort, and putting an unschedulable item ahead of a schedulable one means an overrun
+costs the entire result. With the working path first, an overrun costs a section of the writeup.
+The failing-test-first discipline is unchanged; it now applies within step 6.
+
+**The two-day timebox on step 6, and the arithmetic behind it.** The race is only observable
+when the GPU work outlasts the time for the NIC to wrap back to the same slot, which with `N`
+slots is `N` further arrivals.
+
+- **At 16 KB it should reproduce.** Gate 3 measured 5843 MiB/s and a 1.81 µs latency floor, so
+  one 16 KB arrival is roughly 2.7 µs of transfer plus the floor, call it 4.5 µs. With the pool
+  cut to `N = 2` the window is about 9 µs, and the measured 4096-point transform is 8.8 µs
+  (`fft_p50` in `data/headline_runs.csv`). Same order, so it should be reachable, and unpacing
+  the client widens it further.
+- **At 4 MB it will not reproduce, and that is the finding.** One 4 MB arrival is 694.76 µs
+  measured, so with `N = 2` the window is about 1.39 ms. No transform in this project is within
+  two orders of magnitude of that.
+
+So the deliverable at 4 MB is the window calculation and the statement that the race is real but
+unobservable above roughly N bytes, not a forced reproduction. **Do not widen the window with
+artificial GPU work to make it fire at 4 MB.** A race that only appears once you add work that
+is not in the pipeline is a demonstration of the knob, not of the hazard, and it would weaken
+the 16 KB result by association. If two days pass without a clean 16 KB reproduction, stop and
+report the arithmetic alone.
 
 ### 6.8 Out of scope for Phase 3
 
@@ -792,22 +863,49 @@ All arms measured on the post-arrival window fixed in section 1: completion obse
 through post-FFT. This is what makes the new arm comparable to the 54 runs already
 collected.
 
-### Arms
+### Arms — REDUCED 2026-08-20, and this is a decision
 
-At minimum:
+**Three arms, two sizes, five reps.** `daq` is added only if it comes free.
 
-- `base` (optimizations off)
-- `opt` (current best: `--zc-align` and `--opt-stream`, both default-on)
-- `rdma` (the new transport, PXI producing over the wire)
-- `rdma-local` (the new transport, local CPU producer, same receive path)
-- `daq` (DAQiri, single-process RC loopback)
+| Arm | What it is | What it answers |
+|---|---|---|
+| `rdma` | external buffers, our pool, event-gated re-queue | the thing being built |
+| `rdma-stock-nopoll` | driver-allocated buffers, same fork, RX polling **off** | does owning the allocation matter |
+| `base` | gRPC-Direct shmem, optimizations off | the standing reference every earlier number uses |
+| `daq` | DAQiri, single-process RC loopback | the target, if the run fits |
 
-`rdma-local` is the control for the cache-state question. `rdma` and `rdma-local` differ
-only in who dirtied the buffer, a remote NIC DMA versus a local CPU store, so any
-difference between them is that effect and nothing else. Without it, every comparison
-between the new arm and the four existing local-producer arms silently assumes producer
-identity does not matter, which is exactly the kind of assumption section 7c of the
-handoff was built on retracting. If the two agree, say so and the assumption is earned.
+Sizes 16 KB and 4 MB. Five reps. Arms rotated within each rep.
+
+**Why reduced.** The full matrix was seven arms across nine sizes. Estimated against the
+remaining Phase 3 work it came to eight and a half to eleven working days with no re-runs,
+against a week and a half available, and Phase 4 cannot absorb slip because it depends on
+Phase 3 finishing. Three of those days were in arms that do not answer the question this phase
+asks. Reducing was chosen over compressing the reps, because a three-rep result on seven arms is
+weaker than a five-rep result on three.
+
+**What was dropped, and what each loss costs:**
+
+- **`opt`.** Its delta against `base` is already measured across 54 runs and is not disputed.
+  Cost: none, the number is quotable from existing data. It is the cheapest thing on this list
+  to add back.
+- **`rdma-local`.** This was the control for the cache-state question, isolating who dirtied the
+  buffer. Cost: **real, and it must be stated in the writeup.** Without it, any comparison
+  between `rdma` and a local-producer arm assumes producer identity does not matter, which is
+  exactly the class of assumption section 7c of the handoff exists to retract. The `rdma` versus
+  `rdma-stock-nopoll` comparison is unaffected, because both have the same remote producer. Only
+  comparisons that cross the producer boundary carry the caveat. If anything surprising shows up
+  there, add this arm back before believing it.
+- **`rdma-stock` with polling on.** Our path cannot poll, so a polling stock arm confounds
+  allocation ownership with wakeup mechanism. Running stock nopoll-only makes the one comparison
+  this phase is for a clean one. Cost: we cannot quote stock RDMA's best case. That is a claim
+  worth dropping rather than a confound worth publishing.
+- **Seven of the nine sizes.** The effect is size-dependent, as Phase 2 showed and as the step 6
+  window arithmetic shows again. 16 KB and 4 MB bracket the range, so the endpoints are the two
+  cells that carry information about the trend. Cost: no shape between them, so state a bracket
+  and not a curve.
+
+If the reduced run lands early, the order to restore is `daq`, then `rdma-local`, then the
+intermediate sizes, then `opt`, then polling stock.
 
 ### Explicitly out of scope: `daq-wire`
 
@@ -832,10 +930,11 @@ into e2e.
 
 ### Protocol
 
-Single interleaved run, 9 sizes, arms rotated, 3 reps minimum. Extend
-`headline_sweep.sh` rather than writing a new script, since it already interleaves
-correctly at each size and stamps the git SHA. Extend `headline_table.py` for the sign
-tests and the residual decomposition.
+Single interleaved run, 2 sizes, arms rotated, 5 reps. Extend `headline_sweep.sh` rather
+than writing a new script, since it already interleaves correctly at each size and stamps
+the git SHA. Extend `headline_table.py` for the sign tests and the residual decomposition.
+Spectrum verified in every rep, not once at the start. Buffer dirtied before each timed
+transform.
 
 ### Report
 
@@ -843,8 +942,17 @@ tests and the residual decomposition.
 **post-arrival processing latency**, not end-to-end latency.
 - Residual decomposition (`e2e - fft`), which is what isolates transport from transform.
 - Sign tests on all paired cells.
-- Delivery accounting per arm.
-- Explicit statement of which path each arm used and who produced the bytes.
+- **Delivered count and blocked-send time reported as two separate columns, never combined
+and never normalised away.** The arms fail differently under pressure and the difference is
+the interesting part. Stock shmem is fire-and-forget with no flow control, which is why only
+170 to 190 of 200 messages arrive at small sizes: it *drops*. RDMA with a finite slot pool
+*blocks*, because `QueueExternalBufferRegion` is the credit and a sender with no credit waits.
+A latency figure that silently excludes dropped messages flatters shmem, and one that folds
+blocked time into per-message latency penalises RDMA for the same underlying back-pressure.
+Quoting either alone misrepresents both. Report delivered-of-attempted per arm, and total
+sender-side blocked time per arm, alongside the latency percentiles.
+- Explicit statement of which path each arm used and who produced the bytes, including the
+`rdma-local` caveat recorded under Arms.
 
 ### Expected outcome
 

@@ -59,7 +59,10 @@ as predicted from source, that **RX polling and external buffers are mutually ex
 `rdma-stock-nopoll` arm is needed to isolate allocation ownership from wakeup mechanism.
 
 **The fork is now a branch, and the divergence is larger than the first two audits found.**
-`daqiri-extbuf` in the fork sits off upstream `2d404a5` and the measured state is commit
+`daqiri-extbuf` is published at `https://github.com/dvthomas01/grpc-direct`, forked from
+`ni/grpc-direct` at `2d404a5`. `ni/grpc-direct` itself is private and read-only to us: a
+dry-run push returns 403, so upstreaming needs either write access or a pull request from the
+fork. The branch sits off upstream `2d404a5` and the measured state is commit
 `5dfeaa5`: fifteen files, +1508/-39. Read `git diff 2d404a5 daqiri-extbuf` rather than any of
 the hash comparisons. Beyond the two files already reported (`cpp/client_interceptor.cc` and
 `plugin/cmd/protoc-gen-grpc-direct/gen_cpp.go`) it also carries a `python/` package restructure
