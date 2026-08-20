@@ -4,7 +4,9 @@ Status: Phase 0 complete, all four gates passed. Phase 0.5 complete, DAQiri conf
 local and the headline table relabelled. Measurement window committed to post-arrival.
 Phase 1 complete and negative: no flag closes any part of the gap, so Phase 2 is justified
 and proceeds. Phase 2 complete and passing: 31,800 verified messages, the broken-ordering
-control fails as required, nothing on the hot path. Next is Phase 3.
+control fails as required, nothing on the hot path. Phase 3 scoped, not started, and the
+scoping changed its shape: the RDMA transport already exists in the Rust library, so the work
+is to make it land in memory we allocated. Blocked on the Spark being off the network.
 
 ---
 
@@ -353,11 +355,203 @@ proceeding. Do not integrate a data path that is not provably correct.
 
 ---
 
-## 6. Phase 3: integration into the transport
+## 6. Phase 3: integration into the transport — SCOPED, NOT STARTED
 
-Only start this once Phase 2 passes its checks.
+Scoping pass done 2026-08-20 by reading the actual sources rather than the headers. It changed
+the shape of the phase, so the findings come first and the original task list is kept below.
 
-### Tasks
+Every line number below refers to the copies on the PXI: `/home/admin/grpc-direct/src/lib.rs`
+and `/home/admin/easyrdma/core/api/easyrdma.h`. Those are the vendor's files and are
+deliberately **not** committed here; `scripts/phase3_scope_probe.sh` re-runs the read.
+
+**Blocked on hardware.** The Spark went off the network on 2026-08-20 (see
+`LONGTERM_CONTEXT.md`, "Settling whether the Spark is alive"). Nothing here that requires a
+build or a measurement can run. Everything that is reading, forking and writing the gate
+program can.
+
+### 6.1 The premise of task 1 is wrong: the RDMA transport already exists
+
+Task 1 below says the implementation "currently returns NULL". That came from the header
+comment, and the header comment is stale. Read from `/home/admin/grpc-direct/src/lib.rs` on the
+PXI (the Spark's copy could not be checked, see below):
+
+| what | where |
+|---|---|
+| easyrdma FFI block, 12 functions | `src/lib.rs:270-378` |
+| `RdmaServerBackend`, `RdmaClientBackend` | `src/lib.rs:599`, `src/lib.rs:644` |
+| live dispatch, server and client | `src/lib.rs:1296`, `src/lib.rs:1891` |
+| the stale "not yet implemented, returns NULL" comment | `src/lib.rs:1215` |
+
+So Phase 3 is not "write an RDMA transport". It is **"make the RDMA transport that exists land
+its bytes in memory we allocated"**. That is a much smaller change and, more usefully, it means
+there is a working stock implementation to A/B against. Phase 4 should gain an `rdma-stock` arm
+for exactly that reason: it separates "RDMA helps" from "controlling the allocation helps",
+which are the two claims this project keeps conflating.
+
+### 6.2 Why the stock implementation is not sufficient
+
+`easyrdma_ConfigureBuffers(session, maxTransactionSize, maxConcurrentTransactions)` makes
+**easyrdma** allocate and register the landing buffer. It is called at `src/lib.rs:724`, `832`
+and `946`. `grpc_direct_server_receive` then hands the caller `region.buffer` directly
+(`src/lib.rs:1497-1516`), and the easyrdma header describes that field as "Pointer to
+internally-allocated buffer".
+
+That is a buffer we did not allocate, which is the precise arrangement Phase 1 measured at
++48.7 µs of total time at 4 MB and Phase 2 was built to escape. Adopting the stock transport
+unchanged would move the data over RDMA and still pay the penalty that motivated the RDMA work.
+
+Two smaller corrections found while reading, both worth writing down because the documentation
+is wrong about them:
+
+- `docs/RDMA_TRANSPORT.md` says received regions are "copied into a thread-local buffer and
+  immediately released". **The code does not do that.** It hands out the region pointer and
+  holds the region. Doc and source disagree; the source wins, and the receive path is already
+  zero-copy.
+- The region is released at the *top of the next* `grpc_direct_server_receive`
+  (`src/lib.rs:1487`), not at the end of the current one. So a message's buffer stays valid
+  exactly until you ask for the next message.
+
+### 6.3 The seam: `easyrdma_ConfigureExternalBuffer`
+
+`easyrdma.h` exposes a caller-allocated path alongside the internal one:
+
+```c
+int32_t easyrdma_ConfigureExternalBuffer(easyrdma_Session session, void* externalBuffer,
+                                         size_t bufferSize, size_t maxConcurrentTransactions);
+int32_t easyrdma_QueueExternalBufferRegion(easyrdma_Session session, void* pointerWithinBuffer,
+                                           size_t size,
+                                           easyrdma_BufferCompletionCallbackData* callbackData,
+                                           int32_t timeoutMs);
+int32_t easyrdma_ReleaseUserBufferRegionToIdle(easyrdma_Session session,
+                                               easyrdma_InternalBufferRegion* bufferRegion);
+```
+
+plus `easyrdma_Property_UserBuffers` and
+`easyrdma_CloseFlags_DeferWhileUserBuffersOutstanding`, which exist specifically because
+caller-owned buffers can still be in use at teardown.
+
+This is the whole integration in one sentence: **allocate the pool with `cudaHostAlloc`, hand
+it to `ConfigureExternalBuffer`, and the landing zone is ours.** None of these three functions
+is currently bound in the Rust FFI block; adding them is the bulk of the diff.
+
+### 6.4 Gate 5, before any Rust is written
+
+Phase 2's lesson was that a check is worth nothing until it has been watched to fail, and
+Phase 0's was that a decisive feasibility question gets its own small program. The same applies
+here, because the entire plan rests on an untested assumption.
+
+**Gate 5: does `easyrdma_ConfigureExternalBuffer` accept a `cudaHostAlloc`'d pointer, and does
+data actually land in it?** A C++ program on the Spark, no Rust, no gRPC:
+
+1. `cudaHostAlloc` a pool, `cudaHostGetDevicePointer` it once.
+2. `easyrdma_ConfigureExternalBuffer` over the pool. Record the return code.
+3. Have the PXI send into it, then check the bytes are in *our* pool at the offset we expect,
+   not in a copy.
+4. **Control, and it is the point of the gate:** run the same program with
+   `ConfigureBuffers` and confirm `region.buffer` is *not* inside our pool. A gate that only
+   shows the new path working cannot distinguish "external buffers work" from "we misread
+   which pointer we were looking at".
+
+Gate 4 already proved raw `ibv_reg_mr` accepts a `cudaHostAlloc`'d pointer, so the odds are
+good. But easyrdma is not raw verbs: it may `mmap`, re-align, or require its own page
+properties. Assuming it works and finding out during the Rust integration would mean debugging
+two unknowns at once.
+
+**Abort condition.** If Gate 5 fails, the external-buffer route is closed, and the honest
+options are: land in easyrdma's buffer and pay the penalty, keep the Phase 2 raw-verbs path as
+a separate non-gRPC arm, or fork easyrdma too. Pick one deliberately and record why. Do not
+silently fall back.
+
+### 6.5 What the fork looks like
+
+- **`/home/admin/grpc-direct` on the PXI has no `.git`.** It is a copy, and it sits next to
+  `src/lib.rs.bak`, `.bak2`, `.bak3` and `.bak4` alongside a modified `lib.rs`. Somebody has
+  already edited this tree in place with no history. **Do not fork from it.** Clone upstream,
+  then diff the PXI tree against the clone to find out what those edits were, because they are
+  currently running in every RDMA result this project might quote.
+- **The Spark's copy at `/home/nitest/grpc-direct` has not been checked** and may differ again.
+  Diff all three once the Spark returns.
+- **Build knobs are already documented** by the vendor: Cargo feature `rdma = []` with
+  `EASYRDMA_LIB_DIR` and `EASYRDMA_INC_DIR`, or CMake `-DGRPC_DIRECT_ENABLE_RDMA=ON`, which
+  fetches and builds easyrdma itself. `LONGTERM_CONTEXT.md` records that grpc-direct was once
+  already rebuilt with `--features rdma` on both machines, so this has been done before.
+- **Substituting the fork is a one-line change on our side.** `grpc_direct/CMakeLists.txt`
+  takes `GD_SRC` and `GD_BUILD` as cache paths and links `-lgrpc_direct` from
+  `${GD_BUILD}/cargo-target/release` with a matching `BUILD_RPATH`. Point those at the fork and
+  nothing else in our tree moves.
+- **Keep the diff small on purpose.** `src/lib.rs` is a single 104 KB file, so every line we
+  touch is a line that conflicts on the next vendor update. Target: bind three FFI functions,
+  add a pool type, and change the `ConfigureBuffers` call sites behind a flag.
+
+### 6.6 The three ownership questions
+
+Phase 2 was lockstep with one message in flight, which sidestepped all three. They were
+deferred, not solved.
+
+**(a) Who owns a slot between arrival and FFT completion?**
+
+Today: easyrdma owns it, we borrow, and the borrow ends at the top of the next
+`server_receive`. This has never caused a problem, and the reason is worth being precise
+about, because it is luck rather than design: `s.fft->execute()` in
+`grpc_direct/bench_grpc_server.cc` is **synchronous**, it synchronizes internally, which is how
+`last_exec_us()` can report a time. The FFT is therefore always finished before the handler
+returns, which is always before the release. The invariant holds by side effect.
+
+That breaks the moment the FFT becomes asynchronous, which is the obvious next optimization.
+Release-at-next-receive would then hand a buffer back to the NIC while the GPU is still reading
+it. **This is the mirror image of the Phase 2 bug**: Phase 2 was launch-before-arrival, this is
+release-before-completion. Same class, opposite end.
+
+The decision: bind slot lifetime to a CUDA event, not to a call. Record an event after the FFT;
+a slot returns to the pool only once that event has completed. And, following Phase 2's rule,
+**write the failing version first**: release the slot immediately after launch, let a
+subsequent message overwrite it, and confirm the spectral check fails. If it passes, the check
+cannot see this race and everything built on it is unverified.
+
+**(b) How does the sender learn a slot was freed?**
+
+Stock behaviour is implicit and it already works: re-queueing a receive region is what makes it
+eligible again, so the receive-request availability on the RC queue pair *is* the credit. The
+sender blocks in `AcquireSendRegion` when all `RDMA_MAX_CONCURRENT = 4` buffers are occupied.
+There is no application-level credit and none is needed.
+
+Do **not** carry Phase 2's explicit TCP credit forward. It exists because Phase 2 bypassed
+easyrdma and had to invent flow control; here the library provides it.
+
+Open: with external buffers, confirm whether `ReleaseUserBufferRegionToIdle` alone re-arms a
+slot or whether it must be paired with `QueueExternalBufferRegion`. This is a source-reading
+job in `easyrdma/core/linux` and `core/common/RdmaBufferQueue.h`, not a guess.
+
+**(c) What happens when the sender outruns the receiver?**
+
+Stock RDMA blocks: the vendor's own troubleshooting table lists "AcquireSendRegion failed — all
+send buffers occupied". Stock shmem silently drops, which is the known 171-to-200-of-200
+shortfall.
+
+**That difference will contaminate Phase 4 if it is left implicit.** Under the same offered
+load, a blocking arm and a dropping arm do different amounts of work, and their latency
+distributions are not comparable. The right response is to measure it, not to quietly equalize
+it: record delivered counts per arm and time spent blocked in send, and report both next to the
+latency. The sequence accounting from `b8c0b96` covers the first half already.
+
+### 6.7 Order of work
+
+1. Get a real upstream clone and diff it against the PXI tree. Find out what the `.bak` files
+   were hiding.
+2. Write and run Gate 5, with its negative control. **Blocked on the Spark.**
+3. Bind the three external-buffer functions in the Rust FFI block.
+4. Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
+   `ConfigureBuffers` reachable so `rdma-stock` stays measurable.
+5. Write the release-before-completion failure case and confirm it fails.
+6. Then the real path, then the checks below.
+
+### 6.8 Out of scope for Phase 3
+
+- Any timing quoted from Phase 2. That harness is lockstep with one message in flight.
+- Changes to the shmem and tcp paths beyond keeping them building.
+- `daq-wire`, which stays out of scope for the reasons in section 7.
+
+### Tasks (original plan text, kept because 6.1 corrects it rather than replacing it)
 
 1. Implement `GRPC_DIRECT_TRANSPORT_RDMA` in the Rust library via easyrdma behind the
 Cargo `--features rdma` flag. The enum exists; the implementation currently returns
@@ -381,6 +575,10 @@ pattern, so the existing arms stay measurable.
 - Sequence accounting shows contiguous windows, matching the standard established for
 the shmem path.
 - No regression in the existing shmem and tcp transports.
+- The landing buffer is demonstrably ours: assert the received pointer lies inside the
+`cudaHostAlloc`'d pool, and abort if it does not.
+- Nothing allocates, registers or translates on the hot path, asserted at the call site as in
+Phase 2 rather than merely intended.
 
 ---
 

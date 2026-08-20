@@ -26,7 +26,15 @@ tmp_*
 # Personal / local-only docs (not for the shared repo)
 RESULTS.md
 M9_REPORT.md
-PROGRESS.md
 ARCHITECTURE.md
-SHORTTERM_CONTEXT.md
-LONGTERM_CONTEXT.md
+
+# PROGRESS.md, SHORTTERM_CONTEXT.md and LONGTERM_CONTEXT.md used to be listed
+# here. They were removed on 2026-08-20 because three tracked files pointed
+# readers at them (handoff.md, handoff_roce_2026-08-06.md, scripts/find_spark.sh
+# and presentation/HANDOFF.md), which made them handoff artifacts that nobody
+# outside this laptop could read. A document that is cited as authoritative and
+# is also unshareable is the worst of both. They are tracked now; once a file is
+# tracked, entries here no longer apply to it anyway.
+#
+# The three above are genuinely local: finished reports on a finished phase,
+# cited only from PROGRESS.md, where the link is flagged as local-only.

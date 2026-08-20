@@ -33,8 +33,19 @@ pre-flight gates passed on 2026-08-19; section 7d has the results and the reprod
 **Phase 2 is built and passing:** 31,800 messages from the PXI across payloads from 16 KB to
 4 MB, every one spectrally verified, zero completion errors, and nothing allocated or registered
 after startup. The deliberately-broken-ordering control fails as it must, so the checker is
-known to be sensitive to the race rather than merely green. Section 7f. Next is Phase 3,
-integration into the transport.
+known to be sensitive to the race rather than merely green. Section 7f.
+
+**Phase 3 is scoped and not started, and the scoping changed its shape.** The Rust library
+already implements the RDMA transport over easyrdma; the "not yet implemented, returns NULL"
+comment is stale. But it lets easyrdma allocate the landing buffer, which is the arrangement
+Phase 1 measured and Phase 2 exists to escape. `easyrdma_ConfigureExternalBuffer` is the seam.
+Full breakdown, including the three buffer-ownership questions, in `rdma_transport_plan.md` §6.
+
+**Blocked: the Spark is off the network as of 2026-08-20.** DNS still resolves it and SSH times
+out. An ARP sweep from the PXI (`scripts/find_spark_arp.sh`) does not find its MAC anywhere on
+the subnet, so it is off rather than at a new lease. Note that the *first* ARP check reported it
+alive with the correct MAC; that was a stale cache entry, and `ip neigh` must be flushed before
+it is believed.
 
 **If you read only one more thing, read section 1.** Four of this project's headline numbers
 turned out to be measurement artifacts rather than results, and all four were caught late.
@@ -162,11 +173,20 @@ performance without giving up the gRPC API", which was the original project goal
   - `f5e5b79` page size is innocent, `cudaHostRegister` is the mechanism (retracts the null)
   - `c91614c` Gates 1 and 4 pass
   - `c875e0c` Gate 3 passes
-- `origin/grpc-direct-optimization` is at `efe712d`, so the branch is **5 commits ahead and not
-  pushed**. Ask before pushing. Git identity: Dami Thomas, damithomas03@gmail.com. Remote
-  `https://github.com/dvthomas01/DAQIRI_v_GRPC.git`.
-- **Note:** `PROGRESS.md`, `SHORTTERM_CONTEXT.md`, `LONGTERM_CONTEXT.md` are in `.gitignore`
-  by existing repo convention. They are updated on disk but intentionally not committed.
+  - `0c26669` Phase 0.5: the comparison is post-arrival processing latency, not end-to-end
+  - `6070ae1` Phase 1 harness: the allocator-flag arms
+  - `dc5eb4a` Phase 1 results, and a two-sided fix to `sign_p` in `scripts/memsrc_table.py`
+  - `eb83fe9` Phase 1 evidence log, force-added over the `*.log` ignore
+  - `7a952b1` every quotation of the 10.94 \u00b5s figure now carries its payload size
+  - `7a49963` Phase 2: bytes cross the cable, land in `cudaHostAlloc` memory, transform correctly
+- `origin/grpc-direct-optimization` is at `7a49963`, the same as local, so the branch is
+  **pushed and clean**. Ask before pushing. Git identity: Dami Thomas, damithomas03@gmail.com.
+  Remote `https://github.com/dvthomas01/DAQIRI_v_GRPC.git`.
+- **Note:** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md` **are committed as
+  of 2026-08-20**. They used to be gitignored while this file and two others pointed readers at
+  them, so they were cited as authoritative and were unreadable by anyone else. `RESULTS.md`,
+  `M9_REPORT.md` and `ARCHITECTURE.md` are still local-only, and `PROGRESS.md` flags the one
+  link that therefore will not resolve.
 - **Also note:** the previous RoCE session left a lot of uncommitted work in the working tree
   (RoCE pipeline sources, `data/*.csv`, `presentation/`, many `scripts/probe_*.sh`). It is
   untracked and shared across both branches. It was deliberately left alone. Do not commit it
@@ -184,6 +204,9 @@ performance without giving up the gRPC API", which was the original project goal
 | `rdma/rdma_fft_client.cc` | Phase 2 sender. Builds on the PXI with `g++ ... -libverbs`, no CUDA. |
 | `rdma/rdma_contract.h` | The sequence-number-to-tone mapping both sides must agree on. One definition on purpose. |
 | `data/p2_break.log`, `data/p2_correct.log`, `data/p2_soak.log` | Phase 2 raw output, including the run that is supposed to fail |
+| `rdma_transport_plan.md` §6 | Phase 3 scoping: what the fork looks like, where the easyrdma seam is, the three ownership questions |
+| `scripts/phase3_scope_probe.sh` | Re-runs that scoping read against the PXI. §6 cites `src/lib.rs` line numbers; this is how to check them |
+| `scripts/find_spark_arp.sh` | Settles whether the Spark is off the network or just at a new address. Flushes ARP first, which matters |
 | `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 
@@ -1145,7 +1168,7 @@ from 29 to 2, and there are zero drops at 4 MB.
 | `grpc_direct/pipeline_fft.proto` | `samples` is field 1 (`FloatArray`), `raw_samples` is field 4 (`bytes`). |
 | `fft/bench_fft_memsrc.cc` | The memory placement ladder. Arms `device` / `devwrite` / `mgdwrite` / `hostalloc` / `heapreg` / `shmreg` / `hugereg`. Has `smaps_backing()` for reading what actually backs a mapping, a `SIGSEGV`/`SIGBUS` fault probe that drops an unusable arm instead of killing the sweep, and a rotating arm order. **`--sizes` is in samples, not KB.** |
 | `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA feasibility gates. Build with `nvcc -O2 -arch=native ... -lcuda`, and add `-libverbs` for gate 4. |
-| `PROGRESS.md` / `SHORTTERM_CONTEXT.md` / `LONGTERM_CONTEXT.md` | Updated, gitignored. |
+| `PROGRESS.md` / `SHORTTERM_CONTEXT.md` / `LONGTERM_CONTEXT.md` | Updated, and **now committed** — they were gitignored while being cited here. |
 
 ## 13. Benchmark parameters (keep these constant for comparability)
 
