@@ -1,0 +1,43 @@
+=== build ===
+build exit: 0
+
+=== run ===
+gate5_extbuf: does easyrdma land RDMA writes in memory we allocated?
+  addr=192.168.20.1 port=18600 msg=1048576 pool=67108864 offset=4194304
+
+=== the pool ===
+  host 0x32ee00000  device 0x32ee00000  size 67108864
+  [PASS] host VA == device VA (expected on GB10's coherent C2C)
+
+=== A. ConfigureExternalBuffer over our cudaHostAlloc pool ===
+  ConfigureExternalBuffer(pool=0x32ee00000, size=67108864, concurrent=4) -> 0 (Success)
+  [PASS] easyrdma accepts a cudaHostAlloc'd pointer as its landing zone
+  [PASS] the completion callback fired
+  [PASS] the completion reports success -- status=0 bytes=1048576
+  [PASS] the completion reports the full payload size -- status=0 bytes=1048576
+  [PASS] the bytes at our chosen offset are the bytes that were sent
+  [PASS] the pool before the offset is untouched
+  [PASS] the pool after the payload is untouched
+  [PASS] the GPU reads the received bytes in place, no copy -- gpu=100139008 cpu=100139008
+  after completion: UserBuffers property -> rc 0, value 0
+  [PASS] a second transfer completes
+  [PASS] the second payload lands correctly in a different slot we chose
+  [PASS] the first slot still holds its own data, so slots do not alias
+
+=== B. CONTROL: plain ConfigureBuffers must NOT land in our pool ===
+  region.buffer = 0xabfb1f9a8040 (pool spans 0x32ee00000..0x332e00000)
+  [PASS] the stock path lands OUTSIDE our pool, as it must
+  [PASS] our pool is entirely untouched by the stock path
+  [PASS] the stock path did transfer the data, so the control is live
+
+=== D. PREDICTED FAILURE: polling + external buffers ===
+  Source says RdmaConnectedSessionBase.cpp:153 throws
+  OperationNotSupported (-734026) when usePolling is set. Confirming.
+  [PASS] RX polling can be enabled before configure
+  ConfigureExternalBuffer with polling on -> -734026 (OperationNotSupported)
+  [PASS] polling and external buffers are mutually exclusive, as the source says
+
+=== verdict ===
+  17 checks, 0 failures
+  GATE 5: PASS
+gate5 exit: 0

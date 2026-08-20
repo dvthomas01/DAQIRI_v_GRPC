@@ -38,6 +38,32 @@
   gets a pointer into memory it did not allocate. `easyrdma_ConfigureExternalBuffer` takes a
   caller-supplied pointer instead, which is the seam that lets a `cudaHostAlloc`'d pool be the
   landing zone.
+- **And the seam works.** Gate 5, `scripts/gate5_extbuf.cu`:
+  `easyrdma_ConfigureExternalBuffer` accepts a 64 MiB `cudaHostAlloc` pool, the payload lands
+  at the caller-chosen offset with the rest of the pool untouched, and a GPU kernel sums the
+  bytes in place through the device pointer and matches the CPU. Offsets need no alignment; an
+  unaligned 1048577 works. The control with stock `ConfigureBuffers` lands outside the pool
+  while still transferring, so it is a live control rather than a silent one.
+- **External buffers are a different protocol, not a flag on the same one.** Three differences,
+  each of which cost a debugging cycle or would have:
+  - Completion arrives **only by callback**. `easyrdma_AcquireReceivedRegion` throws
+    `InvalidOperation` (-734004) because `RdmaBufferQueue::WaitForCompletedBuffer` refuses
+    outright when `putBackToIdleOnCompletion` is set, which it is for external queues.
+  - There is **no release call**. The slot goes back to idle when the callback fires;
+    `easyrdma_Property_UserBuffers` reads 0 immediately after. `QueueExternalBufferRegion` is
+    the only re-arm, and it is also what sends credit, because `ConfigureExternalBuffer` does
+    not set `autoQueueRx` and so never posts receives for you.
+  - Teardown needs `easyrdma_CloseFlags_DeferWhileUserBuffersOutstanding`. Without it, closing
+    a session with one of our regions still queued gives `double free or corruption`.
+- **RX polling and external buffers are mutually exclusive.**
+  `RdmaConnectedSessionBase.cpp:153` throws `OperationNotSupported` (-734026) when `usePolling`
+  is set, confirmed empirically. This is a benchmark design constraint, not a detail: an
+  external-buffer arm cannot poll, so comparing it against a polling stock arm confounds
+  allocation ownership with interrupt wakeup, and the wakeup may be the bigger term.
+- **A prediction made before the run is worth more than the run.** The polling exclusivity was
+  read out of the easyrdma source and written down as an expected failure *before* Gate 5 ran,
+  then came back at exactly -734026. That is what licenses trusting the rest of the same source
+  reading; a gate composed only of things expected to pass would not have.
 
 ## Key findings (measurement methodology, 2026-08-19)
 

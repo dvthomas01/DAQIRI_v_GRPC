@@ -42,6 +42,22 @@ measured and Phase 2 exists to escape. `easyrdma_ConfigureExternalBuffer` is the
 audit below confirms it is called nowhere, so it must be bound rather than switched on. Full
 breakdown, including the three buffer-ownership questions, in `rdma_transport_plan.md` §6.
 
+**Gate 5 passed on 2026-08-20 and the premise of Phase 3 holds.**
+`easyrdma_ConfigureExternalBuffer` accepts a 64 MiB `cudaHostAlloc` pool, the payload lands at
+the offset we choose, the rest of the pool is untouched, and a GPU kernel reads the received
+bytes in place. The negative control with stock `ConfigureBuffers` lands outside the pool while
+still transferring, so it is a live control. 17 checks, 0 failures, 3 reps at different sizes
+including an unaligned offset. `scripts/gate5_extbuf.cu`, output in `data/gate5_extbuf.txt`.
+
+The gate corrected three things the plan had wrong, all in `rdma_transport_plan.md` §6.4.
+External buffers complete **by callback only** (`AcquireReceivedRegion` throws
+`InvalidOperation`), there is **no release call** (the slot returns to idle on completion, so
+re-queueing is the only re-arm), and teardown needs
+`easyrdma_CloseFlags_DeferWhileUserBuffersOutstanding` or the heap corrupts. It also confirmed,
+as predicted from source, that **RX polling and external buffers are mutually exclusive**
+(-734026). That is a Phase 4 confound: the `rdma` arm cannot poll and `rdma-stock` can, so an
+`rdma-stock-nopoll` arm is needed to isolate allocation ownership from wakeup mechanism.
+
 **The PXI's copy of `grpc-direct` has been audited and it is clean.** It had no `.git` and four
 `lib.rs.bak` files, so provenance was established by hashing every file against a fresh clone of
 `ni/grpc-direct`. 125 of 127 files are byte-identical to upstream HEAD `2d404a5`; the only
@@ -226,8 +242,12 @@ performance without giving up the gRPC API", which was the original project goal
 | `scripts/roce_restore_pxi.sh` | Root on the PXI. Re-adds `192.168.20.2/24` and mtu 9000, then re-reads the GID indices. Run after every Spark power cycle |
 | `scripts/diff_grpc_direct_upstream.ps1` | Hashes the PXI's `grpc-direct` against an upstream clone. Clone with `core.autocrlf=false` or it reports nonsense |
 | `scripts/audit_libr_baks.sh` | Answers what the four `lib.rs.bak` snapshots contain that the current `lib.rs` does not. Answer: nothing |
+| `scripts/gate5_extbuf.cu` | Gate 5. Does easyrdma land RDMA writes in a `cudaHostAlloc` pool we own? Yes. Self-contained, runs on the Spark alone over RoCE loopback |
+| `scripts/run_gate5.sh`, `scripts/gate5_reps.sh` | Build-and-run for Gate 5, and the three-rep sweep across sizes and offsets |
+| `scripts/probe_easyrdma_userbuf*.sh` | Read-only reads of the easyrdma source that established the external-buffer protocol. `userbuf3` is the one that found the callback-only completion |
 | `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
+| `data/gate5_extbuf.txt`, `data/gate5_reps.txt` | Gate 5 output and the three reps |
 
 ## 4. How we found the problem (the reasoning that mattered)
 

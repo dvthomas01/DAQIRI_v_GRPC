@@ -8,7 +8,11 @@ control fails as required, nothing on the hot path. Phase 3 scoped and the fork 
 scoping changed its shape twice. The RDMA transport already exists in the Rust library, so the
 work is to make it land in memory we allocated; and the PXI's undocumented copy of that library
 turns out to differ from upstream in exactly one source file, in five coherent changes, with
-nothing hidden in the four `.bak` snapshots. Both machines are up. Next: Gate 5.
+nothing hidden in the four `.bak` snapshots. Gate 5 passed: easyrdma does accept a
+`cudaHostAlloc`'d pool and the bytes land in it, the GPU reads them in place, and the negative
+control lands outside. The gate also found that external buffers complete by callback only and
+cannot be combined with RX polling, which changes the binding work and adds a confound Phase 4
+has to control for. Next: bind the FFI.
 
 ---
 
@@ -357,7 +361,7 @@ proceeding. Do not integrate a data path that is not provably correct.
 
 ---
 
-## 6. Phase 3: integration into the transport — SCOPED, NOT STARTED
+## 6. Phase 3: integration into the transport — IN PROGRESS, GATE 5 PASSED
 
 Scoping pass done 2026-08-20 by reading the actual sources rather than the headers. It changed
 the shape of the phase, so the findings come first and the original task list is kept below.
@@ -435,6 +439,10 @@ This is the whole integration in one sentence: **allocate the pool with `cudaHos
 it to `ConfigureExternalBuffer`, and the landing zone is ours.** None of these three functions
 is currently bound in the Rust FFI block; adding them is the bulk of the diff.
 
+**Corrected by Gate 5:** two of those three, not three. `ReleaseUserBufferRegionToIdle` is not
+part of the external-buffer receive path at all, and `AcquireReceivedRegion` cannot be used
+with it either. See the Gate 5 result in §6.4.
+
 ### 6.4 Gate 5, before any Rust is written
 
 Phase 2's lesson was that a check is worth nothing until it has been watched to fail, and
@@ -462,6 +470,61 @@ two unknowns at once.
 options are: land in easyrdma's buffer and pay the penalty, keep the Phase 2 raw-verbs path as
 a separate non-gRPC arm, or fork easyrdma too. Pick one deliberately and record why. Do not
 silently fall back.
+
+#### Gate 5 result — PASS, 2026-08-20
+
+`scripts/gate5_extbuf.cu`, built and run on the Spark. It does not need the PXI: sender and
+receiver are two sessions in one process over 192.168.20.1, so the transfer still crosses the
+HCA. 17 checks, 0 failures, and three reps at different sizes and offsets
+(`scripts/gate5_reps.sh`, output `data/gate5_reps.txt`), including a deliberately unaligned
+offset of 1048577, all pass. Full output at `data/gate5_extbuf.txt`.
+
+**The premise holds.** `easyrdma_ConfigureExternalBuffer` returned 0 for a 64 MiB
+`cudaHostAlloc` pool, the payload landed at exactly the offset we chose, the rest of the pool
+kept its `0xAB` fill, and a GPU kernel summing through `pool.dev + offset` matched the CPU sum
+byte for byte. Host VA equalled device VA, as expected on GB10's coherent C2C. A second
+message into a different slot did not disturb the first, so slots are independently
+addressable, which is what a slot-per-message pool needs.
+
+The control did its job: with plain `ConfigureBuffers` the region came back at
+`0xabfb1f9a8040`, outside the pool's `0x32ee00000..0x332e00000`, the pool was untouched, and
+the data still arrived, so the control is live rather than passing by failing to transfer.
+
+**Three things the gate taught that the plan did not know, all of which change the work:**
+
+1. **Completion for an external buffer arrives only by callback.** The first run failed here.
+   `easyrdma_AcquireReceivedRegion` returns `InvalidOperation` (-734004) from
+   `RdmaBufferQueue.cpp:105`, which throws unconditionally when `putBackToIdleOnCompletion`
+   is set, and it is set for single-buffer external queues. There is no completed-buffer queue
+   to block on. The receive path must pass an `easyrdma_BufferCompletionCallbackData` to
+   `QueueExternalBufferRegion` and be driven from that callback. This is a different shape
+   from the stock path's blocking `AcquireReceivedRegion` and it is the main structural
+   difference the Rust binding has to absorb.
+2. **There is no release call to make.** Because the buffer goes straight back to idle on
+   completion, `easyrdma_ReleaseUserBufferRegionToIdle` is not part of this path;
+   `easyrdma_Property_UserBuffers` reads 0 immediately after the callback fires. Re-arming a
+   slot is `QueueExternalBufferRegion` and nothing else. This answers §6.6(b) below.
+3. **Teardown needs `DeferWhileUserBuffersOutstanding`.** Run 1 printed its verdict and then
+   died with `double free or corruption (fasttop)`. Closing with the defer flag removed it.
+   The flag is not optional politeness; without it, closing a session that still has one of
+   our regions queued corrupts the heap.
+
+**And one constraint that reaches into Phase 4: polling and external buffers are mutually
+exclusive.** `RdmaConnectedSessionBase.cpp:153` throws `OperationNotSupported` when
+`usePolling` is set, and the gate confirmed it empirically at -734026. That matters twice
+over. It is a real design limit: the external-buffer arm cannot use RX polling, so it pays an
+interrupt wakeup on every message that a polling arm does not. And it is the only prediction in
+this phase that was made from source reading *before* being run, so it is the evidence that the
+rest of the source reading in §6.5 and here can be trusted.
+
+**Consequence for the arms, to be settled before any number is quoted.** `rdma` (external
+buffers) cannot poll; `rdma-stock` can, and the fork's polling fix means it actually will. A
+straight `rdma` vs `rdma-stock` comparison would then differ in two things at once, allocation
+ownership and wakeup mechanism, and the wakeup difference could easily be the larger of the
+two. Add an `rdma-stock-nopoll` arm so the pair that differs only in who allocated the buffer
+exists. If that turns out to be too many arms, the fallback is to run `rdma-stock` with polling
+off and say so in the column header, but the polling state of every RDMA arm must be reported
+next to its latency either way.
 
 ### 6.5 What the fork looks like — DONE 2026-08-20, and it is clean
 
@@ -592,6 +655,19 @@ Open: with external buffers, confirm whether `ReleaseUserBufferRegionToIdle` alo
 slot or whether it must be paired with `QueueExternalBufferRegion`. This is a source-reading
 job in `easyrdma/core/linux` and `core/common/RdmaBufferQueue.h`, not a guess.
 
+**Answered by Gate 5: neither. There is no release step.** External buffer queues run with
+`putBackToIdleOnCompletion` set, so the slot returns to idle the moment the completion callback
+fires, and `easyrdma_Property_UserBuffers` reads 0 straight after. `QueueExternalBufferRegion`
+is the only re-arming call, and it is also what releases credit to the sender, since
+`ConfigureExternalBuffer` does not set `autoQueueRx` and therefore never posts receives on our
+behalf the way `ConfigureBuffers` does.
+
+That makes ownership *simpler* than the stock path, not harder, and it is worth being explicit
+about why: the memory is ours the entire time. easyrdma never hands us a pointer and never
+takes one back. What (a) above calls "release-before-completion" becomes
+**re-queue-before-completion**, entirely on our side of the line, which means the CUDA-event
+rule in (a) is the whole of the answer rather than half of it.
+
 **(c) What happens when the sender outruns the receiver?**
 
 Stock RDMA blocks: the vendor's own troubleshooting table lists "AcquireSendRegion failed — all
@@ -609,11 +685,19 @@ latency. The sequence accounting from `b8c0b96` covers the first half already.
 1. ~~Get a real upstream clone and diff it against the PXI tree. Find out what the `.bak` files
    were hiding.~~ **DONE 2026-08-20.** One modified source file, five coherent changes, nothing
    hidden in the `.bak` snapshots. See §6.5.
-2. Write and run Gate 5, with its negative control. **Unblocked; this is the next action.**
-3. Bind the three external-buffer functions in the Rust FFI block.
+2. ~~Write and run Gate 5, with its negative control.~~ **DONE 2026-08-20, PASS.** 17 checks,
+   3 reps, control live. See §6.4. Three protocol corrections came out of it and one Phase 4
+   constraint.
+3. Bind the external-buffer functions in the Rust FFI block. **Two, not three:**
+   `ConfigureExternalBuffer` and `QueueExternalBufferRegion`, plus the
+   `easyrdma_BufferCompletionCallbackData` struct and its function-pointer typedef.
+   `ReleaseUserBufferRegionToIdle` is not on this path.
 4. Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
-   `ConfigureBuffers` reachable so `rdma-stock` stays measurable.
-5. Write the release-before-completion failure case and confirm it fails.
+   `ConfigureBuffers` reachable so `rdma-stock` stays measurable. The flag has to switch the
+   *completion mechanism* as well as the configure call, because the external path is callback
+   driven and the stock path blocks in `AcquireReceivedRegion`.
+5. Write the release-before-completion failure case and confirm it fails. Per §6.6(b) this is
+   now re-queue-before-completion.
 6. Then the real path, then the checks below.
 
 ### 6.8 Out of scope for Phase 3

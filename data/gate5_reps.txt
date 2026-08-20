@@ -1,0 +1,27 @@
+######## rep 1: msg=1048576 offset=4194304 port=18700 ########
+  ConfigureExternalBuffer with polling on -> -734026 (OperationNotSupported)
+  [PASS] polling and external buffers are mutually exclusive, as the source says
+
+=== verdict ===
+  17 checks, 0 failures
+  GATE 5: PASS
+rep 1 exit: 0
+
+######## rep 2: msg=65536 offset=1048577 port=18710 ########
+  ConfigureExternalBuffer with polling on -> -734026 (OperationNotSupported)
+  [PASS] polling and external buffers are mutually exclusive, as the source says
+
+=== verdict ===
+  17 checks, 0 failures
+  GATE 5: PASS
+rep 2 exit: 0
+
+######## rep 3: msg=4194304 offset=33554432 port=18720 ########
+  ConfigureExternalBuffer with polling on -> -734026 (OperationNotSupported)
+  [PASS] polling and external buffers are mutually exclusive, as the source says
+
+=== verdict ===
+  17 checks, 0 failures
+  GATE 5: PASS
+rep 3 exit: 0
+

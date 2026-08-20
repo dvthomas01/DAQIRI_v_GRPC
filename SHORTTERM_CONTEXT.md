@@ -186,14 +186,28 @@ short version:
    defined in any snapshot is missing from the current file, so nothing was tried and quietly
    reverted. Details in `rdma_transport_plan.md` §6.5. Reproduce with
    `scripts/diff_grpc_direct_upstream.ps1` and `scripts/audit_libr_baks.sh`.
-2. **Swap `ConfigureBuffers` for `ConfigureExternalBuffer`** so the landing buffer is ours and
+2. **Gate 5 — DONE 2026-08-20, PASS.** `easyrdma_ConfigureExternalBuffer` accepts a 64 MiB
+   `cudaHostAlloc` pool, the bytes land at the offset we pick, the rest of the pool stays
+   untouched, and a GPU kernel reads them in place. Control with stock `ConfigureBuffers` lands
+   outside the pool and still transfers, so it is live. 17 checks, 0 failures, 3 reps.
+   `scripts/gate5_extbuf.cu`, output `data/gate5_extbuf.txt` and `data/gate5_reps.txt`.
+   Three protocol corrections came out of it, all now in `rdma_transport_plan.md` §6.4:
+   completion is **callback-only**, there is **no release call**, and teardown needs
+   `DeferWhileUserBuffersOutstanding` or the heap corrupts. Plus one Phase 4 constraint: **RX
+   polling and external buffers are mutually exclusive** (-734026), so the `rdma` arm cannot
+   poll and an `rdma-stock-nopoll` arm is needed to keep the comparison honest.
+3. **Swap `ConfigureBuffers` for `ConfigureExternalBuffer`** so the landing buffer is ours and
    `cudaHostAlloc`'d, then prove by measurement that the allocator penalty is gone. Confirmed by
    the diff: **no external-buffer API is called anywhere**, in upstream, in the fork, or in any
-   `.bak`. The seam is genuinely unbound, so it has to be added rather than switched on.
-3. **Answer the three ownership questions** that Phase 2's lockstep design deferred rather than
+   `.bak`. The seam is genuinely unbound, so it has to be added rather than switched on. Bind
+   two functions, not three: `ConfigureExternalBuffer` and `QueueExternalBufferRegion`, plus the
+   completion-callback struct. `ReleaseUserBufferRegionToIdle` is not on this path.
+4. **Answer the three ownership questions** that Phase 2's lockstep design deferred rather than
    solved: who owns a slot between arrival and FFT completion, how the sender learns a slot was
-   freed, and what happens when the sender outruns the receiver.
-4. Only then Phase 4, the five-arm comparison.
+   freed, and what happens when the sender outruns the receiver. **(b) is now answered** by
+   Gate 5: re-queueing is the only re-arm and also the credit, and since the memory is ours
+   throughout, the hazard is re-queue-before-completion rather than release-before-completion.
+5. Only then Phase 4, the five-arm comparison.
 
 ### When comparing the fork against upstream, turn line-ending translation off
 

@@ -63,7 +63,7 @@
 | P1b | Is the penalty size-dependent? | **COMPLETE — YES** | It does not exist below ~1 MB. Pooling nine sizes had turned a real 15 µs effect at 4 MB into p = 1. Every future quotation of the figure carries a payload size |
 | P2 | Minimal RDMA data path, PXI → Spark → cuFFT, spectrally verified | **COMPLETE — PASSING** | `7a49963`. 1800 verified over nine sizes + 30000 in soak, 0 CQ errors, 0 timeouts |
 | P2-ctrl | Deliberately-broken ordering must FAIL the verification | **COMPLETE — FAILS AS REQUIRED** | 59/60 wrong, reporting the 400 kHz poison tone. Ran *before* the real implementation. One 16 KB message in 20 passed anyway, so the test's sensitivity is size-dependent |
-| P3 | Integrate into the Rust `grpc-direct` transport | **IN PROGRESS** | Scoping in `rdma_transport_plan.md` §6. Fork audited against upstream (§6.5). Next: Gate 5 |
+| P3 | Integrate into the Rust `grpc-direct` transport | **IN PROGRESS** | Scoping in `rdma_transport_plan.md` §6. Fork audited against upstream (§6.5). **Gate 5 PASSED** 17/17, 3 reps (§6.4): easyrdma accepts a `cudaHostAlloc` pool and the GPU reads the received bytes in place. Next: bind the FFI |
 
 **Note on this file's status.** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md`
 were in `.gitignore` under "personal / local-only docs" while `handoff.md`,
