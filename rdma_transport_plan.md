@@ -907,6 +907,30 @@ weaker than a five-rep result on three.
 If the reduced run lands early, the order to restore is `daq`, then `rdma-local`, then the
 intermediate sizes, then `opt`, then polling stock.
 
+**Confirmed 2026-08-21. The scope above is locked and the estimate risk in it is closed.**
+`rdma-stock-nopoll` was the one arm that had never been built, so its cost was the only
+unknown large enough to move the schedule. It was built and run before anything else for that
+reason. It came to about an hour, not the day it could have been, and it works: 500 of 500
+received and verified from the PXI, no bad frames, no bad spectra.
+
+Three things that run turned up, which the protocol below has to account for:
+
+- The stock arm registers the library's own receive slots with `cudaHostRegister` during an
+  unmeasured warmup. That is not a workaround, it is the mechanism under test. Section 7c of
+  `handoff.md` measured `cudaHostRegister` memory 10.94 µs of GPU time slower than
+  `cudaHostAlloc` memory at 4 MB, 15 of 15 reps, p = 6.104e-05, **and no penalty at all below
+  about 1 MB**. So the arm is predicted to tie at 16 KB and separate at 4 MB. It ties: 12.40 µs
+  against 12.32 to 14.64 µs for `rdma`. **4 MB is the cell that carries the result, and neither
+  RDMA arm has been run there yet.** That is the next measurement, not a Phase 4 formality.
+- `--slots` is meaningless for the stock arm. The library fixes four slots and sizes them
+  itself, and the run confirmed exactly four distinct regions of 20480 bytes. Any slot-count
+  sweep applies to `rdma` alone.
+- A 500-message RDMA run finishes in well under three seconds, and the GPU takes about three
+  seconds of sustained load to leave idle clocks. So those runs never ramp, which is precisely
+  what produced the 21.25 µs reading that motivated the clock gate. The Phase 4 driver has to
+  push unmeasured traffic ahead of the measured section for the RDMA arms, the same way
+  `headline_sweep.sh` now does for the shmem arms.
+
 ### Explicitly out of scope: `daq-wire`
 
 A DAQiri arm running PXI-to-Spark across the cable is **not** being measured. This is a
@@ -935,6 +959,15 @@ than writing a new script, since it already interleaves correctly at each size a
 the git SHA. Extend `headline_table.py` for the sign tests and the residual decomposition.
 Spectrum verified in every rep, not once at the start. Buffer dirtied before each timed
 transform.
+
+**Clock gate, in the harness.** `headline_sweep.sh` samples `clocks.sm` for the duration of
+each run, takes the peak, refuses to record below `MIN_SM_MHZ` (2400), and writes the observed
+clock into every CSV row beside the git SHA. Rows under the threshold are written marked
+`CLOCKLOW` rather than dropped, since `headline_table.py` keeps only `result==OK` and a missing
+cell reads as an oversight. A warmup runs the base arm until the clock ramps before the first
+measured rep, and again after any `CLOCKLOW` row. This lives in the script and not in
+`LONGTERM_CONTEXT.md` because a rule in a document is followed by whoever read the document.
+The RDMA arms still need the equivalent, per the run-length note under Arms.
 
 ### Report
 
