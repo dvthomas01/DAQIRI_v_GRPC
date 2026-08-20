@@ -441,11 +441,31 @@ How it actually behaves, which matters more than that it exists:
   until you ask for message N+1, which is a one-in-flight ownership model regardless of the
   queue depth of 4.
 
-### The library we are actually running is a fork, and here is what is in it
+### Three different comparisons, and which one answers which question
+
+This section has been misread once, so the pairings come first. Three comparisons were run and
+they do not measure the same thing:
+
+| # | Left | Right | Result | Answers |
+|---|---|---|---|---|
+| A | PXI `/home/admin/grpc-direct` | upstream `ni/grpc-direct` @ `2d404a5` | 125 of 127 identical, `src/lib.rs` +529/-31 | what the PXI runs |
+| B | Spark `~/grpc-direct` | PXI `/home/admin/grpc-direct` | 144 identical, 2 different, 8 Spark-only | whether the two boxes match |
+| C | Spark `~/grpc-direct` | upstream `2d404a5` | **15 files, +1508/-39** | what the benchmarks were built from |
+
+**"144 identical" is comparison B and says nothing about upstream.** It is Spark against PXI. It
+looks reassuring and is not, because the two trees agree on 144 files that are *both* forked.
+Comparison C is the one that describes the benchmarked library, it was run last, and it is
+larger than A and B together suggested.
+
+Comparison C is now reproducible without hashing anything: it is `git diff 2d404a5 daqiri-extbuf`
+in the fork.
+
+### Comparison A: the PXI's copy against upstream
 
 Audited 2026-08-20. `/home/admin/grpc-direct` on the PXI has no `.git`, so provenance was
 established by hashing every file against a fresh clone of `https://github.com/ni/grpc-direct.git`.
 Base is upstream HEAD `2d404a5` (2026-06-11); **125 of 127 tracked files are byte-identical**.
+This is the PXI, which sends. It is not the machine the gRPC numbers were measured on.
 The only modified source file is `src/lib.rs` at +529/-31. The four `lib.rs.bak*` files are
 monotone snapshots and no function defined in any of them is missing from the current file, so
 nothing was tried and reverted. Reproduce with `scripts/diff_grpc_direct_upstream.ps1` and
@@ -484,7 +504,7 @@ checking the clone out as CRLF, not a finding. `git -c core.autocrlf=false -c co
 drops it to 2. A comparison that says almost everything changed is describing its own
 configuration.
 
-### The Spark and the PXI are not running the same grpc-direct
+### Comparison B: the Spark against the PXI
 
 Compared 2026-08-20 with `scripts/hash_grpc_direct.sh` and
 `scripts/diff_grpc_direct_spark_vs_pxi.ps1`. 144 files identical, 2 different, 8 Spark-only.
@@ -517,6 +537,38 @@ cross-built for the PXI.
 **Its `.git/config` had a GitHub personal access token in the remote URL in plaintext.** Do not
 copy that directory, do not commit anything derived from `git remote -v`, and scrub any probe
 output before it lands in `data/`. Flagged to the user 2026-08-20 for revocation.
+
+### Comparison C: the Spark against upstream, which is the one that matters
+
+Run 2026-08-20 once the Spark's tree was committed as branch `daqiri-extbuf` off `2d404a5`.
+Fifteen files, +1508/-39 at the measured state (commit `5dfeaa5`):
+
+```
+.cargo/config.toml                                |   2 +
+cpp/client_interceptor.cc                         |  21 +-
+examples/bench_client.rs                          | 225 ++
+examples/native_bench.rs                          | 481 ++
+plugin/cmd/protoc-gen-grpc-direct/gen_cpp.go      |   4 +-
+python/README.md                                  | 245 ++
+python/{ => grpc_direct}/*.py                     |   6 files renamed, 0 content change
+python/pyproject.toml                             |   2 +-
+src/lib.rs                                        | 560 ++
+```
+
+**Comparisons A and B missed three of these, and the reason is worth keeping.** The two earlier
+probes reported `cpp/client_interceptor.cc` and `gen_cpp.go` and nothing else of substance.
+They missed the `python/` package restructure and the two `examples/` additions because
+*comparison B was Spark against PXI and both trees already carried them*, so they hashed equal;
+and comparison A ran against a file list rather than a commit, so a directory rename read as
+absence rather than as a move. A file-by-file hash comparison cannot see a change that both
+sides share, and that is the whole failure mode: B's headline number was 144 agreements between
+two copies of the same fork.
+
+None of the three additions touch the benchmark path. `examples/` is not built by our CMake,
+and `python/` is not linked. They are recorded so the fork's contents are stated once and
+correctly, not because they change a number. The two that do matter are still
+`cpp/client_interceptor.cc`, which is linked and is inert for our RPC type, and `gen_cpp.go`,
+which upstream cannot compile without.
 
 ### C++ interceptor pattern (from prior benchmark)
 ```cpp

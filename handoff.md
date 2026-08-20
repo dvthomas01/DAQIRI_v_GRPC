@@ -58,11 +58,21 @@ as predicted from source, that **RX polling and external buffers are mutually ex
 (-734026). That is a Phase 4 confound: the `rdma` arm cannot poll and `rdma-stock` can, so an
 `rdma-stock-nopoll` arm is needed to isolate allocation ownership from wakeup mechanism.
 
-**The PXI's copy of `grpc-direct` has been audited and it is clean.** It had no `.git` and four
-`lib.rs.bak` files, so provenance was established by hashing every file against a fresh clone of
-`ni/grpc-direct`. 125 of 127 files are byte-identical to upstream HEAD `2d404a5`; the only
-modified source file is `src/lib.rs`, +529/-31, in five coherent changes; the `.bak` files are
-monotone snapshots with nothing reverted. Two carry-forwards: upstream has a real bug where
+**The fork is now a branch, and the divergence is larger than the first two audits found.**
+`daqiri-extbuf` in the fork sits off upstream `2d404a5` and the measured state is commit
+`5dfeaa5`: fifteen files, +1508/-39. Read `git diff 2d404a5 daqiri-extbuf` rather than any of
+the hash comparisons. Beyond the two files already reported (`cpp/client_interceptor.cc` and
+`plugin/cmd/protoc-gen-grpc-direct/gen_cpp.go`) it also carries a `python/` package restructure
+and two `examples/` additions. Neither is on the benchmark path: `examples/` is not built by our
+CMake and `python/` is not linked. They were missed because the earlier comparison that produced
+"144 files identical" was **Spark against PXI**, and both boxes already had them, so they hashed
+equal. The comparison that produced "125 of 127 identical" was **PXI against upstream**, and the
+PXI is not the machine the gRPC numbers came from. `LONGTERM_CONTEXT.md` now tabulates all three
+pairings before describing any of them.
+
+That PXI audit still stands on its own terms: no `.git`, four `lib.rs.bak` files, provenance by
+hashing against a fresh clone of `ni/grpc-direct`, `src/lib.rs` +529/-31 in five coherent
+changes, `.bak` files monotone with nothing reverted. Two carry-forwards: upstream has a real bug where
 `PROPERTY_USE_RX_POLLING` is set after `ConfigureBuffers` and therefore silently does nothing,
 so an `rdma-stock` arm must be built from the fork with our changes off rather than from
 upstream; and the fork's re-accept loop turns a peer disconnect into an indefinite stall instead

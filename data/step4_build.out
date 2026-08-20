@@ -1,0 +1,58 @@
+== branch ==
+daqiri-extbuf
+01b5a48
+backup: src/lib.rs.bak8
+== patch ==
+  ok: rdma constants
+  ok: backend ext field
+  ok: re-accept buffer config
+  ok: stock backend construction
+  ok: rdma_server_create_ext
+  ok: stock receive guard
+  ok: exported entry points
+PATCHED /home/nitest/grpc-direct/src/lib.rs (3476 lines)
+== build ==
+   Compiling grpc-direct v0.3.0 (/home/nitest/grpc-direct)
+warning: constant `PROPERTY_USER_BUFFERS` is never used
+   --> src/lib.rs:287:15
+    |
+287 |     pub const PROPERTY_USER_BUFFERS: u32 = 0x102;
+    |               ^^^^^^^^^^^^^^^^^^^^^
+    |
+    = note: `#[warn(dead_code)]` (part of `#[warn(unused)]`) on by default
+
+warning: constant `CLOSE_DEFER_WHILE_USER_BUFFERS_OUTSTANDING` is never used
+   --> src/lib.rs:292:15
+    |
+292 |     pub const CLOSE_DEFER_WHILE_USER_BUFFERS_OUTSTANDING: u32 = 0x01;
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ERROR_INVALID_OPERATION` is never used
+   --> src/lib.rs:299:15
+    |
+299 |     pub const ERROR_INVALID_OPERATION: i32 = -734004;
+    |               ^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ERROR_ALREADY_CONFIGURED` is never used
+   --> src/lib.rs:302:15
+    |
+302 |     pub const ERROR_ALREADY_CONFIGURED: i32 = -734016;
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: constant `ERROR_OPERATION_NOT_SUPPORTED` is never used
+   --> src/lib.rs:305:15
+    |
+305 |     pub const ERROR_OPERATION_NOT_SUPPORTED: i32 = -734026;
+    |               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+warning: `grpc-direct` (lib) generated 5 warnings
+    Finished `release` profile [optimized] target(s) in 9.85s
+BUILD_EXIT=0
+== exported symbols ==
+0000000000086068 T grpc_direct_server_create_ext
+00000000000873f8 T grpc_direct_server_receive_ext
+0000000000087b50 T grpc_direct_server_slot_requeue
+== stock path untouched ==
+ src/lib.rs | 537 ++++++++++++++++++++++++++++++++++++++++++++++++++++++++++++-
+ 1 file changed, 535 insertions(+), 2 deletions(-)
+979:fn rdma_server_create(address: &str, port: u32, polling: bool) -> Option<RdmaServerBackend> {
