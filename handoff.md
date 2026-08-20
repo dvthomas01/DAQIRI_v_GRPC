@@ -35,17 +35,32 @@ pre-flight gates passed on 2026-08-19; section 7d has the results and the reprod
 after startup. The deliberately-broken-ordering control fails as it must, so the checker is
 known to be sensitive to the race rather than merely green. Section 7f.
 
-**Phase 3 is scoped and not started, and the scoping changed its shape.** The Rust library
-already implements the RDMA transport over easyrdma; the "not yet implemented, returns NULL"
-comment is stale. But it lets easyrdma allocate the landing buffer, which is the arrangement
-Phase 1 measured and Phase 2 exists to escape. `easyrdma_ConfigureExternalBuffer` is the seam.
-Full breakdown, including the three buffer-ownership questions, in `rdma_transport_plan.md` §6.
+**Phase 3 is under way and the scoping changed its shape twice.** The Rust library already
+implements the RDMA transport over easyrdma; the "not yet implemented, returns NULL" comment is
+stale. But it lets easyrdma allocate the landing buffer, which is the arrangement Phase 1
+measured and Phase 2 exists to escape. `easyrdma_ConfigureExternalBuffer` is the seam, and the
+audit below confirms it is called nowhere, so it must be bound rather than switched on. Full
+breakdown, including the three buffer-ownership questions, in `rdma_transport_plan.md` §6.
 
-**Blocked: the Spark is off the network as of 2026-08-20.** DNS still resolves it and SSH times
-out. An ARP sweep from the PXI (`scripts/find_spark_arp.sh`) does not find its MAC anywhere on
-the subnet, so it is off rather than at a new lease. Note that the *first* ARP check reported it
-alive with the correct MAC; that was a stale cache entry, and `ip neigh` must be flushed before
-it is believed.
+**The PXI's copy of `grpc-direct` has been audited and it is clean.** It had no `.git` and four
+`lib.rs.bak` files, so provenance was established by hashing every file against a fresh clone of
+`ni/grpc-direct`. 125 of 127 files are byte-identical to upstream HEAD `2d404a5`; the only
+modified source file is `src/lib.rs`, +529/-31, in five coherent changes; the `.bak` files are
+monotone snapshots with nothing reverted. Two carry-forwards: upstream has a real bug where
+`PROPERTY_USE_RX_POLLING` is set after `ConfigureBuffers` and therefore silently does nothing,
+so an `rdma-stock` arm must be built from the fork with our changes off rather than from
+upstream; and the fork's re-accept loop turns a peer disconnect into an indefinite stall instead
+of an error. See `rdma_transport_plan.md` §6.5. If you re-run the comparison, clone with
+`core.autocrlf=false` or it will report 123 of 127 files changed and mean nothing by it.
+
+**Both machines are up as of 2026-08-20.** The Spark was off the network for part of the day and
+returned at the same address after a power cycle. Two things that outage taught, both durable:
+`ip neigh` must be flushed before it is believed, because the first check reported the Spark
+alive with its correct MAC from a stale cache entry; and the PXI's RoCE address dies on a **Spark
+power cycle**, not only on a PXI reboot. The PXI had 13 days of uptime and had still reverted to
+a `169.254/16` link-local address, because the carrier flapped. Recovery is
+`scripts/roce_restore_pxi.sh` as root on the PXI. The GID index moves with the address, so read
+it rather than quoting one from memory.
 
 **If you read only one more thing, read section 1.** Four of this project's headline numbers
 turned out to be measurement artifacts rather than results, and all four were caught late.
@@ -207,6 +222,10 @@ performance without giving up the gRPC API", which was the original project goal
 | `rdma_transport_plan.md` §6 | Phase 3 scoping: what the fork looks like, where the easyrdma seam is, the three ownership questions |
 | `scripts/phase3_scope_probe.sh` | Re-runs that scoping read against the PXI. §6 cites `src/lib.rs` line numbers; this is how to check them |
 | `scripts/find_spark_arp.sh` | Settles whether the Spark is off the network or just at a new address. Flushes ARP first, which matters |
+| `scripts/roce_poststate.sh` | Read-only RoCE state check for either machine: address, MTU, port state, `active_mtu`, GID indices |
+| `scripts/roce_restore_pxi.sh` | Root on the PXI. Re-adds `192.168.20.2/24` and mtu 9000, then re-reads the GID indices. Run after every Spark power cycle |
+| `scripts/diff_grpc_direct_upstream.ps1` | Hashes the PXI's `grpc-direct` against an upstream clone. Clone with `core.autocrlf=false` or it reports nonsense |
+| `scripts/audit_libr_baks.sh` | Answers what the four `lib.rs.bak` snapshots contain that the current `lib.rs` does not. Answer: nothing |
 | `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 

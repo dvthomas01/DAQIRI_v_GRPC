@@ -4,9 +4,11 @@ Status: Phase 0 complete, all four gates passed. Phase 0.5 complete, DAQiri conf
 local and the headline table relabelled. Measurement window committed to post-arrival.
 Phase 1 complete and negative: no flag closes any part of the gap, so Phase 2 is justified
 and proceeds. Phase 2 complete and passing: 31,800 verified messages, the broken-ordering
-control fails as required, nothing on the hot path. Phase 3 scoped, not started, and the
-scoping changed its shape: the RDMA transport already exists in the Rust library, so the work
-is to make it land in memory we allocated. Blocked on the Spark being off the network.
+control fails as required, nothing on the hot path. Phase 3 scoped and the fork audited; the
+scoping changed its shape twice. The RDMA transport already exists in the Rust library, so the
+work is to make it land in memory we allocated; and the PXI's undocumented copy of that library
+turns out to differ from upstream in exactly one source file, in five coherent changes, with
+nothing hidden in the four `.bak` snapshots. Both machines are up. Next: Gate 5.
 
 ---
 
@@ -364,10 +366,9 @@ Every line number below refers to the copies on the PXI: `/home/admin/grpc-direc
 and `/home/admin/easyrdma/core/api/easyrdma.h`. Those are the vendor's files and are
 deliberately **not** committed here; `scripts/phase3_scope_probe.sh` re-runs the read.
 
-**Blocked on hardware.** The Spark went off the network on 2026-08-20 (see
-`LONGTERM_CONTEXT.md`, "Settling whether the Spark is alive"). Nothing here that requires a
-build or a measurement can run. Everything that is reading, forking and writing the gate
-program can.
+**Unblocked 2026-08-20.** The Spark was off the network for part of the day and is back at the
+same address; the ARP lesson from that outage is kept in `LONGTERM_CONTEXT.md`, "Settling
+whether the Spark is alive". Both machines are reachable and the RoCE fabric is up end to end.
 
 ### 6.1 The premise of task 1 is wrong: the RDMA transport already exists
 
@@ -462,15 +463,81 @@ options are: land in easyrdma's buffer and pay the penalty, keep the Phase 2 raw
 a separate non-gRPC arm, or fork easyrdma too. Pick one deliberately and record why. Do not
 silently fall back.
 
-### 6.5 What the fork looks like
+### 6.5 What the fork looks like — DONE 2026-08-20, and it is clean
 
-- **`/home/admin/grpc-direct` on the PXI has no `.git`.** It is a copy, and it sits next to
-  `src/lib.rs.bak`, `.bak2`, `.bak3` and `.bak4` alongside a modified `lib.rs`. Somebody has
-  already edited this tree in place with no history. **Do not fork from it.** Clone upstream,
-  then diff the PXI tree against the clone to find out what those edits were, because they are
-  currently running in every RDMA result this project might quote.
-- **The Spark's copy at `/home/nitest/grpc-direct` has not been checked** and may differ again.
-  Diff all three once the Spark returns.
+The PXI copy at `/home/admin/grpc-direct` has no `.git`, so provenance had to be established by
+content rather than by history. Upstream is `https://github.com/ni/grpc-direct.git`, named in
+its own `README.md:201`. Method: hash every non-`target`, non-`.github` file on the PXI, hash a
+fresh upstream clone the same way, compare. Reproduce with
+`scripts/diff_grpc_direct_upstream.ps1`.
+
+**A warning about the method before the result.** The first run reported 123 of 127 files
+modified, which is not a finding, it is `core.autocrlf` checking the clone out with CRLF on
+Windows against the PXI's LF. Clone with `git -c core.autocrlf=false -c core.eol=lf clone` and
+the count drops to 2. A comparison that says almost everything changed is describing itself.
+
+**Base commit: upstream HEAD `2d404a5`, 2026-06-11.** Upstream has had no commits since. The
+PXI's untouched files are stamped Jun 11 15:00 UTC against that commit's 14:50 UTC, and 125 of
+127 tracked files hash identically, so the base is established by content and not by timestamp.
+
+| | count | what |
+|---|---|---|
+| identical | 125 | |
+| modified | 2 | `src/lib.rs`, `python/pyproject.toml` |
+| PXI-only | 19 | `Cargo.lock`, two `examples/*.rs` benches, and `python/grpc_direct/**` plus `*.egg-info` |
+| upstream-only | 6 | `python/*.py` at the old flat path |
+
+The whole python column is one `pip install -e .`: the modules moved from `python/` to
+`python/grpc_direct/`, `pyproject.toml` changed to match, and egg-info, `__pycache__` and a
+built `libgrpc_direct.so` landed beside them. Build residue, not a source edit.
+
+**So there is exactly one modified source file, `src/lib.rs`, +529/-31.** The full diff is
+vendor code, so it is **not** committed here; it sits at `data/lib_rs_vs_upstream.diff` locally
+and the two scripts above regenerate it. It is five coherent changes, not a mess:
+
+| change | where (fork line numbers) | category |
+|---|---|---|
+| `ERROR_DISCONNECTED = -734017` constant added to `mod easyrdma` | 286 | new constant |
+| `stream_region` and `polling` fields on `RdmaServerBackend` | 609 | supports the two below |
+| `rdma_server_reaccept()`, new, 69 lines | 672 | new functionality |
+| RX-polling property moved **before** `ConfigureBuffers`, return code now checked | 808, 924 | **upstream bug fix** |
+| `GRPC_DIRECT_RDMA_LOCAL` env var to override the client's local bind address | 865 | needed for cross-machine |
+| `AcquireReceivedRegion` wrapped in a re-accept retry loop | 1490 | **datapath semantic change** |
+| `rdma_reserved` field + `response_reserve` / `response_commit` | 1074, 2400 | new, saves one memcpy |
+| pipelined streaming API, 6 more `extern "C"` functions | 2509-2747 | new functionality |
+
+Four things worth carrying forward:
+
+1. **The RX-polling fix is real and belongs upstream.** Upstream sets
+   `PROPERTY_USE_RX_POLLING` *after* `ConfigureBuffers` and ignores the return code; easyrdma
+   rejects it at that point with `AlreadyConfigured`, so upstream's polling flag silently does
+   nothing. The fork sets it first and checks. Any `rdma-stock` arm built from unmodified
+   upstream is therefore **not** polling even if asked to, which would be a confound in Phase 4.
+   Build the `rdma-stock` arm from the fork with our changes disabled, not from upstream.
+2. **The re-accept loop changes disconnect semantics.** Upstream returns an error; the fork
+   tears the session down and blocks in `easyrdma_Accept` with `TIMEOUT_INFINITE` until a new
+   client arrives. During a benchmark a peer dropping out becomes an indefinite stall in the
+   receive path rather than a visible error. Phase 4 must record delivered counts anyway, which
+   is what would catch this.
+3. **No external-buffer API is called anywhere.** Neither `easyrdma_ConfigureExternalBuffer`,
+   `easyrdma_QueueExternalBufferRegion`, `easyrdma_ReleaseUserBufferRegionToIdle`,
+   `easyrdma_Property_UserBuffers` nor `easyrdma_CloseFlags_DeferWhileUserBuffersOutstanding`
+   appears in upstream, in the fork, or in any `.bak`. §6.3's seam is genuinely unbound. It has
+   to be added, not switched on.
+4. **One suspected buffer leak, found in passing.** In `grpc_direct_client_stream_go`, if
+   `easyrdma_QueueBufferRegion` fails the acquired region returns `-1` without being released,
+   which loses a slot from a pool of `RDMA_MAX_CONCURRENT = 4`. Not on the Phase 3 path, not
+   fixed, recorded here so it is not rediscovered as a mystery hang.
+
+**The four `.bak` files were hiding nothing.** `scripts/audit_libr_baks.sh` diffs them in
+sequence: 85714 → 86943 → 90234 → 95015 → 104008 bytes over 2026-06-22/23, adding 42, 86, 118
+and 255 lines with 19, 6, 0 and 0 removed. Every function name defined in every snapshot
+survives into the current file, so nothing was tried and quietly reverted. The only removals are
+the RX-polling lines being moved. They are incremental saves, not abandoned variants.
+
+**Still open:** the Spark's copy at `/home/nitest/grpc-direct` has not been compared. Run the
+same hash comparison against it before building there.
+
 - **Build knobs are already documented** by the vendor: Cargo feature `rdma = []` with
   `EASYRDMA_LIB_DIR` and `EASYRDMA_INC_DIR`, or CMake `-DGRPC_DIRECT_ENABLE_RDMA=ON`, which
   fetches and builds easyrdma itself. `LONGTERM_CONTEXT.md` records that grpc-direct was once
@@ -479,6 +546,9 @@ silently fall back.
   takes `GD_SRC` and `GD_BUILD` as cache paths and links `-lgrpc_direct` from
   `${GD_BUILD}/cargo-target/release` with a matching `BUILD_RPATH`. Point those at the fork and
   nothing else in our tree moves.
+- **Fork from upstream `2d404a5`, then replay the PXI's `lib.rs` as one commit.** That way the
+  local changes have a history for the first time and our Phase 3 work sits on top of them as a
+  separate commit, so the two can be told apart later.
 - **Keep the diff small on purpose.** `src/lib.rs` is a single 104 KB file, so every line we
   touch is a line that conflicts on the next vendor update. Target: bind three FFI functions,
   add a pool type, and change the `ConfigureBuffers` call sites behind a flag.
@@ -536,9 +606,10 @@ latency. The sequence accounting from `b8c0b96` covers the first half already.
 
 ### 6.7 Order of work
 
-1. Get a real upstream clone and diff it against the PXI tree. Find out what the `.bak` files
-   were hiding.
-2. Write and run Gate 5, with its negative control. **Blocked on the Spark.**
+1. ~~Get a real upstream clone and diff it against the PXI tree. Find out what the `.bak` files
+   were hiding.~~ **DONE 2026-08-20.** One modified source file, five coherent changes, nothing
+   hidden in the `.bak` snapshots. See §6.5.
+2. Write and run Gate 5, with its negative control. **Unblocked; this is the next action.**
 3. Bind the three external-buffer functions in the Rust FFI block.
 4. Add the `cudaHostAlloc` pool and switch the call sites behind a build flag, keeping stock
    `ConfigureBuffers` reachable so `rdma-stock` stays measurable.

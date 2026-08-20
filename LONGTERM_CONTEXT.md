@@ -319,8 +319,21 @@ check cannot. Beware `4c:bb:47:2a:b7:*`: those are other DGX Sparks in the same 
 
 - **CURRENT (2026-08-06):** 50G RoCE link Spark `enp1s0f0np0` = `192.168.20.1/24` ↔ PXI
   `enp117s0` = `192.168.20.2/24`. RDMA verified with `rping` (RC read/write, 10/10).
-- PXI IP is runtime-only → re-add after reboot: `ip addr add 192.168.20.2/24 dev enp117s0`
-  (root on PXI). To persist: NI MAX or `connmanctl`.
+- PXI IP is runtime-only. **Corrected 2026-08-20: it does not only die on a PXI reboot, it dies
+  whenever the carrier flaps, which means every time the Spark is power-cycled.** Observed with
+  the PXI at `up 13 days` and no reboot of its own: `192.168.20.2/24` had been replaced by a
+  `169.254/16` link-local address, while `mtu 9000` survived. Recovery is
+  `scripts/roce_restore_pxi.sh` (root on PXI), which is `ip addr add 192.168.20.2/24 dev
+  enp117s0` plus the MTU, and then re-reads the GID indices. To persist: NI MAX or `connmanctl`.
+  **Check this after every Spark reboot, not just after a PXI reboot**, because the failure is
+  silent: the link stays UP, the ibverbs port stays ACTIVE, and only the route is gone.
+- **The GID index is a position in a list, not an identity. Read it, never quote it.** After the
+  2026-08-20 recovery the PXI's RoCE v2 IPv4 GID was back at index 5, which is what
+  `rdma/rdma_fft_client.cc` defaults to. That is only true because the stale link-local address
+  is *also* still on the interface, occupying indices 2 and 3 ahead of it. Flush the link-local
+  and `192.168.20.2` slides down to index 3. The Spark's is index 3 for the same reason in
+  reverse: it has only the one address. Both scripts print the indices with the address each one
+  carries; use that output rather than memory.
 - (Historical: an earlier 192.168.10.x link on the 1G ports is obsolete after a room move.)
 - easyrdma built on BOTH arches (`core/` subdir only: `cmake .. -DCMAKE_BUILD_TYPE=Release; make`)
 - grpc-direct rebuilt with `--features rdma` on BOTH machines
@@ -385,6 +398,49 @@ How it actually behaves, which matters more than that it exists:
   previously-held region, then acquires the next. So message N's buffer stays valid exactly
   until you ask for message N+1, which is a one-in-flight ownership model regardless of the
   queue depth of 4.
+
+### The library we are actually running is a fork, and here is what is in it
+
+Audited 2026-08-20. `/home/admin/grpc-direct` on the PXI has no `.git`, so provenance was
+established by hashing every file against a fresh clone of `https://github.com/ni/grpc-direct.git`.
+Base is upstream HEAD `2d404a5` (2026-06-11); **125 of 127 tracked files are byte-identical**.
+The only modified source file is `src/lib.rs` at +529/-31. The four `lib.rs.bak*` files are
+monotone snapshots and no function defined in any of them is missing from the current file, so
+nothing was tried and reverted. Reproduce with `scripts/diff_grpc_direct_upstream.ps1` and
+`scripts/audit_libr_baks.sh`. The full diff is vendor code and is deliberately not committed;
+it lands at `data/lib_rs_vs_upstream.diff` when you run the scripts.
+
+The changes, and why each matters:
+
+- **Upstream's RX polling flag silently does nothing.** Upstream sets `PROPERTY_USE_RX_POLLING`
+  *after* `easyrdma_ConfigureBuffers` and ignores the return code; easyrdma rejects the property
+  once buffers are configured. The fork sets it first and checks. Consequence for benchmarking:
+  an `rdma-stock` arm built from unmodified upstream would not be polling even when asked, which
+  is a confound. Build that arm from the fork with our own changes disabled.
+- **Disconnect handling diverges.** The fork wraps `AcquireReceivedRegion` in a retry loop that,
+  on `ERROR_DISCONNECTED`, tears the session down and blocks in `easyrdma_Accept` with
+  `TIMEOUT_INFINITE`. Upstream returns an error. So a peer dropping out mid-run appears as an
+  indefinite stall in the receive path, not as a failure. Delivered-count accounting catches it.
+- **`GRPC_DIRECT_RDMA_LOCAL`** overrides the client's local bind address. Without it the client
+  binds to the remote address, which cannot work cross-machine. Needed for any two-box run.
+- **Zero-copy response and a pipelined streaming API** were added: `response_reserve` /
+  `response_commit` serialize in place on the send region, and six more `extern "C"` functions
+  implement depth-K streaming.
+- **No external-buffer API is called anywhere**, in upstream, the fork, or any `.bak`. Neither
+  `easyrdma_ConfigureExternalBuffer`, `easyrdma_QueueExternalBufferRegion`,
+  `easyrdma_ReleaseUserBufferRegionToIdle`, `easyrdma_Property_UserBuffers` nor
+  `easyrdma_CloseFlags_DeferWhileUserBuffersOutstanding`. This is the seam Phase 3 needs and it
+  is unbound, so it has to be added rather than enabled.
+- **A suspected slot leak, found in passing and not fixed.** In `grpc_direct_client_stream_go`,
+  a failed `easyrdma_QueueBufferRegion` returns without releasing the acquired region, losing
+  one slot from a pool of four. Not on the Phase 3 path. Recorded so it is not later
+  rediscovered as a mystery hang.
+
+**When diffing a Linux tree against a Windows clone, turn line-ending translation off.** The
+first run of this comparison reported 123 of 127 files modified. That was `core.autocrlf`
+checking the clone out as CRLF, not a finding. `git -c core.autocrlf=false -c core.eol=lf clone`
+drops it to 2. A comparison that says almost everything changed is describing its own
+configuration.
 
 ### C++ interceptor pattern (from prior benchmark)
 ```cpp

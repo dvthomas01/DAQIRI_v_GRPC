@@ -7,18 +7,32 @@
 
 ---
 
-## BLOCKER: the Spark is off the network (2026-08-20)
+## RESOLVED: the Spark is back (2026-08-20)
 
-Nothing Spark-side can run until it comes back. DNS still resolves
-`spark-ac69.ni.corp.natinst.com` to 10.198.65.106 and SSH times out there.
+It was power-cycled and returned at the same address, 10.198.65.106. Both machines are
+reachable and the RoCE fabric is up end to end. Phase 3 is unblocked. Two lessons from the
+outage are kept below because both are durable.
 
 **Do not trust `ip neigh` without flushing first.** The first check from the PXI showed
 `10.198.65.106 dev eno0 lladdr 4c:bb:47:2e:ac:69 DELAY`, i.e. the Spark's own management MAC,
 which reads exactly like "the box is alive". It was a stale cache entry. After
-`ip neigh flush dev eno0` and a fresh ping the same lookup returns `FAILED`. An ARP sweep of
-the whole /24 (`scripts/find_spark_arp.sh`, run from the PXI) finds three other NVIDIA-OUI
-hosts and **not** `4c:bb:47:2e:ac:69`, so the box is off the network rather than merely at a
-new DHCP lease. The PXI is up and reachable throughout.
+`ip neigh flush dev eno0` and a fresh ping the same lookup returned `FAILED`. An ARP sweep of
+the whole /24 (`scripts/find_spark_arp.sh`, run from the PXI) found three other NVIDIA-OUI
+hosts and **not** `4c:bb:47:2e:ac:69`. Use the sweep, not a single-address lookup: only the
+sweep distinguishes "off the network" from "at a new DHCP lease".
+
+**The PXI's RoCE address dies on a Spark power cycle, not only on a PXI reboot.** This
+corrects what the recovery steps used to say. When the Spark came back the PXI had `up 13
+days` and had *still* lost `192.168.20.2/24`, reverting to a `169.254/16` link-local address.
+The trigger is the carrier flap on the direct link, not a reboot, so it happens every time the
+Spark is power-cycled. `mtu 9000` survived; only the address was replaced. Recovery is
+`scripts/roce_restore_pxi.sh`, run as root on the PXI.
+
+**The GID index moves with the address, so read it.** It is a position in a list, not an
+identity. After recovery the PXI's RoCE v2 IPv4 GID was back at index 5, which is what
+`rdma/rdma_fft_client.cc` defaults to, but only because the link-local address is *also* still
+present and occupies indices 2 and 3 ahead of it. Remove the link-local and 192.168.20.2 slides
+down to index 3. Never quote a GID index from memory; read it and check the address it carries.
 
 ## THE HEADLINE: the transport is built and verified end to end
 
@@ -162,15 +176,31 @@ ways and is confounded for placement questions. Only `opt` vs `daq` is clean.
 Scoping is written up in `rdma_transport_plan.md` §6 and should be read before any code. The
 short version:
 
-1. **Fork `grpc-direct` properly.** The copy on the PXI at `/home/admin/grpc-direct` has no
-   `.git` and four `lib.rs.bak*` files beside a modified `lib.rs`, so somebody has already
-   edited it in place with no history. Get a real clone before adding to that.
+1. **Fork `grpc-direct` properly — DONE, and it came back clean.** The PXI copy at
+   `/home/admin/grpc-direct` has no `.git` and four `lib.rs.bak*` files, so provenance had to be
+   established by content. Upstream is `https://github.com/ni/grpc-direct.git`. Against upstream
+   HEAD `2d404a5` (2026-06-11) **125 of 127 tracked files are byte-identical**; the only real
+   source change is `src/lib.rs`, +529/-31. The other "difference", `python/pyproject.toml` plus
+   a pile of moved files, is a `pip install -e .` layout change and build residue. The four
+   `.bak` files are strictly monotone snapshots of the same afternoon's work: no function
+   defined in any snapshot is missing from the current file, so nothing was tried and quietly
+   reverted. Details in `rdma_transport_plan.md` §6.5. Reproduce with
+   `scripts/diff_grpc_direct_upstream.ps1` and `scripts/audit_libr_baks.sh`.
 2. **Swap `ConfigureBuffers` for `ConfigureExternalBuffer`** so the landing buffer is ours and
-   `cudaHostAlloc`'d, then prove by measurement that the allocator penalty is gone.
+   `cudaHostAlloc`'d, then prove by measurement that the allocator penalty is gone. Confirmed by
+   the diff: **no external-buffer API is called anywhere**, in upstream, in the fork, or in any
+   `.bak`. The seam is genuinely unbound, so it has to be added rather than switched on.
 3. **Answer the three ownership questions** that Phase 2's lockstep design deferred rather than
    solved: who owns a slot between arrival and FFT completion, how the sender learns a slot was
    freed, and what happens when the sender outruns the receiver.
 4. Only then Phase 4, the five-arm comparison.
+
+### When comparing the fork against upstream, turn line-ending translation off
+
+The first comparison reported 123 of 127 files modified. That was not a result, it was
+`core.autocrlf` checking the clone out with CRLF on Windows against the PXI's LF. Clone with
+`git -c core.autocrlf=false -c core.eol=lf clone ...` and the count drops to 2. A diff tool that
+says almost everything changed is reporting on itself, not on the code.
 
 ### Historical: the assignment as originally written
 
