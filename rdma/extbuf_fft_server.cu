@@ -207,6 +207,10 @@ static void usage() {
         "                  (default 18800)\n"
         "  --npts    N     FFT size in samples (default 4096)\n"
         "  --msgs    N     messages to receive (default 200)\n"
+        "  --warmup  N     unmeasured messages before the measured section\n"
+        "                  (default 0). Needed at every size: the GB10 sits at\n"
+        "                  idle clocks and takes about three seconds of load to\n"
+        "                  ramp, and a short run finishes before it does.\n"
         "  --slots   N     pool slots (default 4; step 6 uses 2)\n"
         "  --poison  on|off   repaint each slot before re-queueing (default on)\n"
         "  --verify  every|off  spectral check per message (default every)\n"
@@ -227,6 +231,7 @@ int main(int argc, char** argv) {
     uint32_t    port     = 18800;
     int         npts     = 4096;
     int         msgs     = 200;
+    int         warmup   = 0;
     int         slots    = 4;
     int         tol_bins = 2;
     int         reg_warmup = 32;
@@ -243,6 +248,7 @@ int main(int argc, char** argv) {
         else if (a == "--port")       port = static_cast<uint32_t>(std::stoul(next()));
         else if (a == "--npts")       npts = std::stoi(next());
         else if (a == "--msgs")       msgs = std::stoi(next());
+        else if (a == "--warmup")     warmup = std::stoi(next());
         else if (a == "--slots")      slots = std::stoi(next());
         else if (a == "--tol-bins")   tol_bins = std::stoi(next());
         else if (a == "--poison")     poison_on = (next() == "on");
@@ -343,37 +349,67 @@ int main(int argc, char** argv) {
     }
     std::printf("connected\n\n");
 
-    // ── stock warmup: see every slot once, register it, then freeze ──────
+    // ── warmup: unmeasured, and it does two separate jobs ────────────────
+    // One, it ramps the GPU. Sampling clocks.sm once a second across a run
+    // gave 208 208 208 2405 2405 2405 2405 2457 2405 234 208 208: the part
+    // needs about three seconds of sustained load to leave idle clocks and
+    // drops back within one second of the load stopping. A 500 message run at
+    // 16 KB finishes long before that, which is how a cuFFT p50 of 21.25 us
+    // got recorded against a true 7.62 us. Nothing can leave the clock up
+    // between runs, so the ramp has to happen inside this process, driven by
+    // the same traffic that will be measured.
+    //
+    // Two, in the stock arm it is where every library slot gets seen and
+    // registered, since after the freeze below registering a new one aborts.
+    //
     // GRPC_DIRECT_TRANSPORT_RDMA rather than RDMA_LOW_LATENCY, so RX polling
     // is off. That is deliberate and is why the arm is named nopoll: our path
     // cannot poll with external buffers, so a polling stock arm would confound
     // allocation ownership with wakeup mechanism and answer neither question.
-    if (stock) {
-        std::printf("warmup (unmeasured), registering stock slots:\n");
-        for (int m = 0; m < reg_warmup; ++m) {
-            const uint8_t* p = nullptr;
-            size_t         n = 0;
-            GrpcDirectActiveRequest* a = grpc_direct_server_receive(srv, &p, &n);
+    const int warm_n = stock ? (warmup > reg_warmup ? warmup : reg_warmup)
+                             : warmup;
+    if (warm_n > 0) {
+        std::printf("warmup: %d unmeasured messages\n", warm_n);
+        for (int m = 0; m < warm_n; ++m) {
+            const uint8_t* p    = nullptr;
+            size_t         n    = 0;
+            size_t         wslot = 0;
+            GrpcDirectActiveRequest* a =
+                stock ? grpc_direct_server_receive(srv, &p, &n)
+                      : grpc_direct_server_receive_ext(srv, &p, &n, &wslot);
             if (!a) {
-                std::fprintf(stderr, "FATAL: warmup receive failed at %d\n", m);
+                std::fprintf(stderr, "FATAL: warmup receive failed at %d of %d\n",
+                             m, warm_n);
                 return 2;
             }
-            const auto* dp = stock_device_ptr(reinterpret_cast<const unsigned char*>(p), n);
+            const unsigned char* dp =
+                stock ? stock_device_ptr(reinterpret_cast<const unsigned char*>(p), n)
+                      : d_pool + wslot * slot_bytes;
             fft.execute(reinterpret_cast<const float*>(dp + kPayloadOffset), d_out);
             CUDA_OK(cudaEventRecord(consumed, fft.stream()));
             CUDA_OK(cudaEventSynchronize(consumed));
             grpc_direct_request_destroy(a);
+            if (!stock) grpc_direct_server_slot_requeue(srv, wslot);
         }
-        std::printf("registered %zu distinct regions in %d warmup messages\n\n",
-                    g_regs.size(), reg_warmup);
-        if (g_regs.size() < 2)
-            std::fprintf(stderr,
-                         "WARNING: only %zu region(s) seen. If a later message "
-                         "lands somewhere new the guard will abort, which is "
-                         "correct but wastes a run. Raise --reg-warmup.\n",
-                         g_regs.size());
-        guard::freeze();
+        if (stock) {
+            std::printf("registered %zu distinct regions during warmup\n",
+                        g_regs.size());
+            if (g_regs.size() < 2)
+                std::fprintf(stderr,
+                             "WARNING: only %zu region(s) seen. If a later message "
+                             "lands somewhere new the guard will abort, which is "
+                             "correct but wastes a run. Raise --reg-warmup.\n",
+                             g_regs.size());
+        }
+        std::printf("\n");
+    } else if (stock) {
+        std::fprintf(stderr,
+                     "FATAL: the stock arm cannot run with no warmup. Every "
+                     "library slot has to be registered before the guard "
+                     "freezes.\n");
+        return 2;
     }
+    if (stock) guard::freeze();
     const uint64_t frozen_allocs = guard::allocs, frozen_xlates = guard::xlates,
                    frozen_regs = guard::regs;
 

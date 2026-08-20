@@ -931,7 +931,71 @@ Three things that run turned up, which the protocol below has to account for:
   push unmeasured traffic ahead of the measured section for the RDMA arms, the same way
   `headline_sweep.sh` now does for the shmem arms.
 
+### Result: the 4 MB cell, measured 2026-08-20
+
+Run before step 6 rather than after it, because this is the cell the whole hypothesis rests
+on and a race that overruns its box would have left a working path with no evidence it helps.
+Three arms, five reps, arms rotated within each rep, `scripts/phase4_cell.sh`, data in
+`data/phase4_cell_1048576.csv`. All fifteen rows cleared the 2400 MHz gate, every RDMA message
+was spectrum-verified, and every message sent arrived: 6828 of 6828 per RDMA run.
+
+| Arm | e2e p50 (µs) | cuFFT p50 (µs) | residual (µs) | delivered |
+|---|---|---|---|---|
+| `rdma` | 72.77, 74.86, 67.54, 76.35, 74.50 | 65.22, 67.20, 59.71, 69.15, 67.14 | 7.55, 7.66, 7.83, 7.20, 7.36 | 6828 / 6828 |
+| `rdma-stock-nopoll` | 71.90, 69.79, 70.90, 73.82, 76.32 | 64.42, 62.53, 63.49, 66.50, 69.06 | 7.49, 7.26, 7.41, 7.33, 7.26 | 6828 / 6828 |
+| `base` | 659.63, 661.78, 662.77, 664.03, 661.71 | 361.12, 364.03, 363.36, 364.42, 362.43 | 298.51, 297.75, 299.41, 299.62, 299.28 | 11111 / 11111 |
+
+**Finding 1: the two RDMA arms are indistinguishable, and the 7c penalty does not reproduce.**
+Paired by rep, `rdma` minus `rdma-stock-nopoll` on e2e p50 is +0.87, +5.07, -3.36, +2.53, -1.82
+µs. Three of five in one direction, sign test p = 1.0. On the transform alone it is +0.80,
++4.67, -3.78, +2.66, -1.92, again three of five. On the residual it is 4 of 5 with a median of
++0.10 µs, p = 0.375. Nothing here is a difference.
+
+This was the prediction under test and it failed. Section 7c of `handoff.md` measured
+`cudaHostRegister` memory 10.94 µs of GPU time slower than `cudaHostAlloc` memory at 4 MB, 15
+of 15 reps, p = 6.104e-05. Both arms here are at 4 MB, the stock arm registers easyrdma's
+buffers with `cudaHostRegister` and ours are `cudaHostAlloc`, and the measured gap is 0.5 µs
+in a direction that changes sign between reps.
+
+**Owning the allocation is not, on this evidence, worth anything at 4 MB.** That is the
+opposite of the premise the RDMA work was started on, and it is now the most important open
+question on the project. Two candidate explanations, both testable, neither yet tested:
+
+- The 7c effect was never about registration. Both arms here place the payload at a 256-byte
+  offset by contract, so both are equally aligned. The 7c arms were not: they compared
+  allocators, and allocators differ in alignment as well as in provenance. If alignment was
+  doing the work, 7c attributed a real effect to the wrong cause and this cell is the control
+  that catches it.
+- The effect is real but does not survive a warm registration. Here every region is registered
+  during the warmup and the guard proves no registration happens afterwards, so the measured
+  section pays no registration cost and touches only pages the driver has already seen.
+
+Do not repeat the 10.94 µs figure without a payload size and now also without this caveat.
+
+**Finding 2: the gap to `base` is real and enormous, and most of it is not transport.**
+`base` is 660 µs against 73 µs, 5 of 5 reps, sign test p = 0.0625, effect size about 9x. But
+its own log says why: `feed mode: realign via D2D`, `realigns: 11111`, `not 16B aligned`. The
+shmem proto store lands 8-byte aligned, so every buffer is copied device-to-device before the
+transform. That copy is inside the measured window and it is 4 MB. It shows up in both halves:
+`base` reports a 361 µs transform against 65 µs for the identical FFT, and a 299 µs residual
+against 7.4 µs.
+
+`--no-zc-align` is precisely the flag that disables the fix for this, and having it off is what
+`base` means. So the comparison is honest as a statement about the standing reference, and
+dishonest if quoted as a transport result. **The RDMA arms should be compared against `opt`
+before any headline number is written.** `opt` was dropped from Phase 4 as the cheapest arm to
+add back, on the grounds that its delta against `base` is already known from 54 runs. That
+reasoning held while the gap was small. At 4 MB the alignment path is most of the measured
+difference, so `opt` is no longer optional at this size and goes back in.
+
+**Finding 3: back-pressure behaves as the report section anticipated.** The RDMA arms lost
+nothing, 6828 of 6828, and paid for it in the sender: blocked-send time was 1.90 to 2.28
+seconds per run, p50 per send call about 2.0 to 2.3 ms against a 686 µs wire time. The shmem
+arm at 4 MB dropped nothing either, 11111 of 11111, unlike its behaviour at 16 KB where it
+loses 14 percent paced and 71 percent unpaced. Report both columns.
+
 ### Explicitly out of scope: `daq-wire`
+
 
 A DAQiri arm running PXI-to-Spark across the cable is **not** being measured. This is a
 decision, not an oversight.
