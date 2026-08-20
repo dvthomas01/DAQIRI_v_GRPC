@@ -2,14 +2,15 @@
 # ─────────────────────────────────────────────────────────────────────────────
 # Phase 4 cell driver.  Runs on the Spark, drives the PXI over ssh.
 #
-# Three arms, rotated within every rep:
+# Four arms, rotated within every rep:
 #
 #   rdma               external buffers, our pool, event-gated re-queue
 #   rdma-stock-nopoll  driver-allocated buffers, same fork, RX polling off
+#   opt                gRPC-Direct shmem, optimizations on
 #   base               gRPC-Direct shmem, optimizations off
 #
 # This exists rather than another headline_sweep.sh arm because two of the
-# three arms need a process on the other machine. headline_sweep.sh runs
+# four arms need a process on the other machine. headline_sweep.sh runs
 # entirely on the Spark and has no way to start the PXI client, so bolting the
 # RDMA arms into it would mean rewriting its run loop anyway. The parts worth
 # sharing, the clock gate and the peak-sampling, are reproduced here rather
@@ -42,7 +43,13 @@ ROOT="$PWD"
 
 NPTS="${NPTS:-1048576}"                 # floats per message; 1048576 = 4 MiB
 REPS="${REPS:-3}"
-ARMS="${ARMS:-rdma rdma-stock-nopoll base}"
+# Four arms, rotated within every rep.  `opt` was added on 2026-08-20 after the
+# first 4 MB run showed `base` spending ~300 us of its ~660 us on a per-buffer
+# device-to-device realign that `--no-zc-align` exists to disable.  Comparing a
+# transport against an arm carrying a deliberately disabled optimization is not
+# a transport comparison, so `opt` is the arm any transport claim gets made
+# against and `base` stays only as the standing reference.
+ARMS="${ARMS:-rdma rdma-stock-nopoll opt base}"
 OUT="${OUT:-data/phase4_cell_${NPTS}.csv}"
 
 PXI="${PXI:-admin@10.198.65.118}"       # management path, deliberately not the
@@ -205,10 +212,10 @@ run_rdma () {                   # $1 = arm name, $2 = rep, $3 = extra server arg
     E50="$e50"; E99="$e99"; F50="$f50"
 }
 
-run_base () {                   # $1 = rep
-    local rep="$1"
-    local bcsv="$ROOT/data/p4_base_${NPTS}_${rep}.csv"
-    local blog="/tmp/p4_base_${NPTS}_${rep}.log"
+run_base () {                   # $1 = arm name, $2 = rep, $3 = extra server flags
+    local arm="$1" rep="$2" xflags="$3"
+    local bcsv="$ROOT/data/p4_${arm}_${NPTS}_${rep}.csv"
+    local blog="/tmp/p4_${arm}_${NPTS}_${rep}.log"
     rm -f "$bcsv" "$blog"
 
     cleanup
@@ -216,7 +223,7 @@ run_base () {                   # $1 = rep
     timeout 900 "$BSRV" --port "$BPORT" --bufsize "$BYTES" \
         --n-buffers $((BWARM + BSEND)) --warmup "$BWARM" --out "$bcsv" \
         --transport shmem --one-shot \
-        --zero-copy --no-zc-align --no-opt-stream >"$blog" 2>&1 &
+        --zero-copy $xflags >"$blog" 2>&1 &
     local spid=$!
     sleep 4
     timeout 600 taskset -c 11 "$BCLI" --server "localhost:$BPORT" \
@@ -267,7 +274,8 @@ for R in $(seq 1 "$REPS"); do
     case "$ARM" in
       rdma)              run_rdma "$ARM" "$R" "" ;;
       rdma-stock-nopoll) run_rdma "$ARM" "$R" "--stock" ;;
-      base)              run_base "$R" ;;
+      base)              run_base "$ARM" "$R" "--no-zc-align --no-opt-stream" ;;
+      opt)               run_base "$ARM" "$R" "" ;;
       *) echo "unknown arm $ARM" >&2; continue ;;
     esac
 

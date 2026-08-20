@@ -52,6 +52,11 @@
 //   * Every arm's usable pointer is aligned to 2 MB, so alignment is held
 //     constant and cannot be the explanation.  Alignment was the E2 bug; it is
 //     not being allowed back in as a free variable.
+//     AMENDED: that rule held for Phase 1 and it is what made the Phase 5 2x2
+//     necessary.  Holding a variable constant does not test it, and the real
+//     receiver runs at a 256-byte payload offset, not at 2 MB.  The `*_off`
+//     arms break the rule ON PURPOSE and say so in their note; every other arm
+//     still obeys it.
 //   * Results are reported per byte as well as absolute.  A per-byte slope is
 //     the signature that separates a placement cost from fixed launch overhead,
 //     and it is the claim that will be challenged.
@@ -110,6 +115,16 @@
 namespace {
 
 constexpr size_t kAlign = 2u * 1024 * 1024;   // 2 MB, also the THP size
+
+// How far the deliberately-offset arms of the 2x2 sit past their 2 MB boundary.
+// File scope because it is a property of the run, not of one arm, and every
+// offset arm must use the same value or the 2x2 stops being a 2x2.  The default
+// is 256 because that is the payload offset the external-buffer contract
+// actually produces: the RDMA receiver transforms from `base + kPayloadOffset`,
+// so 256 is the alignment the integrated path really runs at.  Must stay a
+// multiple of sizeof(float) or cuFFT will refuse the pointer outright, which
+// would answer a different question than the one being asked.
+size_t g_offset_bytes = 256;
 
 size_t align_up(size_t v, size_t a) { return (v + a - 1) & ~(a - 1); }
 
@@ -458,6 +473,79 @@ bool build_arm(Arm& a, const std::string& kind, size_t bytes) {
         return true;
     }
 
+    // ── Phase 5: provenance x alignment, the 2x2 ──────────────────────────
+    // 7c reported driver-allocated pinned memory transforming 10.94 us faster
+    // than user-allocated-then-registered memory at 4 MB, 15 of 15 reps,
+    // p = 6.104e-05.  The 4 MB Phase 4 cell put those two provenances head to
+    // head inside the real receiver and found nothing: half a microsecond, sign
+    // changing between reps.  Both cannot be right about the same mechanism.
+    //
+    // Two candidate differences survive a read of both harnesses.
+    //
+    //   Alignment.  Every 7c arm was aligned to 2 MB by construction, on
+    //   purpose, because alignment had already been a bug once and was not being
+    //   let back in as a free variable.  The receiver has no such luxury: the
+    //   payload sits at kPayloadOffset = 256 into the slot, so BOTH Phase 4 arms
+    //   ran 256-byte aligned and neither ran at 2 MB.  If cudaHostAlloc's
+    //   advantage needs 2 MB alignment to show up, then holding alignment at
+    //   2 MB is exactly what created the 7c effect and moving to 256 is exactly
+    //   what erased it.  That is an interaction, not a main effect, and a ladder
+    //   that holds alignment constant cannot see it.
+    //
+    //   Provenance itself, if the effect is real but simply does not reproduce
+    //   here.  7c is the load-bearing measurement under the whole RDMA argument
+    //   and it has never been repeated.
+    //
+    // So: four arms, provenance crossed with alignment, one size, interleaved
+    // and rotated with everything else in this harness.  Reading the 2x2:
+    //
+    //   ha_align fast, the other three slow   -> interaction.  7c measured an
+    //                                            alignment effect and named it
+    //                                            provenance.  Rewrite 7c; the
+    //                                            project has one mechanism.
+    //   both ha_* fast, both reg_* slow       -> provenance, main effect, no
+    //                                            interaction.  7c holds and the
+    //                                            Phase 4 null needs another
+    //                                            explanation.
+    //   both reg_* slow only when offset      -> alignment main effect, and the
+    //                                            fix is the payload offset, not
+    //                                            the transport.
+    //   nothing separates                     -> 7c does not hold in this
+    //                                            configuration.  Say so plainly.
+    //
+    // The registered side uses the /dev/shm mapping rather than the heap so the
+    // aligned cell is byte-for-byte the `shmreg` arm the 10.94 us came from.
+    // 7c put heapreg within 0.3 us of shmreg, so this choice is continuity with
+    // the original claim rather than a statement that the arena matters.
+    if (kind == "ha_align" || kind == "ha_off") {
+        const size_t off = (kind == "ha_off") ? g_offset_bytes : 0;
+        void* h = nullptr;
+        CUDA_CHECK(cudaHostAlloc(&h, bytes + kAlign + off, cudaHostAllocMapped));
+        a.raw = h;
+        a.raw_bytes = bytes + kAlign + off;
+        a.is_hostalloc = true;
+        a.host = reinterpret_cast<float*>(
+            align_up(reinterpret_cast<uintptr_t>(h), kAlign) + off);
+        add_note(a, off ? "cudaHostAlloc, offset " + std::to_string(off) + " B past 2 MB"
+                        : "cudaHostAlloc, 2 MB aligned");
+        void* dev = nullptr;
+        CUDA_CHECK(cudaHostGetDevicePointer(&dev, a.host, 0));
+        a.use = static_cast<float*>(dev);
+        return true;
+    }
+
+    if (kind == "reg_align" || kind == "reg_off") {
+        const size_t off = (kind == "reg_off") ? g_offset_bytes : 0;
+        if (!map_shm(a, bytes + kAlign + off, kind)) return false;
+        // map_shm leaves a.host on the 2 MB boundary; push it off deliberately.
+        a.host = reinterpret_cast<float*>(
+            reinterpret_cast<uintptr_t>(a.host) + off);
+        add_note(a, off ? "/dev/shm + cudaHostRegister, offset " +
+                          std::to_string(off) + " B past 2 MB"
+                        : "/dev/shm + cudaHostRegister, 2 MB aligned");
+        return register_and_map(a, bytes, cudaHostRegisterMapped);
+    }
+
     if (kind == "heapreg") {
         void* h = std::malloc(slack);
         if (!h) return false;
@@ -572,6 +660,32 @@ int main(int argc, char** argv) {
     std::string arms_s  = "devwrite,mgdwrite,device,hostalloc,heapreg,shmreg,hugereg";
     int    reps = 3, iters = 200, warmup = 50;
     double pace_us = 0.0;
+    // Whether the producer's CPU write runs inside the timed loop.
+    //
+    // This is a switch and not a constant because it is the difference between
+    // the two contradictory results on this project.  The original read-only
+    // ladder wrote nothing and declared memory kind dead.  Adding the write
+    // separated the arms by 10.94 us and became section 7c, the mechanism the
+    // RDMA work was started on.  The read-only null was then filed as a
+    // methodology burn.
+    //
+    // Running the same four arms both ways at 4 MB shows the two results are
+    // not in conflict and neither was wrong: with the write, registered memory
+    // is about 7 us SLOWER on the transform; without it, registered memory is
+    // about 11 us FASTER.  The sign inverts.  So the 10.94 us is not a property
+    // of the memory, it is a property of what touched the buffer just before
+    // the transform read it.
+    //
+    // WHAT --write off IS NOT.  It is tempting to call this the RDMA case on
+    // the grounds that a NIC writes the buffer and the CPU never does.  It is
+    // not.  With the write off, the same unchanged bytes are transformed
+    // thousands of times in a row, so the GPU is reading a cache-resident
+    // buffer, which no real pipeline ever does.  "Dirty the buffer before
+    // timing a transform" is already on this project's burn list.  Read this
+    // mode as the cache-resident bound, not as a model of DMA arrival.  Nothing
+    // in this harness models a DMA arrival, which is precisely why the Phase 4
+    // cell had to be run on the real receiver.
+    bool   do_write = true;
     std::string out_csv = "data/memsrc_runs.csv";
     std::string gitsha  = "unknown";
 
@@ -586,14 +700,23 @@ int main(int argc, char** argv) {
         else if (f == "--pace-us")pace_us = std::atof(next());
         else if (f == "--out")    out_csv = next();
         else if (f == "--gitsha") gitsha  = next();
+        else if (f == "--offset-bytes") g_offset_bytes = std::strtoull(next(), nullptr, 10);
+        else if (f == "--write") do_write = (std::string(next()) != "off");
         else if (f == "--help") {
             std::printf("usage: %s [--sizes a,b,c] [--arms ...] [--reps N] "
-                        "[--iters N] [--warmup N] [--out f.csv] [--gitsha s]\n", argv[0]);
+                        "[--iters N] [--warmup N] [--offset-bytes N] "
+                        "[--write on|off] [--out f.csv] [--gitsha s]\n", argv[0]);
             return 0;
         }
     }
 
     const std::vector<size_t> sizes = parse_sizes(sizes_s);
+    if (g_offset_bytes % sizeof(float) != 0) {
+        std::fprintf(stderr, "--offset-bytes must be a multiple of %zu; cuFFT "
+                             "would reject the pointer and the run would "
+                             "measure nothing\n", sizeof(float));
+        return 1;
+    }
     std::vector<std::string>  arm_names;
     { size_t pos = 0;
       while (pos <= arms_s.size()) {
@@ -605,8 +728,10 @@ int main(int argc, char** argv) {
 
     std::printf("cuFFT input-placement ladder: WRITE + TRANSFORM\n");
     std::printf("build: %s   %d reps x %zu arms x %zu sizes, "
-                "arms interleaved per iteration\n\n",
+                "arms interleaved per iteration\n",
                 gitsha.c_str(), reps, arm_names.size(), sizes.size());
+    std::printf("producer CPU write in the timed loop: %s\n\n",
+                do_write ? "ON" : "OFF (cache-resident bound, NOT a DMA model)");
     std::printf(
         "Why both halves are reported:\n"
         "  In the pipeline benchmark the producer's write happens OUTSIDE the\n"
@@ -662,6 +787,9 @@ int main(int argc, char** argv) {
                 CUDA_CHECK(cudaMemcpy(a.use, sig.data(), bytes, cudaMemcpyHostToDevice));
             else
                 std::memcpy(a.host, sig.data(), bytes);
+            // Carried into the CSV so a no-write run can never be mistaken for
+            // a write run once the two files sit next to each other.
+            if (!do_write) add_note(a, "NO CPU WRITE in the timed loop");
         }
 
         // Braces, not parens: `exec(int(nsamp))` is a function declaration.
@@ -761,7 +889,13 @@ int main(int argc, char** argv) {
                     // keeps using the CUDA-event time.  Mixing those up is how
                     // the first retracted number on this project happened.
                     const auto w0 = std::chrono::steady_clock::now();
-                    if (a.is_device && !a.direct_write) {
+                    if (!do_write) {
+                        // Nothing: the buffer was filled once before the loop
+                        // and the transform is out-of-place, so the input is
+                        // still valid.  Note this leaves the same bytes in
+                        // place across every iteration, which is the point and
+                        // also the caveat.  See --write above.
+                    } else if (a.is_device && !a.direct_write) {
                         CUDA_CHECK(cudaMemcpy(a.use, sig.data(), bytes,
                                               cudaMemcpyHostToDevice));
                     } else {
@@ -828,6 +962,36 @@ int main(int argc, char** argv) {
             } else if (i_dw >= 0 && !arms[i_dw].usable) {
                 std::printf("   VERDICT %d KB: devwrite unavailable, "
                             "direction cannot be tested this way\n", kb);
+            }
+
+            // ── the 2x2, if all four cells ran ─────────────────────────────
+            // Main effects and the interaction, printed rather than eyeballed,
+            // because the whole point of a 2x2 is that reading four numbers off
+            // a table is where people talk themselves into the answer they came
+            // in with.  Sign tests live in scripts/memsrc_table.py; this is the
+            // effect size, which is the part that decides whether it matters.
+            const long i_ha_a = idx_of("ha_align"), i_ha_o = idx_of("ha_off");
+            const long i_rg_a = idx_of("reg_align"), i_rg_o = idx_of("reg_off");
+            if (i_ha_a >= 0 && i_ha_o >= 0 && i_rg_a >= 0 && i_rg_o >= 0 &&
+                !tot_by_arm[i_ha_a].empty() && !tot_by_arm[i_ha_o].empty() &&
+                !tot_by_arm[i_rg_a].empty() && !tot_by_arm[i_rg_o].empty()) {
+                const float haa = med_of(tot_by_arm[i_ha_a]);
+                const float hao = med_of(tot_by_arm[i_ha_o]);
+                const float rga = med_of(tot_by_arm[i_rg_a]);
+                const float rgo = med_of(tot_by_arm[i_rg_o]);
+                const float prov = ((rga + rgo) - (haa + hao)) / 2.0f;
+                const float algn = ((hao + rgo) - (haa + rga)) / 2.0f;
+                const float inter = (rgo - rga) - (hao - haa);
+                std::printf("\n   2x2 %d KB, total us, offset arms at +%zu B\n"
+                            "                     2MB aligned    offset\n"
+                            "     cudaHostAlloc   %10.2f  %10.2f\n"
+                            "     mmap+register   %10.2f  %10.2f\n"
+                            "     provenance main effect (register - hostalloc) %+8.2f us\n"
+                            "     alignment  main effect (offset   - aligned)   %+8.2f us\n"
+                            "     interaction                                   %+8.2f us\n"
+                            "     7c predicts the provenance effect near +10.94 us at 4 MB\n",
+                            kb, g_offset_bytes, haa, hao, rga, rgo,
+                            prov, algn, inter);
             }
         }
         std::printf("\n");

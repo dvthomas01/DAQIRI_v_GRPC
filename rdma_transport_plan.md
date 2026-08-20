@@ -970,7 +970,96 @@ question on the project. Two candidate explanations, both testable, neither yet 
   during the warmup and the guard proves no registration happens afterwards, so the measured
   section pays no registration cost and touches only pages the driver has already seen.
 
+**Both were tested and both are wrong.** See the two follow-up sections below. Alignment was
+already held constant in 7c, so the first hypothesis was false on its face. The real variable
+is the producer's CPU write, which 7c had and the receiver does not. The paragraph is left
+standing rather than deleted because a hypothesis that looked good and failed is worth more in
+the record than a clean page.
+
 Do not repeat the 10.94 µs figure without a payload size and now also without this caveat.
+
+### Follow-up: provenance crossed with alignment, and the answer is neither
+
+**Retraction first.** The paragraph above offered alignment as the leading candidate, on the
+reasoning that both Phase 4 arms sit at a 256-byte payload offset while the 7c arms did not.
+The second half of that is false and a two-minute read of the harness would have caught it.
+`fft/bench_fft_memsrc.cc` aligns every arm's pointer to 2 MB by construction, prints
+`ptr % 2MB` for each arm before timing as an audit, and carries a comment saying alignment was
+a previous bug and is not being let back in as a free variable. Alignment was already held
+constant in 7c. The hypothesis was wrong before it was tested.
+
+It was tested anyway, because holding a variable constant is not the same as testing it, and
+because the receiver really does run at 256 bytes. Four arms, provenance crossed with
+alignment, 4 MB, five reps, `--offset-bytes 256`, rotated and interleaved,
+`data/memsrc_2x2_1048576.csv`.
+
+| total µs | 2 MB aligned | offset 256 B |
+|---|---|---|
+| `cudaHostAlloc` | 118.03 | 116.80 |
+| mmap + `cudaHostRegister` | 182.51 | 185.50 |
+
+Provenance main effect +66.59 µs on the total, +7.31 µs on the transform alone. Alignment main
+effect +0.88 µs on the total, and on the transform it is negative, meaning the offset arms were
+marginally faster. Interaction +4.22 µs. Every registered rep is slower than every
+`cudaHostAlloc` rep, 5 of 5 on both columns. **Alignment is not the variable. Provenance
+reproduces, at 7.31 µs rather than 10.94, same direction and same order.** Section 7e already
+established the figure is size-dependent, so a smaller number at the same size is a difference
+worth noting rather than a contradiction.
+
+That should have left provenance explaining everything and the Phase 4 null unexplained. It
+does not, and the reason is the third variable neither hypothesis named.
+
+### The actual mechanism: the effect belongs to the write, not to the memory
+
+7c exists because of a methodology fix. The ladder before it never wrote to the buffer and
+declared memory kind dead; adding the CPU write separated the arms by 10.94 µs. The read-only
+null went into the burn list as a mistake. So run the same four arms again with the write taken
+back out, `--write off`, everything else identical, `data/memsrc_2x2_nowrite_1048576.csv`.
+
+| transform µs | 2 MB aligned | offset 256 B |
+|---|---|---|
+| `cudaHostAlloc` | 54.69 | 51.71 |
+| mmap + `cudaHostRegister` | 42.43 | 41.47 |
+
+**The sign inverts.** With the CPU write, registered memory is 7.31 µs slower. Without it,
+registered memory is 11.25 µs faster. 5 of 5 either way, and the spread within an arm is under
+a microsecond, so this is not noise in either direction.
+
+The 10.94 µs is therefore not a property of the memory. It is a property of the interaction
+between the producer's stores and the transform's reads, and `cudaHostRegister` changes that
+interaction. This is consistent with what 7c itself called the strongest clue and then did not
+follow: registration has no business changing CPU store speed, and it doubles it, which means
+it is changing the page's cacheability or coherency attributes. The transform penalty is the
+other end of the same change.
+
+**So the read-only ladder was not wrong. It was answering a different question and was retired
+for the wrong reason.** Both measurements are correct about the configuration they measured.
+The error was extrapolating 7c, measured with a CPU producer writing every buffer, to the RDMA
+receiver, where a NIC writes the buffer and the CPU never touches it. The Phase 4 null is what
+that extrapolation looks like when it is finally checked.
+
+**What `--write off` is not.** It is not a model of DMA arrival, and must not be quoted as one.
+With the write off the same bytes are transformed thousands of times running, so the GPU reads
+a cache-resident buffer, which no pipeline does. Dirtying the buffer before timing a transform
+is already on this project's burn list. Read that table as a cache-resident bound. Nothing in
+`bench_fft_memsrc` models a DMA arrival, which is exactly why the Phase 4 cell had to run on
+the real receiver, and the real receiver is the measurement that stands.
+
+### What this changes
+
+- **The RDMA transport's original justification is withdrawn.** It was started because owning
+  the receive allocation was worth 10.94 µs at 4 MB. That number does not apply to a path with
+  no CPU producer write, and the direct measurement in the receiver agrees.
+- **The claim that survives is narrower and still real**: on the shmem path, where a CPU
+  producer does write every buffer, driver-allocated pinned memory beats
+  allocate-then-register by 7 to 11 µs of transform time and about 2x on the write, at 4 MB.
+  That is a statement about the shmem path, not about transports in general.
+- **Owning the allocation may still be worth having** for reasons that were always true and
+  never depended on 7c: no per-buffer registration, no unregister on teardown, a fixed slot
+  pool, and a release-before-completion gate we control. Those are correctness and steady-state
+  arguments. They are not a 10.94 µs argument and should stop being written as one.
+- **`opt` goes back into the Phase 4 arm list**, before anything is called a headline number.
+  See the note under Finding 2.
 
 **Finding 2: the gap to `base` is real and enormous, and most of it is not transport.**
 `base` is 660 µs against 73 µs, 5 of 5 reps, sign test p = 0.0625, effect size about 9x. But
@@ -987,6 +1076,12 @@ before any headline number is written.** `opt` was dropped from Phase 4 as the c
 add back, on the grounds that its delta against `base` is already known from 54 runs. That
 reasoning held while the gap was small. At 4 MB the alignment path is most of the measured
 difference, so `opt` is no longer optional at this size and goes back in.
+
+**Scope amendment, 2026-08-20.** The locked scope above said three arms. It is now four:
+`rdma`, `rdma-stock-nopoll`, `opt`, `base`. `base` stays, because it is the standing reference
+and dropping it would make the new numbers incomparable with everything already published, but
+it is no longer the arm any transport claim is made against. Cost is one more arm per rep at
+both sizes.
 
 **Finding 3: back-pressure behaves as the report section anticipated.** The RDMA arms lost
 nothing, 6828 of 6828, and paid for it in the sender: blocked-send time was 1.90 to 2.28
