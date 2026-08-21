@@ -330,7 +330,9 @@ part-way through, and anyone reading this should know that rather than infer it.
 | `scripts/gate5_extbuf.cu` | Gate 5. Does easyrdma land RDMA writes in a `cudaHostAlloc` pool we own? Yes. Self-contained, runs on the Spark alone over RoCE loopback |
 | `scripts/run_gate5.sh`, `scripts/gate5_reps.sh` | Build-and-run for Gate 5, and the three-rep sweep across sizes and offsets |
 | `scripts/probe_easyrdma_userbuf*.sh` | Read-only reads of the easyrdma source that established the external-buffer protocol. `userbuf3` is the one that found the callback-only completion |
-| `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result |
+| `data/pagesize_rot.csv` | The rotated-order run behind the 10.94 us at 4 MB result. **Read with 7g: that figure needs a CPU producer write and does not transfer to the RDMA path** |
+| `data/memsrc_2x2_1048576.csv`, `data/memsrc_2x2_nowrite_1048576.csv` | 7g. The same four arms with and without the producer's CPU write. The sign inverts between the two files |
+| `data/phase4_cell_1048576.csv` | 7h. The 4 MB Phase 4 cell, three arms x five reps, with `sm_mhz` and the git SHA on every row |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 | `data/gate5_extbuf.txt`, `data/gate5_reps.txt` | Gate 5 output and the three reps |
 
@@ -640,7 +642,7 @@ built because there is nothing it could report. Closed.
 Nobody should start Route B expecting a quick win. It is the right design, it is a real piece
 of work in a Rust library we do not own, and the payoff is about 6 us at the largest payload.
 
-## 7c. RETRACTION: memory kind is not dead, and we found the mechanism (2026-08-19)
+## 7c. RETRACTION: memory kind is not dead, and we found a mechanism (2026-08-19, SCOPE NARROWED BY 7g)
 
 > **SCOPE NARROWED BY 7g, 2026-08-21. Do not quote this section on its own.** Everything
 > measured here repeats. What is wrong is the last two words of the heading and the section
@@ -978,6 +980,11 @@ so the pattern matches the shell running the command and kills it. The symptom i
 command that produces no output at all, not even an `echo` that ran before the `pkill`.
 
 ## 7e. Phase 1: no allocation or registration flag closes the gap (2026-08-19)
+
+> **Read with 7g.** The arms and the sign tests here stand. What does not stand is the framing:
+> this section assumes the gap is the thing to close and that closing it is what the transport
+> work buys. 7g shows the gap needs a CPU producer write, and the transport does not have one.
+> "No flag closes it" is still true and no longer implies "so we must own the allocation".
 
 Section 7c left two cheap questions open before committing to an RDMA transport: whether the
 registration penalty is inherent to `cudaHostRegister` or just to the flag we happened to pass,
