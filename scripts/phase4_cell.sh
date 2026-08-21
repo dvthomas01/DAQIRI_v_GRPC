@@ -187,6 +187,14 @@ run_rdma () {                   # $1 = arm name, $2 = rep, $3 = extra server arg
 
     cleanup
     clk_start
+    # --verify every is safe here as of the re-ordering in extbuf_fft_server.cu:
+    # the spectral check now runs after the slot re-queue, not before it. Until
+    # then this line and the comment at the top of that file disagreed about the
+    # flag for a month, and every throughput figure Phase 4 produced was really a
+    # measure of detect_peaks holding the sender's credit. handoff.md 7i.
+    #
+    # If you are re-running an old $RSRV, check that its --help says the check
+    # runs after the re-queue before quoting any rate from this cell.
     ( cd "$ROOT/rdma" && timeout 900 "$RSRV" \
         --addr "$SPARK_RDMA_IP" --port "$RPORT" --npts "$NPTS" \
         --warmup "$WARM_MSGS" --msgs "$MSGS" --slots "$SLOTS" \

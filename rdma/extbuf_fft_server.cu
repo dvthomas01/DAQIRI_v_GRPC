@@ -59,11 +59,27 @@
 // runs, because --echo on serialises the sender.  Do not put them in the same
 // table row.
 //
-// Throughput and inter-message gap are NOT quotable with --poison on or
-// --verify every, because both run after the timer stops but before the
-// re-queue, and the re-queue is the sender's credit.  Poisoning and verifying
-// therefore throttle the sender.  That is the correct trade for a correctness
-// harness and the wrong one for Phase 4, which runs --poison off --verify off.
+// Throughput and inter-message gap are NOT quotable with --poison on, because
+// poisoning is a full payload memcpy that runs after the timer stops but before
+// the re-queue, and the re-queue is the sender's credit.  So it throttles the
+// sender and shows up as transport time.  The program now WITHHOLDS those lines
+// when --poison on rather than printing them with a caveat, because a number
+// that is not printed cannot be quoted.
+//
+// --verify every used to be in that same sentence and no longer is.  The
+// spectral check reads d_out, the transform's output in device memory, and
+// never touches the slot, so it had no reason to be inside the credit window.
+// It now runs after the re-queue.  That is worth 3.18x on sustained rate at
+// 4 MiB and gives up nothing: every message is still checked.  Before the move
+// it held the slot 2488 us per message, the sender blocked in AcquireSendRegion
+// for exactly that long and reported it as send time, and it was read as fabric
+// latency for a month.  scripts/phase4_cell.sh passed --verify every the whole
+// time while the comment here said Phase 4 needed it off.  handoff.md 7i.
+//
+// The general form, which is the part worth carrying to another project: in any
+// pipeline where the consumer owns buffer lifetime, measure gate-to-credit-
+// returned as a first-class column.  Nothing else tells you whether the network
+// is slow or you are holding the buffer.  It is hold_us here.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // HOT PATH DISCIPLINE
@@ -248,8 +264,14 @@ static void usage() {
         "                  idle clocks and takes about three seconds of load to\n"
         "                  ramp, and a short run finishes before it does.\n"
         "  --slots   N     pool slots (default 4; step 6 uses 2)\n"
-        "  --poison  on|off   repaint each slot before re-queueing (default on)\n"
-        "  --verify  every|off  spectral check per message (default every)\n"
+        "  --poison  on|off   repaint each slot before re-queueing (default on).\n"
+        "                  This is the ONLY thing left in the credit window, so\n"
+        "                  with it on the inter-arrival and sustained-rate lines\n"
+        "                  are withheld from the report rather than caveated.\n"
+        "  --verify  every|off  spectral check per message (default every).\n"
+        "                  Runs AFTER the slot re-queue, because it reads the\n"
+        "                  transform's output and never touches the slot, so it\n"
+        "                  is free of the sender's credit. Safe to leave on.\n"
         "  --own-stream    run cuFFT on its own stream\n"
         "  --tol-bins N    peak tolerance in bins (default 2)\n"
         "  --stock         rdma-stock-nopoll arm: driver-allocated buffers,\n"
@@ -261,7 +283,7 @@ static void usage() {
         "                  so the sender can time post-to-FFT-complete on its\n"
         "                  own clock (default off). Serialises the pipeline:\n"
         "                  this is the latency instrument, not the throughput\n"
-        "                  one. Requires --poison off --verify off.\n"
+        "                  one. Requires --poison off.\n"
         "  --fft     on|off   run the transform (default on). Off is the echo\n"
         "                  calibration arm: with a tiny --npts it measures the\n"
         "                  request-and-return path with no work in the middle,\n"
@@ -313,29 +335,44 @@ int main(int argc, char** argv) {
         return 1;
     }
 
-    // Poisoning is a full payload memcpy and verifying is a device-to-host read
-    // of the spectrum plus a scan.  Both run between the transform finishing and
-    // the slot going back to the NIC.  In streaming mode that only throttles the
-    // sender, which the header already warns about.  In echo mode it would sit
-    // inside the interval the sender is timing, so the headline latency would be
-    // partly a measure of the harness.  Refused rather than warned about,
-    // because a warning in a log is a warning nobody reads before quoting the
-    // number.
+    // ── WHAT IS STILL INSIDE THE CREDIT WINDOW, AND WHAT LEFT IT ─────────────
+    // Poisoning is a full payload memcpy through the mapping the NIC will reuse,
+    // so it has to happen before the re-queue.  It is the only thing left there.
     //
-    // The correctness that is given up here is not given up: the ack carries the
-    // request's seq, and the sender checks it, so a reply that belongs to a
-    // different message is still caught.  What is not checked in echo mode is
-    // the spectrum, and that was established in step 5 and again in every
-    // streaming Phase 4 run.
-    if (echo_on && (poison_on || verify_on)) {
+    // Verifying used to be there too and did not need to be.  detect_peaks reads
+    // d_out, which is device memory holding the transform's output, and never
+    // touches the slot, so it now runs after the re-queue.  That reordering is
+    // worth 3.18x on sustained rate at 4 MiB and gives up nothing: every message
+    // is still checked.  It cost 2488 us per message and was read as fabric
+    // latency for a month.  handoff.md 7i.
+    //
+    // What this means for --echo on: neither poison nor verify sits inside the
+    // timed interval any more, because the ack is sent immediately after the
+    // gate and both of these now follow it.  Verify is therefore allowed in echo
+    // mode, and is worth having, since it is the only spectral check available
+    // there.  Poison is still refused: it is a 4 MiB memcpy on the consumer
+    // thread and echo mode has no other traffic to hide it behind, so it would
+    // show up in the next message's arrival rather than this one's latency,
+    // which is harder to see and just as wrong.
+    if (echo_on && poison_on) {
         std::fprintf(stderr,
-                     "--echo on requires --poison off --verify off.\n"
-                     "Both run after the transform and before the ack, so they "
-                     "would be inside the interval the sender is timing and the "
-                     "headline latency would be partly a measure of this "
-                     "harness.\n");
+                     "--echo on requires --poison off.\n"
+                     "Poison is a full payload memcpy in the credit window. In "
+                     "echo mode there is no other traffic to absorb it, so it "
+                     "displaces the next message rather than this one and the "
+                     "contamination moves somewhere harder to see.\n"
+                     "(--verify every is fine here: it moved below the re-queue "
+                     "and is no longer inside the timed interval.)\n");
         return 1;
     }
+    // The other half of the same rule, and the one that would otherwise let a
+    // driver script and this file disagree in silence again.  scripts/
+    // phase4_cell.sh passed --verify every for a month while the comment in this
+    // file said Phase 4 needed it off, and nothing caught it because a comment
+    // cannot refuse anything.  Verify is now safe, so the disagreement is gone.
+    // Poison is not, so the arrival rate and sustained rate are withheld rather
+    // than printed with a caveat.  A number that is not printed cannot be quoted.
+    const bool rate_is_reportable = !poison_on;
     if (!fft_on && !echo_on) {
         std::fprintf(stderr,
                      "--fft off is only meaningful with --echo on. On its own it "
@@ -661,41 +698,24 @@ int main(int argc, char** argv) {
             ar = nullptr;
         }
 
-        // Everything from here to the re-queue runs outside the timed window
-        // and delays the sender's credit.  Correct for a harness, wrong for
-        // Phase 4; run with --poison off --verify off there.
-        float peak_hz = -1.0f, expect_hz = payload_tone_hz(seq);
-        bool  ok = frame_ok;
-        if (frame_ok && verify_on && fft_on) {
-            auto peaks = fft.detect_peaks(d_out, 3, kSampleRateHz);
-            peak_hz    = peaks.empty() ? -1.0f : peaks[0].first;
-            const float err = std::fabs(peak_hz - expect_hz);
-            ok = err <= tol_hz;
-            if (ok) {
-                ++verified;
-            } else {
-                ++bad_spectrum;
-                if (err > worst_err_hz) {
-                    worst_err_hz    = err;
-                    worst_seen_hz   = peak_hz;
-                    worst_expect_hz = expect_hz;
-                }
-            }
-        }
-
-        // Poisoning writes through the same mapping the NIC will reuse, in
-        // both arms. The stock arm has no slot index, so the pointer we were
-        // handed is the only address available, which is fine because the
-        // library will not reuse it until the next receive releases it.
+        // ── WHAT IS ALLOWED TO STAND HERE, AND WHY IT IS ALMOST NOTHING ──
+        // Everything between the gate above and the re-queue below is time the
+        // NIC spends waiting for a slot it could already have had, and the
+        // sender pays it inside AcquireSendRegion and reports it as send time.
+        // That is not a theoretical concern: the spectral check used to live
+        // here and it cost 2488 us per message, which was read as fabric
+        // latency for a month. See handoff.md 7i.
+        //
+        // The test for whether something belongs here is simple. Does it touch
+        // the slot? Poison does, because it writes through the mapping the NIC
+        // will reuse, so it has no choice. The spectral check does not: it
+        // reads d_out, which is cudaMalloc'd device memory holding the
+        // transform's output, and the transform has already been gated. So the
+        // check moved below the re-queue, where it costs the pipeline nothing
+        // and still verifies every message. Nothing was traded away.
         if (poison_on)
             std::memcpy(const_cast<uint8_t*>(ptr) + kPayloadOffset,
                         poison.data(), npts * sizeof(float));
-
-        if (csv)
-            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%.3f,%s\n",
-                         seq, slot, len, npts, t1 - t0, fft.last_exec_us(),
-                         peak_hz, expect_hz, ok ? 1 : 0,
-                         gap.empty() ? 0.0 : gap.back(), git_sha.c_str());
 
         if (ar) grpc_direct_request_destroy(ar);
 
@@ -717,6 +737,41 @@ int main(int argc, char** argv) {
             rq_us.push_back(r1 - r0);
             hold.push_back(r1 - t1);
         }
+
+        // ── VERIFICATION, DELIBERATELY BELOW THE RE-QUEUE ────────────────
+        // The NIC may already be refilling the slot. That is fine and it is
+        // the point: this reads d_out, the transform's output in device
+        // memory, and never touches the slot. Keeping it above the re-queue
+        // bought nothing and cost 2488 us of the sender's time per message.
+        //
+        // It still costs wall-clock on this thread, so it delays the next
+        // receive_ext call. With four slots in flight that is absorbed; with
+        // one it would not be, which is why the arrival rate is reported next
+        // to the consumer duty cycle rather than on its own.
+        float peak_hz = -1.0f, expect_hz = payload_tone_hz(seq);
+        bool  ok = frame_ok;
+        if (frame_ok && verify_on && fft_on) {
+            auto peaks = fft.detect_peaks(d_out, 3, kSampleRateHz);
+            peak_hz    = peaks.empty() ? -1.0f : peaks[0].first;
+            const float err = std::fabs(peak_hz - expect_hz);
+            ok = err <= tol_hz;
+            if (ok) {
+                ++verified;
+            } else {
+                ++bad_spectrum;
+                if (err > worst_err_hz) {
+                    worst_err_hz    = err;
+                    worst_seen_hz   = peak_hz;
+                    worst_expect_hz = expect_hz;
+                }
+            }
+        }
+
+        if (csv)
+            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%.3f,%s\n",
+                         seq, slot, len, npts, t1 - t0, fft.last_exec_us(),
+                         peak_hz, expect_hz, ok ? 1 : 0,
+                         gap.empty() ? 0.0 : gap.back(), git_sha.c_str());
 
         if (guard::allocs != frozen_allocs || guard::xlates != frozen_xlates ||
             guard::regs != frozen_regs) {
@@ -763,6 +818,16 @@ int main(int argc, char** argv) {
     if (echo_on) {
         std::printf("inter-arrival     : not meaningful with --echo on "
                     "(the sender is waiting for us)\n");
+    } else if (!rate_is_reportable) {
+        std::printf("inter-arrival     : WITHHELD. --poison on puts a %zu-byte "
+                    "memcpy in the credit window,\n"
+                    "                    so the arrival rate below would be "
+                    "measuring this harness and not\n"
+                    "                    the transport. Re-run with --poison "
+                    "off. See handoff.md 7i for what\n"
+                    "                    happened the last time a number like "
+                    "this was printed anyway.\n",
+                    npts * sizeof(float));
     } else if (g50 > 0.0) {
         const double mib_s = static_cast<double>(frame_bytes) / g50
                              * 1e6 / (1024.0 * 1024.0);

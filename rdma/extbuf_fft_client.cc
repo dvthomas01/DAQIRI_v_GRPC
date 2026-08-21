@@ -48,6 +48,15 @@
 // because the sender is not the measured side.  That was true of the window we
 // were measuring and false of the pipeline, which is the point of --echo.
 //
+// As of --gen inplace it is also removable.  Once the receiver stopped holding
+// the sender's credit, gen_us at 468 us plus send_us at 335 us accounted for
+// essentially all of an 800 us inter-arrival, which makes this the bottleneck
+// rather than a footnote.  --gen inplace builds the sixteen frames complete at
+// startup so the loop writes only a header, leaving the library's copy as the
+// only one.  Run it paired against --gen copy.  The result decides whether the
+// receive path's 85 percent of link is a transport limit or a harness limit,
+// and those are different claims.
+//
 // Build on the PXI:
 //   g++ -O2 -std=c++17 -o extbuf_fft_client extbuf_fft_client.cc signal_gen.cc \
 //       -I. -I$HOME/grpc-direct/include \
@@ -106,6 +115,14 @@ static void usage() {
         "                 clock (default off). The receiver must be run with\n"
         "                 --echo on too. Serialises the sender, so the result\n"
         "                 is unloaded latency, not pipeline latency.\n"
+        "  --gen  copy|inplace  how the payload reaches the frame (default\n"
+        "                 copy). copy generates once at startup and memcpy's\n"
+        "                 4 MiB into the frame every message, which is what\n"
+        "                 gen_us measures. inplace builds sixteen complete\n"
+        "                 frames at startup and writes only the header per\n"
+        "                 message. Pair the two: the difference is how much of\n"
+        "                 the sender's limit is the harness generating data a\n"
+        "                 real digitiser would have DMA'd in already.\n"
         "  --csv     PATH per-message CSV: seq,gen_us,send_us,rtt_us\n");
 }
 
@@ -119,6 +136,7 @@ int main(int argc, char** argv) {
     int         warmup  = 20;
     int         linger_ms = 200;
     bool        echo_on = false;
+    std::string gen_mode = "copy";
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -133,9 +151,16 @@ int main(int argc, char** argv) {
         else if (a == "--pace-us") pace_us = std::stoi(next());
         else if (a == "--warmup")  warmup = std::stoi(next());
         else if (a == "--linger-ms") linger_ms = std::stoi(next());
+        else if (a == "--gen")     gen_mode = next();
         else if (a == "--echo")    echo_on = (next() == "on");
         else if (a == "--csv")     csv_path = next();
         else { usage(); return 1; }
+    }
+
+    if (gen_mode != "copy" && gen_mode != "inplace") {
+        std::fprintf(stderr, "--gen must be copy or inplace, got '%s'\n",
+                     gen_mode.c_str());
+        return 1;
     }
 
     if (!std::getenv("GRPC_DIRECT_RDMA_LOCAL"))
@@ -145,22 +170,60 @@ int main(int argc, char** argv) {
                      "machines. Set it to this box's RoCE address.\n");
 
     const size_t frame_bytes = contract::ext_frame_bytes(static_cast<uint32_t>(npts));
-    std::vector<unsigned char> frame(frame_bytes, 0);
-    auto* hdr = reinterpret_cast<ExtFrameHeader*>(frame.data());
-    auto* pay = reinterpret_cast<float*>(frame.data() + kPayloadOffset);
 
-    // The tone changes every message, which is what makes the receiver's check
-    // capable of failing. A fixed payload would verify clean against a stale
-    // slot, and staleness is the exact hazard this whole path is arranged
-    // around. Sixteen distinct signals, generated once, indexed by seq.
-    std::vector<std::vector<float>> signals(16, std::vector<float>(npts));
-    for (uint32_t s = 0; s < 16; ++s) {
+    // ── THE SENDER'S OWN COPY, AND THE ARM THAT REMOVES IT ───────────────────
+    // In copy mode the payload is generated into signals[] once and memcpy'd
+    // into the frame every message. That memcpy is gen_us. It is 4 MiB of
+    // single-threaded host bandwidth on the PXI and at 4 MiB it is roughly 468
+    // us, against a 685 us wire time, so it is not a rounding error: it is
+    // comparable to the transfer it is preparing for.
+    //
+    // In inplace mode the sixteen frames are built complete at startup, payload
+    // and all, and the send loop writes only the 16-byte header of whichever one
+    // is due. gen_us collapses to the header write. Nothing else changes, which
+    // is the point: this is a paired arm against copy, not a replacement for it.
+    //
+    // Why this is worth measuring rather than assuming. A real digitiser DMAs
+    // into a buffer you then hand to the transport; it does not stage the
+    // waveform somewhere else first and copy it in. The copy mode arm is an
+    // artefact of the harness generating its own data. If removing it moves the
+    // rate, then the 85 percent of link the receive path sustains is limited by
+    // the harness and not by the transport, and that is a different claim from
+    // the one currently written down.
+    //
+    // Reusing a frame every sixteen messages is safe because client_send copies
+    // into the send region before it returns. That copy is the other 4 MiB and
+    // it belongs to the library, so this arm cannot remove it.
+    const bool inplace = (gen_mode == "inplace");
+
+    std::vector<std::vector<unsigned char>> frames;
+    std::vector<unsigned char>              frame;
+    std::vector<std::vector<float>>         signals;
+
+    auto fill_payload = [&](uint32_t s, float* dst) {
         SignalConfig cfg;
         cfg.sample_rate_hz = kSampleRateHz;
         cfg.buffer_size    = npts;
         cfg.freqs_hz       = {payload_tone_hz(s)};
         cfg.amplitudes     = {1.0f};
-        generate_signal(cfg, signals[s].data(), npts);
+        generate_signal(cfg, dst, npts);
+    };
+
+    // The tone changes every message, which is what makes the receiver's check
+    // capable of failing. A fixed payload would verify clean against a stale
+    // slot, and staleness is the exact hazard this whole path is arranged
+    // around. Sixteen distinct signals either way, so the two arms present the
+    // receiver with identical traffic and only the sender's work differs.
+    if (inplace) {
+        frames.resize(16);
+        for (uint32_t s = 0; s < 16; ++s) {
+            frames[s].assign(frame_bytes, 0);
+            fill_payload(s, reinterpret_cast<float*>(frames[s].data() + kPayloadOffset));
+        }
+    } else {
+        frame.assign(frame_bytes, 0);
+        signals.assign(16, std::vector<float>(npts));
+        for (uint32_t s = 0; s < 16; ++s) fill_payload(s, signals[s].data());
     }
 
     std::printf("connecting to %s:%u ...\n", host.c_str(), port);
@@ -203,16 +266,20 @@ int main(int argc, char** argv) {
         const uint32_t seq = static_cast<uint32_t>(m);
 
         const double g0 = now_us();
+        unsigned char* buf = inplace ? frames[seq % 16].data() : frame.data();
+        auto* hdr = reinterpret_cast<ExtFrameHeader*>(buf);
         hdr->magic     = kExtMagic;
         hdr->seq       = seq;
         hdr->n_samples = static_cast<uint32_t>(npts);
         hdr->flags     = (m == msgs - 1) ? kExtFlagLast : 0u;
-        std::memcpy(pay, signals[seq % 16].data(), npts * sizeof(float));
+        if (!inplace)
+            std::memcpy(reinterpret_cast<float*>(buf + kPayloadOffset),
+                        signals[seq % 16].data(), npts * sizeof(float));
         const double g1 = now_us();
 
         const double s0 = now_us();
         GrpcDirectPendingResponse* p =
-            grpc_direct_client_send(cli, frame.data(), frame_bytes);
+            grpc_direct_client_send(cli, buf, frame_bytes);
         const double s1 = now_us();
 
         if (!p) {
@@ -285,9 +352,10 @@ int main(int argc, char** argv) {
     std::printf("sent              : %llu of %d (%llu failed)\n",
                 (unsigned long long)(msgs - failed), msgs,
                 (unsigned long long)failed);
-    std::printf("frame build p50   : %.2f us  (our memcpy of %zu bytes, "
-                "not on the wire)\n",
-                pct_of(gen_us, 0.50), frame_bytes);
+    std::printf("frame build p50   : %.2f us  (--gen %s: %s, not on the wire)\n",
+                pct_of(gen_us, 0.50), gen_mode.c_str(),
+                inplace ? "16-byte header only"
+                        : "our memcpy of the whole frame");
     std::printf("send call p50/p99 : %.2f / %.2f us  (%zu timed, %d warmup skipped)\n",
                 pct_of(send_us, 0.50), pct_of(send_us, 0.99), send_us.size(),
                 warmup);

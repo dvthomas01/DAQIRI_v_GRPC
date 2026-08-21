@@ -116,6 +116,13 @@ ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" "test -x $RCLI" 2>/dev/null \
 # PXI would produce a run with no rtt column and no obvious reason why.
 ssh -o BatchMode=yes "$PXI" "$RCLI --help 2>&1 | grep -q -- --echo" \
     || fail "$RCLI on the PXI has no --echo. Rebuild and copy it across."
+# Same reasoning for --gen. A stale client silently ignores an unknown flag in
+# some builds and would run copy mode while the CSV is labelled stream-inplace,
+# which is the exact class of silent disagreement that cost us Phase 4.
+case " $ARMS " in *\ stream-inplace\ *)
+    ssh -o BatchMode=yes "$PXI" "$RCLI --help 2>&1 | grep -q -- --gen" \
+        || fail "$RCLI on the PXI has no --gen, so stream-inplace would really be stream-nv. Rebuild and copy it across." ;;
+esac
 ping -c 2 -W 2 "$PXI_RDMA_IP" >/dev/null 2>&1 \
     || fail "$PXI_RDMA_IP does not answer. The PXI reverts to a link-local address after a restart; run scripts/pxi_setip.sh."
 
@@ -258,12 +265,28 @@ for R in $(seq 1 "$REPS"); do
       stream-nv)
         # The same arm with the spectral check off, which is what the server's
         # own header said Phase 4 should have used and what Phase 4 did not do.
-        # detect_peaks runs after the gate and before slot_requeue, so its cost
-        # is charged to the sender as credit it has not been given back. Paired
-        # against stream, per rep, so the difference is the price of verifying
-        # inside the hot loop rather than a difference between two days.
+        #
+        # HISTORICAL, and kept because the pairing is the evidence: detect_peaks
+        # used to run after the gate and before slot_requeue, so its cost was
+        # charged to the sender as credit it had not been given back, and this
+        # arm was worth 3.18x against stream. The check has since moved below the
+        # re-queue, so stream and stream-nv should now be one distribution. If
+        # they are not, the server binary predates that change; check its --help.
         run_one "$ARM" "$R" "$NPTS" \
           "--poison off --verify off" "" \
+          "$WARM_MSGS" "$MSGS" ;;
+      stream-inplace)
+        # The sender's own copy removed. Paired against stream-nv, which is the
+        # same run with --gen copy, so the difference is one 4 MiB host memcpy
+        # per message and nothing else. The receiver cannot tell the two apart.
+        #
+        # What it decides: with the receiver no longer holding credit, gen_p50
+        # plus send_p50 accounted for essentially all of the inter-arrival, so
+        # the sender is the bound. A real digitiser DMAs into the buffer it hands
+        # to the transport and never does this copy, so if the rate moves here
+        # then the receive path's share of link is limited by the harness.
+        run_one "$ARM" "$R" "$NPTS" \
+          "--poison off --verify off" "--gen inplace" \
           "$WARM_MSGS" "$MSGS" ;;
       *) echo "unknown arm $ARM" >&2; continue ;;
     esac
