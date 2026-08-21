@@ -1,4 +1,4 @@
-# HANDOFF: gRPC-Direct latency optimization (CURRENT, 2026-08-19)
+# HANDOFF: gRPC-Direct latency optimization (CURRENT, 2026-08-21)
 
 > Paste this into a new chat to continue. It is self-contained: everything a fresh session
 > needs about the goal, the system, what has been measured, and what to do next.
@@ -13,19 +13,34 @@ assumption forcing an unnecessary GPU copy on 100% of messages), fixed it, and c
 the gap. A dedicated CUDA stream took a little more. **At 4 MB the gap is now 8.10 us, about
 13%.** Roughly 80% of what remains is inside cuFFT rather than in transport.
 
-**We now know why the transform is slower, and it is not the transform.** Buffers allocated by
-the CUDA driver with `cudaHostAlloc` beat buffers we allocate ourselves and hand to
-`cudaHostRegister` by **14.94 us** of GPU time at 4 MB, 5 out of 5 paired cells, and by
-33.86 us more on the producer's write. That is larger than the entire remaining gap. iceoryx2
-allocates our payload buffers with `shm_open` and we register them after the fact; DAQiri's
-buffers come from the driver. Owning the allocation is the whole difference. Section 7c has the
-evidence, and it retracts an earlier null result that came from a benchmark which never wrote
-to the buffer.
+**The transform finding has been narrowed, and the headline it used to carry is withdrawn.**
+This document previously opened by saying we knew why the transform was slower and that owning
+the buffer allocation was worth about 15 us at 4 MB. That is no longer a claim this project
+makes. Read section 7g before quoting anything from 7c or 7e.
 
-**No flag fixes it.** Section 7e sweeps three `cudaHostAlloc` flags and three
-`cudaHostRegister` flags across 9 sizes. Every allocation-side arm sits on the fast side and
-every registration-side arm sits on the slow side, with no flag closing any measurable part of
-the gap. The cheap escape route is closed, so owning the allocation is the only one left.
+What 7c measured is real and repeats: with a CPU producer writing every buffer, driver-allocated
+pinned memory transforms about 7 to 11 us faster at 4 MB than memory we allocate and hand to
+`cudaHostRegister`, and the producer's write is about 2x faster too. Five of five reps, and
+7e shows no flag on either side closes it.
+
+What was wrong is the scope. **Remove the CPU write and the sign inverts**: registered memory
+becomes 11.25 us faster, also 5 of 5. So the penalty is not a property of the memory. It is a
+property of the interaction between the producer's stores and the transform's reads, and
+`cudaHostRegister` changes that interaction. 7c hinted at this and did not follow it: registration
+has no business changing CPU store speed, and it doubles it, which means it is changing the
+page's cacheability.
+
+The consequence is that the figure applies to the shmem path, where a CPU producer really does
+write every buffer, and **does not transfer to an RDMA receiver, where a NIC writes the buffer
+and the CPU never touches it.** That was checked directly: a four-arm 4 MB cell in the real
+receiver put our own `cudaHostAlloc` pool against driver-allocated buffers and found them
+indistinguishable, 0.5 us with the sign changing between reps. Sections 7g and 7h.
+
+**So the RDMA transport's original justification is withdrawn.** It was started because owning
+the receive allocation was worth 10.94 us. It is not, on that path. The reasons to keep it are
+the ones that never depended on 7c: no per-buffer registration, no unregister on teardown, a
+fixed slot pool, and a release-before-completion gate we control. Those are correctness and
+steady-state arguments and should not be written as a microsecond argument.
 
 **Current work: give gRPC-Direct DAQiri's actual transport.** A RoCE RDMA write from the PXI
 landing directly in a `cudaHostAlloc`'d receive buffer that cuFFT reads in place. All four
@@ -115,9 +130,10 @@ that `FailHijackedRecvMessage()` never fired. Our send path (lines 238-249, the
 `CLIENT_STREAMING` branch) is untouched by the diff. The remaining hunk is a whitespace mangle
 at line 200 with identical semantics.
 
-**If you read only one more thing, read section 1.** Four of this project's headline numbers
-turned out to be measurement artifacts rather than results, and all four were caught late.
-Sections 5 and 7c contain the retractions.
+**If you read only one more thing, read section 1.** Five of this project's headline numbers
+turned out to be measurement artifacts or overreaches rather than results, and all five were
+caught late. Sections 5, 7c and 7g contain the retractions. **7g retracts part of 7c**, so read
+them as a pair or not at all.
 
 ### Where to look for what
 
@@ -127,8 +143,10 @@ Sections 5 and 7c contain the retractions.
 | 5 | Current scoreboard and the retracted 2.91 us gap |
 | 7 | Why we do not own the payload allocation |
 | 7b | The three device-landing routes, costed. **Its ranking is retired by 7d.** |
-| 7c | The mechanism: `cudaHostAlloc` versus `cudaHostRegister` |
+| 7c | `cudaHostAlloc` versus `cudaHostRegister`. **Scope narrowed by 7g. Do not quote alone.** |
 | 7d | The RoCE-into-`cudaHostAlloc` design, the four gates, and the machine state that dies on reboot |
+| 7g | What the 10.94 us actually belongs to, and why it does not transfer to RDMA |
+| 7h | The 4 MB Phase 4 cell: the two provenances measured in the real receiver |
 
 ## 1. How to measure on this box (read this before you run anything)
 
@@ -164,10 +182,13 @@ system as much as the code.
    winning every single cell. Rotate the starting arm: `arms[(it + k) % arms.size()]`. Doing this
    to the memory ladder did not erase its effect, it grew it from 7.17 to 10.94 us at 4 MB, but
    you cannot know which until you check.
-5. **Dirty the buffer before you time a transform.** A ladder that only reads the buffer
-   understates host memory badly enough to invert the conclusion. Real pipelines always write
-   first. **Time the producer write and the transform together**, because a change that slows
-   the write and speeds the transform looks like a pure win when only half the window is timed.
+5. **Dirty the buffer the way the real producer dirties it.** A ladder that only reads the
+   buffer understates host memory badly enough to invert the conclusion, and so does a ladder
+   that CPU-writes a buffer the real system fills by DMA. Both of those happened here, in that
+   order. The rule is not "always write", it is **match the harness to the producer you are
+   claiming about**, and say in the write-up which producer that was. **Time the producer write
+   and the transform together**, because a change that slows the write and speeds the transform
+   looks like a pure win when only half the window is timed.
 6. **Include a control that should not move.** When the RoCE MTU was raised, 4 MB got 4.9%
    faster, which alone is indistinguishable from drift. A 2-byte message measured in the same
    pair of runs cannot be affected by MTU, and it did not move. That is what turns the 4 MB
@@ -175,7 +196,7 @@ system as much as the code.
    more. Related: **baseline, change, remeasure**, even when the change is obviously correct,
    because otherwise you get one number with nothing to attribute it to.
 
-**Four burns, so you can recognise the shape of them.**
+**Five burns, so you can recognise the shape of them.**
 
 - *The async timer.* A stage timer wrapped around the realign copy read 3.5 to 5.2 us, so the
   copy looked cheap and got dismissed. `cudaMemcpyAsync` only enqueues. The real 77 us landed
@@ -195,6 +216,18 @@ system as much as the code.
   buffer. Adding the CPU write that every real pipeline performs separated the arms by 10.94 us
   of transform time at a 4 MB payload, p = 6.1e-05, and produced the mechanism the whole project
   had been looking for. The read-only caveat had been written down at the time and not acted on.
+  **Amended 2026-08-21, and this is the more interesting half.** The read-only ladder was not
+  wrong and should not have been filed here as a burn. It was answering a different question
+  correctly, and the question it answers is the one the RDMA receiver actually asks, because a
+  NIC writes that buffer and the CPU never does. Both measurements were right about their own
+  configuration. The mistake was carrying one of them into a configuration it had not measured,
+  which is a harder mistake to see than a bad measurement and cost considerably more. See 7g.
+- *A result that travelled further than the configuration that produced it.* 7c was measured
+  with a CPU producer dirtying every buffer, then quoted as a fact about buffer provenance in
+  general and used to justify building a transport. Removing the CPU write inverts the sign.
+  **Before a number leaves the harness that produced it, write down what the harness did that
+  the target system does not do.** In this case: a CPU store per buffer, one buffer reused for
+  thousands of iterations, and no DMA anywhere.
 
 **A name is not evidence.** An arm labelled as a huge-page test had been reported as one on the
 strength of `madvise(MADV_HUGEPAGE)` returning 0. That return value means the kernel accepted a
@@ -221,9 +254,19 @@ Make gRPC-Direct's end-to-end latency match or beat DAQiri's RoCE path, while:
 - proving correctness (spectral output) before trusting any speedup.
 
 The cross-machine RoCE work was shelved during the optimization arc and has now been
-deliberately restarted, because the evidence in 7c points at the receive buffer's allocator and
-the only way to own that allocation is to own the transport. The claim being built is "DAQiri
-performance without giving up the gRPC API", which was the original project goal. See 7d.
+deliberately restarted. The original reason was that the evidence in 7c pointed at the receive
+buffer's allocator, and the only way to own that allocation is to own the transport. **That
+reason no longer holds**: 7g shows the 7c penalty needs a CPU producer write, which an RDMA
+receiver does not have, and 7h measures the two allocations head to head in the real receiver
+and finds no difference.
+
+The work continued anyway, on grounds that stand on their own. Owning the receive path gives a
+fixed slot pool with no per-buffer registration, no unregister on teardown, and a
+release-before-completion gate we control, and the claim being built is "DAQiri performance
+without giving up the gRPC API", which was the original project goal and never depended on 7c.
+But the honest position is that a microsecond justification was replaced by a correctness one
+part-way through, and anyone reading this should know that rather than infer it. See 7d, 7g,
+7h.
 
 ## 3. Where the work lives
 
@@ -247,7 +290,12 @@ performance without giving up the gRPC API", which was the original project goal
   - `eb83fe9` Phase 1 evidence log, force-added over the `*.log` ignore
   - `7a952b1` every quotation of the 10.94 \u00b5s figure now carries its payload size
   - `7a49963` Phase 2: bytes cross the cable, land in `cudaHostAlloc` memory, transform correctly
-- `origin/grpc-direct-optimization` is at `7a49963`, the same as local, so the branch is
+  - `6a8056f` Phase 3 step 5 runs: the external-buffer path works end to end
+  - `1910b36` Phase 4 harness: clock gate and warmup, plus the stock RDMA arm
+  - `5d5921c` plan: lock the Phase 4 scope and record what the stock arm cost
+  - `b498987` Phase 4: the 4 MB cell, and the 7c penalty does not reproduce
+  - `14778ab` memsrc 2x2: the 10.94 us belongs to the CPU write, not to the memory
+- `origin/grpc-direct-optimization` is at `14778ab`, the same as local, so the branch is
   **pushed and clean**. Ask before pushing. Git identity: Dami Thomas, damithomas03@gmail.com.
   Remote `https://github.com/dvthomas01/DAQIRI_v_GRPC.git`.
 - **Note:** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md` **are committed as
@@ -594,11 +642,21 @@ of work in a Rust library we do not own, and the payoff is about 6 us at the lar
 
 ## 7c. RETRACTION: memory kind is not dead, and we found the mechanism (2026-08-19)
 
+> **SCOPE NARROWED BY 7g, 2026-08-21. Do not quote this section on its own.** Everything
+> measured here repeats. What is wrong is the last two words of the heading and the section
+> that follows the result table. The effect belongs to the CPU producer's write, not to the
+> memory, and removing the write inverts its sign. It applies to the shmem path and does not
+> transfer to an RDMA receiver. The paragraph below saying this matters more than the RDMA
+> route is withdrawn.
+
 Section 7b and the earlier memory-kind ladder both concluded that where the buffer comes from
 does not matter. **That conclusion was wrong, and the reason it was wrong is worth more than
 the conclusion.** The ladder that produced it never wrote to the buffer before transforming
 it. Real pipelines always do. Once a CPU store precedes the transform, the arms separate
 immediately and stay separated.
+
+> Amendment: the shmem pipeline always does. The RDMA receiver never does, and that is the
+> whole of 7g.
 
 ### What backs each mapping (from /proc/self/smaps, 4 MB payload)
 
@@ -663,6 +721,11 @@ attributes. On a C2C-coherent part that is a plausible thing for `cudaHostRegist
 
 ### Why this matters more than the RDMA route
 
+> **WITHDRAWN 2026-08-21.** The argument below is left in place because it is the argument the
+> next four weeks of work were built on, and deleting it would hide that. It is wrong in one
+> specific way: it assumes the 10.94 us follows the buffer into any transport. It does not.
+> It follows the CPU write, and the RDMA receiver has no CPU write. See 7g and 7h.
+
 Our pipeline receives an iceoryx2 buffer from `/dev/shm` and must `cudaHostRegister` it.
 DAQiri calls `cudaMallocHost`. So DAQiri sits on the fast side of this effect and we sit on
 the slow side, by construction, and **10.94 us at 4 MB is larger than our entire remaining
@@ -722,11 +785,14 @@ rather than device memory, because on this chip host memory is what the GPU read
 
 This is DAQiri's architecture. DAQiri already does RoCE into `cudaMallocHost` buffers. The
 claim is not a faster path, it is "DAQiri performance without giving up the gRPC API", which
-was the original project goal. The reason to expect it to work is 7c: `cudaHostAlloc` beats
+was the original project goal. ~~The reason to expect it to work is 7c: `cudaHostAlloc` beats
 `cudaHostRegister` by 10.94 us of transform time at a 4 MB payload, which is larger than the
 remaining 8.10 us
-gap to DAQiri. Today iceoryx2 allocates the buffers with `shm_open` and we register them after
-the fact. Owning the allocation is the point.
+gap to DAQiri.~~ **Struck 2026-08-21: that reason is withdrawn, see 7g and 7h.** The claim in
+the sentence before it is unaffected, since matching DAQiri's architecture was never contingent
+on the registration penalty. Today iceoryx2 allocates the buffers with `shm_open` and we
+register them after the fact. Owning the allocation is still the point, but for the reasons in
+7g's closing list rather than for a microsecond figure.
 
 ### Gate results
 
@@ -791,11 +857,15 @@ percentile of 2.20 us. That is a clean fabric, not a marginal one.
 
 **The conclusion that matters for the design.** 5843 MiB/s is 49.0 Gb/s on a 50 Gb link, so the
 transport is running at about 98% of line rate and there is essentially nothing left to win in
-the wire. Every microsecond still on the table is in what happens after the bytes land. That is
+the wire. Every microsecond still on the table is in what happens after the bytes land. ~~That is
 precisely what the `cudaHostAlloc` design changes, and it is why the 10.94 us registration
 penalty from 7c, measured at a 4 MB payload, is worth chasing even though it is small next to a
 695 us transfer for the same 4 MB: DAQiri pays the same 695 us, so the comparison stays honest
-and the 10.94 us is the part we actually control.
+and the 10.94 us is the part we actually control.~~ **Second sentence struck 2026-08-21.** The
+fabric conclusion stands. The design conclusion does not: 7g shows the registration penalty
+needs a CPU producer write, and 7h measured both allocations in this receiver at 4 MB and found
+no difference. There is still essentially nothing left to win in the wire, but the thing that
+was going to be won after the bytes land was not there.
 
 ### RESUME STEP: the PXI RoCE address does not survive a reboot
 
@@ -958,10 +1028,19 @@ mechanism should be treated as unproven rather than established.
 only and reported 10.94 us of transform time. Across the ladder the split at 4 MB is +33.86 us
 on the write and +14.94 us on the transform, and the transform penalty is absent below about
 1 MB: at 128, 256 and 512 KB `shmreg` transforms marginally *faster* than `hostalloc` while
-still losing 4-15 us on the write. This does not change the conclusion, because the producer's
+still losing 4-15 us on the write. ~~This does not change the conclusion, because the producer's
 write sits outside the measured window in both pipeline arms, so only the transform half is
-charged to the headline number, and 14.94 us alone still exceeds the 8.10 us gap. It does mean
+charged to the headline number, and 14.94 us alone still exceeds the 8.10 us gap.~~ It does mean
 any future statement of this effect has to name a payload size.
+
+> **Amended 2026-08-21.** The struck sentence is the one that carried the claim furthest and it
+> contains the error in miniature. The producer's write sits outside the measured window, so it
+> was dismissed as not counting. 7g shows the write is not a separate cost that can be set
+> aside, it is the *cause* of the transform penalty: remove it and registered memory transforms
+> 11.25 us faster instead of slower. A term you exclude from the window can still be the reason
+> the rest of the window looks the way it does. Note also that this section's own finding, that
+> `shmreg` transforms marginally faster than `hostalloc` below 1 MB, is the same sign inversion
+> showing up two days early in a size sweep, and it was written down and read past.
 
 `shmreg_big` is null a second time, now under the write-then-transform discipline that 7c said
 the original `--zc-bigreg` result lacked. It is 0/5 at every size and slightly the worst arm on
@@ -1062,6 +1141,123 @@ The ordering test also demonstrates sensitivity to data that is absent, which is
 of the race. A subtly partial arrival, where most of the buffer is correct and a tail is not, is
 harder to force deliberately and is not separately proven here.
 
+## 7g. RETRACTION: the 10.94 us belongs to the CPU write, not to the memory (2026-08-21)
+
+This is the section that narrows 7c. Read it before quoting 7c or 7e anywhere.
+
+### What prompted it
+
+7h measured the two buffer provenances against each other inside the real RDMA receiver at
+4 MB and found nothing: 0.5 us with the sign changing between reps, against a 7c prediction of
+10.94 us at the same payload size. Two results about the same mechanism cannot both be right,
+so the harness got rerun with the variables crossed instead of held.
+
+### Alignment, which was the wrong guess and is worth recording as one
+
+The first explanation offered was that 7c's arms differed in alignment while the receiver's do
+not, since the receiver transforms from `base + kPayloadOffset` at 256 bytes. The second half
+is true. The first half is false, and reading the harness would have caught it before the
+hypothesis was written down: `fft/bench_fft_memsrc.cc` aligns every arm to 2 MB by
+construction, prints `ptr % 2MB` per arm as an audit before timing, and carries a comment
+saying alignment had already been a bug once and was not being let back in as a free variable.
+
+It was tested anyway, because holding a variable constant is not the same as testing it and
+because 256 bytes is what the receiver really runs at. Four arms, provenance crossed with
+alignment, 4 MB, 5 reps, rotated and interleaved, `data/memsrc_2x2_1048576.csv`:
+
+| total us | 2 MB aligned | offset 256 B |
+|---|---|---|
+| `cudaHostAlloc` | 118.03 | 116.80 |
+| mmap + `cudaHostRegister` | 182.51 | 185.50 |
+
+Provenance main effect +66.59 us on the total and +7.31 us on the transform alone. Alignment
+main effect +0.88 us on the total, and negative on the transform, meaning the offset arms were
+if anything faster. Every registered rep is slower than every `cudaHostAlloc` rep, 5 of 5 on
+both columns. **Provenance reproduces. Alignment is not the variable.**
+
+### The variable is the CPU write, and removing it inverts the sign
+
+7c exists because of a methodology fix: the ladder before it never wrote to the buffer and
+declared memory kind dead, and adding the write separated the arms by 10.94 us. The read-only
+null was filed in section 1 as a burn. So the same four arms were run again with the write
+taken back out, `--write off`, everything else identical, `data/memsrc_2x2_nowrite_1048576.csv`:
+
+| transform us | 2 MB aligned | offset 256 B |
+|---|---|---|
+| `cudaHostAlloc` | 54.69 | 51.71 |
+| mmap + `cudaHostRegister` | 42.43 | 41.47 |
+
+With the CPU write, registered memory is 7.31 us slower. Without it, registered memory is
+11.25 us faster. 5 of 5 either way, and the spread inside an arm is under a microsecond, so
+this is not noise in either direction.
+
+**The 10.94 us is therefore not a property of the memory.** It is a property of the interaction
+between the producer's stores and the transform's reads, and `cudaHostRegister` changes that
+interaction. 7c named the clue and did not follow it: registration has no business changing CPU
+store speed, and it doubles it, which means it is changing the page's cacheability or coherency
+attributes. The transform penalty is the other end of the same change.
+
+**So the read-only ladder was not wrong.** It was answering a different question and was retired
+for the wrong reason. Both measurements are correct about the configuration they measured. The
+error was carrying 7c, measured with a CPU producer writing every buffer, to a receiver where a
+NIC writes the buffer and the CPU never touches it.
+
+### What `--write off` is not
+
+It is not a model of DMA arrival and must not be quoted as one. With the write off, the same
+bytes are transformed thousands of times running, so the GPU reads a cache-resident buffer,
+which no pipeline does. Read that table as a bound. **Nothing in `bench_fft_memsrc` models a DMA
+arrival**, which is exactly why 7h had to run on the real receiver, and 7h is the measurement
+that stands.
+
+### What survives
+
+- On the **shmem path**, where a CPU producer does write every buffer, driver-allocated pinned
+  memory beats allocate-then-register by 7 to 11 us of transform and about 2x on the write, at
+  4 MB. 7e shows no flag on either side closes it. This is a statement about the shmem path.
+- On the **RDMA path**, there is no measured difference. 7h.
+- Owning the allocation may still be worth having, for reasons that never depended on 7c: no
+  per-buffer registration, no unregister on teardown, a fixed slot pool, and a
+  release-before-completion gate we control. Those are correctness and steady-state arguments,
+  not microsecond arguments.
+
+Full write-up, including what it costs the RDMA plan, in `rdma_transport_plan.md` §7.
+
+## 7h. Phase 4, the 4 MB cell: the two provenances in the real receiver (2026-08-20)
+
+Run before the release-before-completion race work rather than after it, because this is the
+cell the hypothesis rested on and a timeboxed race that overran would have left a working path
+with no evidence it helped.
+
+Three arms, 5 reps, arms rotated within each rep, `scripts/phase4_cell.sh`,
+`data/phase4_cell_1048576.csv`. All 15 rows cleared the 2400 MHz clock gate, every RDMA message
+was spectrum-verified, and every message sent arrived.
+
+| Arm | e2e p50 (us) | cuFFT p50 (us) | residual (us) | delivered |
+|---|---|---|---|---|
+| `rdma` (our `cudaHostAlloc` pool) | 72.77, 74.86, 67.54, 76.35, 74.50 | 65.22, 67.20, 59.71, 69.15, 67.14 | 7.55, 7.66, 7.83, 7.20, 7.36 | 6828 / 6828 |
+| `rdma-stock-nopoll` (driver buffers) | 71.90, 69.79, 70.90, 73.82, 76.32 | 64.42, 62.53, 63.49, 66.50, 69.06 | 7.49, 7.26, 7.41, 7.33, 7.26 | 6828 / 6828 |
+| `base` (shmem, optimizations off) | 659.63, 661.78, 662.77, 664.03, 661.71 | 361.12, 364.03, 363.36, 364.42, 362.43 | 298.51, 297.75, 299.41, 299.62, 299.28 | 11111 / 11111 |
+
+Paired by rep, `rdma` minus `rdma-stock-nopoll` on e2e p50 is +0.87, +5.07, -3.36, +2.53,
+-1.82 us. Three of five in one direction, sign test p = 1.0. On the transform alone, three of
+five again. On the residual, four of five with a median of +0.10 us, p = 0.375. **The two
+provenances are indistinguishable.**
+
+**Do not quote the gap to `base` as a transport result.** `base`'s own log reads
+`feed mode: realign via D2D`, `realigns: 11111`, `not 16B aligned`. It copies 4 MB
+device-to-device inside the measured window because the shmem proto store lands 8-byte aligned
+and `--no-zc-align` disables the fix. That is what `base` means. It shows in both halves: a
+361 us transform for the same FFT the RDMA arms do in 65 us, and a 299 us residual against
+7.4 us. Most of the 9x is the deliberately disabled optimization. **`opt` is now back in the
+Phase 4 arm list** and is the arm any transport claim gets made against; `base` stays only as
+the standing reference.
+
+Back-pressure behaved as designed: the RDMA arms lost nothing and paid 1.9 to 2.3 seconds
+blocked in the sender against a 686 us wire time. Shmem at 4 MB also lost nothing, unlike at
+16 KB where it drops 14 percent paced and 71 percent unpaced. Delivered count and blocked-send
+time are separate columns and must never be combined.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build
@@ -1150,43 +1346,49 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 | `scripts/e34_probe.sh` | Arms e2/e3/e4/e34 plus a correctness pass. |
 | `scripts/verify_e2.sh` | Spectral correctness: copy vs realign vs in-place. |
 | `scripts/decompose_4mb.py` | Local. Reads `data/*.csv`, prints the residual decomposition. |
-| `fft/bench_fft_memsrc.cc` | The memory placement ladder, and the harness behind the 10.94 us at 4 MB result. No gRPC, no DAQiri, no network. Build target `bench_fft_memsrc`. |
+| `fft/bench_fft_memsrc.cc` | The memory placement ladder, and the harness behind both the 10.94 us at 4 MB result and its retraction in 7g. `--write off` removes the producer's CPU write, which inverts the sign. `--offset-bytes` moves the offset arms off their 2 MB boundary. No gRPC, no DAQiri, no network. Build target `bench_fft_memsrc`. |
 | `scripts/memsrc_table.py` | Local. Turns its CSV into write / transform / total tables, paired sign tests, and a `shmreg` versus `hostalloc` head-to-head. |
 | `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA gates. Self-contained, run on the Spark, print their own verdicts. |
 | `scripts/grpc_sweep.sh`, `scripts/roce_sweep.sh` | Older single-transport sweeps. **Not interleaved with each other.** Use `headline_sweep.sh` for any gRPC-vs-DAQiri claim. |
 
 ## 10. What to do next
 
-The question that used to head this list, "why is our cuFFT slower than DAQiri's", is answered.
-It is not cuFFT. It is the buffer cuFFT is reading: at a 4 MB payload, driver-allocated memory
-transforms 10.94 us faster than memory we allocate and register ourselves, which is more than
-the entire remaining gap. The penalty shrinks with payload size and vanishes below about 1 MB,
-so the size is part of the claim. Sections 7c and 7e. Everything below follows from that.
+The question that used to head this list, "why is our cuFFT slower than DAQiri's", is answered,
+and the answer that replaced it has since been narrowed. It is not cuFFT. On the **shmem path**,
+it is the buffer cuFFT is reading: at 4 MB, driver-allocated memory transforms 7 to 11 us faster
+than memory we allocate and register ourselves. That penalty needs a CPU producer writing the
+buffer, it shrinks with payload size and vanishes below about 1 MB, and it **does not exist on
+the RDMA path**, where a NIC writes the buffer and the CPU never does. Sections 7c, 7e, 7g, 7h.
+Size and producer are both part of the claim now.
 
-**Do these in order. The first two are cheap and could make the third unnecessary.**
+Items 1 to 3 below are struck. They were the follow-ups to a mechanism whose scope has changed,
+and two of the three were answered as part of narrowing it. They are left visible because the
+list they came from is what a reader would otherwise reconstruct.
 
-1. **Is the penalty inherent to `cudaHostRegister`, or to how we call it?** Try
-   `cudaHostRegisterDefault` and `cudaHostRegisterPortable` against `cudaHostRegisterMapped` on
-   the same `/dev/shm` buffer, in `fft/bench_fft_memsrc.cc`, rotated and with the buffer
-   dirtied. This is the difference between "needs an iceoryx2 change" and "one flag", and it is
-   an afternoon at most. Note that both the fast and slow paths already use `...Mapped` plus
-   `cudaHostGetDevicePointer`, so pointer acquisition is not the difference; and the CPU write
-   is also about 2x slower on registered memory, which suggests registration changes page
-   cacheability or coherency attributes rather than anything CUDA-specific.
-2. **Does registering once at startup remove it?** The pipeline registers per slot. `--zc-bigreg`
-   tested span granularity and came back null, but that was before we knew to dirty the buffer,
-   so it deserves one rerun under the write-then-transform discipline.
-3. **The warm-versus-cold ring hole.** The ladder reuses one buffer; the real pipeline rotates a
-   ring. If the penalty is a first-touch or TLB effect it would show up in the ladder and not in
-   the pipeline, or the reverse. Measure a ring of buffers before drawing a conclusion that only
-   holds for one.
-4. **Phase 1 of the RDMA work: the flag experiment.** All four gates passed (7d), so this is
-   unblocked. Put the `cudaHostAlloc` receive buffer behind a mode flag exactly like every other
-   optimization on this branch, so the baseline stays measurable. Start from
-   `scripts/gate4_regmr.cu`, which already allocates, registers and proves coherence, and from
-   `/home/admin/easyrdma_pingpong.cpp` on the PXI, which is the library a real gRPC-Direct RDMA
-   transport would actually use.
-5. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
+1. ~~**Is the penalty inherent to `cudaHostRegister`, or to how we call it?**~~ **Answered, 7e:
+   no flag on either side closes any measurable part of it.** The note that the CPU write is
+   also about 2x slower on registered memory turned out to be the important part, and 7g
+   follows it: registration changes the page's cacheability, the slow write and the slow
+   transform are two ends of the same change, and removing the write inverts the sign.
+2. ~~**Does registering once at startup remove it?**~~ **Answered, 7e and 7h: no.** The Phase 4
+   receiver registers everything during warmup and asserts nothing registers afterwards, and
+   there is still no difference between the arms. Warm registration is not the variable.
+3. ~~**The warm-versus-cold ring hole.**~~ **Superseded.** 7h runs a real rotating slot pool over
+   6828 messages per rep instead of one reused buffer, which is the measurement this item was
+   asking for, and it agrees with 7g rather than with 7c.
+4. **Finish Phase 4 with `opt` in the arm list.** The 16 KB cell has not been run and the 4 MB
+   cell needs re-running with four arms. `scripts/phase4_cell.sh`, `NPTS=4096` and
+   `NPTS=1048576`. Note the warmup formula asks for roughly 893,000 messages at 16 KB to reach
+   four seconds of traffic, which is legitimate but worth a wall-clock sanity check first.
+5. **The release-before-completion race, step 6.** Correctness, not performance, so it is worth
+   doing regardless of which mechanism won. The gate is already in the right place in the
+   receiver, so the diff should only touch the launch. Demonstrate corruption at 16 KB with 2
+   slots, where the window arithmetic says it reproduces: one arrival is about 4.5 us, so with
+   2 slots the window is about 9 us against a measured ~8 us `fft_p50`. At 4 MB one arrival is
+   694.76 us and the window is about 1.39 ms, so it will not reproduce naturally. **Write the
+   4 MB case up with the arithmetic rather than widening the window with artificial GPU work**,
+   which would weaken the demonstration rather than strengthen it. Failing test first.
+6. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
    1.7 us, smaller than the above but fully ours. `--opt-stream` took the easy part; what is
    left is per-message CUDA event record/query overhead and metrics bookkeeping. Consider
    whether both events per buffer are needed.
@@ -1195,7 +1397,8 @@ so the size is part of the claim. Sections 7c and 7e. Everything below follows f
 E1/E3/E4 (section 6, measured and rejected). Landing data in device memory (7b and 7d: the
 hardware refuses it, `GPU_DIRECT_RDMA_SUPPORTED = 0`, and `ibv_reg_mr` on device memory returns
 "Bad address"). Fabric tuning (7d: already at 98% of line rate). Huge pages, NUMA and
-registration granularity (7c: all eliminated with evidence).
+registration granularity (7c: all eliminated with evidence). Alignment as an explanation for
+the 7c effect (7g: tested and null, and it had already been held constant in 7c).
 
 **On the small-buffer drops, which are benign and can stay deprioritised.** Only 170 to 179 of
 200 buffers are delivered at 256 KB and below, which looked like it might bias the medians. It
@@ -1211,17 +1414,22 @@ from 29 to 2, and there are zero drops at 4 MB.
 ## 11. Open questions
 
 1. ~~Why is `cudaHostRegister`'d heap memory ~10 us slower for a cuFFT read than
-   `cudaHostAlloc`'d memory?~~ **Withdrawn, then reinstated, then answered.** It was first
+   `cudaHostAlloc`'d memory?~~ **Withdrawn, reinstated, answered, then narrowed.** First
    dismissed as thermal drift, correctly, because the original ladder was built from separate
-   runs. Rebuilt properly (interleaved, rotated, repeated, buffer dirtied) the effect is real:
-   10.94 us at 4 MB, 15 of 15 paired cells, p = 6.1e-05. Section 7c.
+   runs. Rebuilt properly the effect is real: 10.94 us at 4 MB, 15 of 15 paired cells,
+   p = 6.1e-05, section 7c. **Narrowed by 7g**: it needs a CPU producer write, and without one
+   the sign inverts and registered memory is 11.25 us faster. The question as originally phrased
+   has a false premise, since registered memory is not slower in general.
 2. ~~Why does our cuFFT run ~4 us slower at 1024 and 2048 KB specifically but match at
    4096 KB?~~ **Dissolved.** There was never anything size-specific. The gap exists at every
    size and the apparent match at 4 MB was itself the artifact. Section 5.
-3. **What does `cudaHostRegister` actually change about a page?** This is now the live version
-   of question 1. The CPU write is also about 2x slower on registered memory, which points at
-   cacheability or coherency attributes rather than anything CUDA-specific. Answering it would
-   tell us whether item 1 in section 10 can succeed.
+3. **What does `cudaHostRegister` actually change about a page?** Still the live version of
+   question 1, and 7g raised its value rather than answering it. Registration makes CPU stores
+   about 2x slower and makes a subsequent GPU read of those stores slower, while making a GPU
+   read of an untouched buffer *faster*. A cacheability or coherency attribute change is the
+   obvious candidate and would explain all three signs at once. Nobody has read it out of the
+   system's own accounting yet, which by this project's own rule is what would turn it from a
+   story into evidence.
 4. Can grpc-direct be made to allocate received messages into a supplied arena? Section 7: the
    answer from this side is no. The question is whether the Rust side wants to expose a seam.
    Note that 7d is the other way of solving the same problem: if we own the transport, we own
@@ -1242,7 +1450,7 @@ from 29 to 2, and there are zero drops at 4 MB.
 | `fft/cufft_executor.{h,cu}` | `CuFFTExecutor(n, own_stream)`. With `own_stream` it creates a non-blocking stream, calls `cufftSetStream`, and completes by spinning on `cudaEventQuery` instead of `cudaEventSynchronize`. Also has `try_execute()` (non-throwing, used by the E2 alignment probe) and `launch_realign_copy()` (the E3 kernel). |
 | `grpc_direct/bench_grpc_client.cc` | Builds a fresh `BufferRequest` inside the send loop and does a full CPU copy per iteration. Excluded from server e2e but caps throughput. Has `--pace-us` (default 400). |
 | `grpc_direct/pipeline_fft.proto` | `samples` is field 1 (`FloatArray`), `raw_samples` is field 4 (`bytes`). |
-| `fft/bench_fft_memsrc.cc` | The memory placement ladder. Arms `device` / `devwrite` / `mgdwrite` / `hostalloc` / `heapreg` / `shmreg` / `hugereg`. Has `smaps_backing()` for reading what actually backs a mapping, a `SIGSEGV`/`SIGBUS` fault probe that drops an unusable arm instead of killing the sweep, and a rotating arm order. **`--sizes` is in samples, not KB.** |
+| `fft/bench_fft_memsrc.cc` | The memory placement ladder. Arms `device` / `devwrite` / `mgdwrite` / `hostalloc` / `heapreg` / `shmreg` / `hugereg`, plus the 7g 2x2 `ha_align` / `ha_off` / `reg_align` / `reg_off`. Has `smaps_backing()` for reading what actually backs a mapping, a `SIGSEGV`/`SIGBUS` fault probe that drops an unusable arm instead of killing the sweep, and a rotating arm order. **`--sizes` is in samples, not KB.** **`--write off` is a cache-resident bound, not a DMA model.** |
 | `scripts/gate1_caps.cu`, `scripts/gate4_regmr.cu` | The RDMA feasibility gates. Build with `nvcc -O2 -arch=native ... -lcuda`, and add `-libverbs` for gate 4. |
 | `PROGRESS.md` / `SHORTTERM_CONTEXT.md` / `LONGTERM_CONTEXT.md` | Updated, and **now committed** — they were gitignored while being cited here. |
 
