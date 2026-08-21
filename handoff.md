@@ -134,16 +134,22 @@ at line 200 with identical semantics.
 turned out to be measurement artifacts or overreaches rather than results, and all five were
 caught late. Sections 5, 7c and 7g contain the retractions. **7g retracts part of 7c**, so read
 them as a pair or not at all. **7i is the sixth**, and it is the largest: the sender's 2205 us
-stall was the receiver's own spectral check holding the slot, and removing it is worth 3.18x.
+stall was the receiver's own spectral check, and removing it is worth 3.18x. **7j corrects 7i's
+explanation of why**, so read those as a pair too.
 
 **The pipeline now has a transport number, and it did not before (7i).** Every latency figure
 in this document above section 7i starts its clock after the data has landed. That was
 deliberate and labelled, but it means none of them bounded the pipeline. Post-to-FFT-complete
 from the PXI at 4 MiB is about **1364 us unloaded**, measured by round-trip echo on the sender's
 single clock because the two boxes' realtime clocks differ by 23.13 seconds and neither runs
-NTP. Sustained, with the receiver's verification moved out of the credit window, the path runs
-at **4983 MiB/s, 85 percent of line rate**, up from 27 percent. Slot depth is closed negative.
-What limits it now is the sender's own CPU doing two 4 MiB host memcpys per message.
+NTP.
+
+**Sustained, the path runs at the wire (7j).** With the receiver's per-message verification off
+and the sender's own frame-build copy removed, 4 MiB moves at **5878 MiB/s median against Gate
+3's measured 5843 MiB/s**, with an inter-arrival of 663 to 686 us against a 685 us wire time.
+The transport is not the bottleneck and neither is the receive path. The earlier "85 percent of
+line rate" was the harness measuring its own memcpy. Slot depth is closed negative at 2, 4, 8
+and 16.
 
 ### Where to look for what
 
@@ -157,7 +163,8 @@ What limits it now is the sender's own CPU doing two 4 MiB host memcpys per mess
 | 7d | The RoCE-into-`cudaHostAlloc` design, the four gates, and the machine state that dies on reboot |
 | 7g | What the 10.94 us actually belongs to, and why it does not transfer to RDMA |
 | 7h | The 4 MB Phase 4 cell: the two provenances measured in the real receiver. **Its throughput and blocked-send figures are contaminated; see 7i.** |
-| 7i | The transport number, the 3.18x from moving verification out of the credit window, slot depth closed negative, and the sender's CPU as the new bound |
+| 7i | The transport number, the 3.18x from `--verify off`, slot depth closed negative, and the sender's CPU as the new bound. **Its mechanism for the 3.18x is corrected by 7j.** |
+| 7j | Why the credit window was not the mechanism, and the sender's own copy removed: the pipeline runs at the wire |
 
 ## 1. How to measure on this box (read this before you run anything)
 
@@ -1354,12 +1361,6 @@ building the frame is outside this number.
 Phase 4's 4 MB cell recorded the sender blocked about 2205 us per buffer against a 685 us wire
 time. That was read as a fabric or depth problem for weeks. It was neither.
 
-The instrument that found it is `hold_us`, measured on the receiver from the transform's gate
-completing to `grpc_direct_server_slot_requeue` returning. `detect_peaks` runs inside that
-window. For two and a half milliseconds a slot the NIC could be refilling is sitting in a peak
-search, and the sender blocks in `AcquireSendRegion` for exactly that long and reports it as
-send time. `rq_us`, the re-queue call itself, is 1 to 8 us throughout and was never a candidate.
-
 Paired per rep, 4 MiB, 1000 measured messages, three reps, arms rotated.
 `data/tc_verifycost_1048576_s4.csv`.
 
@@ -1376,13 +1377,24 @@ Three of three, no overlap between the arms, **3.18x on the median**. 4983 MiB/s
 5843 MiB/s Gate 3 measured with `ib_write_lat`, so **85 percent of the link where it had been
 27 percent**.
 
+> **The explanation below this line was wrong, and the correction is in 7j.** The finding that
+> `--verify every` costs 3.18x is a paired measurement and it stands. The mechanism given for it
+> was `detect_peaks` holding the slot inside the credit window. That was tested by moving the
+> check below the re-queue: `hold_us` fell from 2488 us to 1.5 us and **the rate did not move**.
+> The credit window was never the mechanism. See 7j.
+
+The instrument that found it is `hold_us`, measured on the receiver from the transform's gate
+completing to `grpc_direct_server_slot_requeue` returning. `detect_peaks` runs inside that
+window. For two and a half milliseconds a slot the NIC could be refilling is sitting in a peak
+search, and the sender blocks in `AcquireSendRegion` for exactly that long and reports it as
+send time. `rq_us`, the re-queue call itself, is 1 to 8 us throughout and was never a candidate.
+
 `rdma/extbuf_fft_server.cu` already carried the comment that verification belongs outside the
 credit window and that Phase 4 should run with `--verify off`. `scripts/phase4_cell.sh:193`
 passed `--verify every`. The two files disagreed in the repository for a month and nothing
-reconciled them, which is why the server now refuses the combination outright rather than
-relying on the caller to remember. **Every throughput and blocked-send figure from the Phase 4
-cell is contaminated by this and should not be quoted.** The latency columns from that cell are
-not, because they stop at the gate.
+reconciled them. **Every throughput and blocked-send figure from the Phase 4 cell is
+contaminated by this and should not be quoted.** The latency columns from that cell are not,
+because they stop at the gate.
 
 ### Result 3: slot depth is innocent, closed by measurement
 
@@ -1413,6 +1425,85 @@ and what limits the run is a synthetic sender doing work a real digitizer would 
 manufacturing a waveform in host memory and then handing it to a library that copies it again.
 That framing is worth confirming by measurement rather than asserting, which is the next
 experiment.
+
+---
+
+## 7j. The credit window was not the mechanism, and the sender's copy was the whole gap (2026-08-21)
+
+Two experiments, run together, three reps each, arms rotated, 4 MiB, 1000 measured messages,
+four slots. `data/tc_inplace_1048576_s4.csv`, sha `ceb03b3`.
+
+### Correction to 7i: moving the check out of the credit window bought nothing
+
+7i said `detect_peaks` cost 3.18x because it held the slot between the transform's gate and
+`slot_requeue`, so the NIC could not refill it. That was testable, so it was tested.
+`detect_peaks` reads `d_out`, which is `cudaMalloc`'d device memory holding the transform's
+output, and never touches the received slot. It had no reason to be above the re-queue, so it
+was moved below it.
+
+| arm | hold p50 (us) | gap p50 (us) | MiB/s |
+|---|---|---|---|
+| `stream`, check above the re-queue (7i) | 2488.58, 2480.34, 2666.04 | 2561.85, 2553.49, 2743.11 | 1561, 1566, 1458 |
+| `stream`, check below the re-queue | 1.52, 1.26, 1.76 | 2483.66, 2647.42, 2538.73 | 1611, 1511, 1576 |
+
+`hold_us` fell by a factor of 1600. **The rate did not move.** Three reps each, the two rate
+distributions overlap completely.
+
+So the credit window was never the mechanism. The mechanism is that the receiver is one thread.
+`detect_peaks` costs about 2400 us of it per message at 4 MiB, and `receive_ext` cannot be
+called again until that returns, so the arrival interval is the consumer's loop time regardless
+of where in the loop the work sits. Extra slots cannot absorb it, which is the same reason
+Result 3's depth sweep was flat: the producer is not bursty, it is continuous, and the consumer
+is slower than it.
+
+The attribution in 7i was right about the flag and wrong about the reason, and the difference is
+not cosmetic. If the credit window had been the mechanism, the fix would have been free. It is
+not: verifying every message at 4 MiB is not affordable inline on one thread at any position in
+the loop, and would need sampling or a second thread.
+
+The reordering was kept anyway, because it costs nothing and it makes `hold_us` report the
+credit window rather than reporting whatever was left inside it.
+
+**What is in the binary now.** The server withholds the inter-arrival, sustained rate and
+consumer duty lines entirely when `--poison on` or `--verify every`, and prints the reason and
+the two numbers in their place. Not a warning. A number that is not printed cannot be lifted out
+of a log four weeks later, and 7i is what happens when one is. `scripts/phase4_cell.sh` keeps
+`--verify every`, which is correct for the latency columns it actually quotes, and its `mib_s`
+now comes out `NA`. Confirmed: a `stream` rep run after the change reports `mib_s NA`.
+
+### The sender's own copy was the entire remaining gap
+
+Result 4 predicted this and asked for it to be confirmed rather than asserted. `--gen inplace`
+on the client builds the sixteen frames complete at startup and writes only the 16-byte header
+per message, which removes one of the two 4 MiB host copies. The library's copy into the send
+region stays. The receiver cannot tell the two arms apart: same flags, same traffic.
+
+| arm | gen p50 (us) | send p50 (us) | gap p50 (us) | MiB/s |
+|---|---|---|---|---|
+| `stream-nv` (`--gen copy`) | 467.12 | 335.70 | 783.51 | 5100 |
+| `stream-inplace` | 0.16 | 688.20 | 662.98 | 6031 |
+| `stream-nv` | 468.70 | 335.25 | 804.39 | 4973 |
+| `stream-inplace` | 0.16 | 688.65 | 686.23 | 5829 |
+| `stream-nv` | 467.40 | 336.79 | 801.67 | 4989 |
+| `stream-inplace` | 0.13 | 687.99 | 680.29 | 5878 |
+
+Three of three, no overlap. `gen_p50` goes from 467 us to 0.16 us, which is the header write.
+
+**The pipeline is now at the wire.** `gap_p50` of 663 to 686 us against the 685 us Gate 3
+measured for 4 MiB, and 5878 MiB/s median against Gate 3's 5843 MiB/s. There is nothing left to
+recover at this size. `send_p50` rising from 336 to 688 us is the same statement from the other
+side: with the frame build gone, the send call is where the sender waits for the wire, and it
+waits exactly one wire time.
+
+**This changes the claim in Result 4.** It is no longer "the receive path sustains 85 percent of
+link and a synthetic sender limits it". It is: **the receive path is not the limit, and neither
+is the transport. With the harness's own copy removed the pipeline runs at the measured line
+rate.** The 85 percent figure was the harness measuring its own frame build. A digitizer DMAs
+into the buffer it hands to the transport and never makes that copy, so `--gen inplace` is also
+the more faithful arm, not just the faster one.
+
+Read Result 4 with this attached: its arithmetic was correct and its conclusion was one step
+short.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
@@ -1548,18 +1639,25 @@ list they came from is what a reader would otherwise reconstruct.
    measured ~8 us `fft_p50`. At 4 MB one arrival is 694.76 us and the window is about 1.39 ms,
    so it will not reproduce naturally. Write the 4 MB case up with the arithmetic rather than
    widening the window with artificial GPU work.~~
-6. **Generate in place on the sender.** This is the current bottleneck and the highest-value
-   experiment left. 7i shows the PXI spends 803 us per 4 MiB message in two host memcpys against
-   an 800 us arrival interval, so the sender is the whole limit. Removing one of the two copies
-   should move the number a long way. It also decides how the headline is framed: whether the
-   85 percent of line rate is bounded by a synthetic sender doing work a digitizer would not do,
-   which is currently an assertion rather than a measurement.
+6. ~~**Generate in place on the sender.**~~ **Done, 2026-08-21. See 7j.** `--gen inplace` on the
+   client removes the frame-build memcpy. 5878 MiB/s median against 4989, three of three, and
+   `gap_p50` lands on the 685 us wire time. The pipeline is at line rate at 4 MiB and the
+   framing question is answered: the 85 percent was the harness, not the transport.
 7. **DAQiri cross-machine.** Both DAQiri benchmarks are single-process loopback with both
    endpoints on the same address, while the extbuf RDMA arm is genuinely PXI to Spark, so the
    standing comparison is loopback against wire. Fixing it means splitting
    `daqiri/bench_daqiri_roce_pipeline.cc` into real client and server roles, which is real work
-   rather than a flag.
-8. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
+   rather than a flag. **This is now the top item.**
+8. **Decide what to do about per-message verification.** 7j closed the cheap version of this:
+   `detect_peaks` costs about 2400 us of the single consumer thread per message at 4 MiB and
+   moving it out of the credit window changed nothing, so it cannot be made free by reordering.
+   The options are sampling every Nth message, moving it to a second thread, or accepting that
+   throughput runs and correctness runs are different runs, which is what the withheld rate
+   lines currently enforce. No measurement needed to choose; it needs a decision.
+9. **Re-measure `stream-inplace` at 16 KB.** 7j only covers 4 MiB. At 16 KB the frame-build
+   memcpy is roughly 1000 times smaller and the per-message fixed costs dominate, so the effect
+   should be small or absent. Worth one cell to know where the crossover is, and it is cheap.
+10. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
    1.7 us, smaller than the above but fully ours. `--opt-stream` took the easy part; what is
    left is per-message CUDA event record/query overhead and metrics bookkeeping. Consider
    whether both events per buffer are needed.

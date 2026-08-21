@@ -59,27 +59,35 @@
 // runs, because --echo on serialises the sender.  Do not put them in the same
 // table row.
 //
-// Throughput and inter-message gap are NOT quotable with --poison on, because
-// poisoning is a full payload memcpy that runs after the timer stops but before
-// the re-queue, and the re-queue is the sender's credit.  So it throttles the
-// sender and shows up as transport time.  The program now WITHHOLDS those lines
-// when --poison on rather than printing them with a caveat, because a number
-// that is not printed cannot be quoted.
+// Throughput and inter-message gap are NOT quotable with --poison on or
+// --verify every.  The program WITHHOLDS those lines in either case rather than
+// printing them with a caveat, because a number that is not printed cannot be
+// lifted out of a log four weeks later.
 //
-// --verify every used to be in that same sentence and no longer is.  The
-// spectral check reads d_out, the transform's output in device memory, and
-// never touches the slot, so it had no reason to be inside the credit window.
-// It now runs after the re-queue.  That is worth 3.18x on sustained rate at
-// 4 MiB and gives up nothing: every message is still checked.  Before the move
-// it held the slot 2488 us per message, the sender blocked in AcquireSendRegion
-// for exactly that long and reported it as send time, and it was read as fabric
-// latency for a month.  scripts/phase4_cell.sh passed --verify every the whole
-// time while the comment here said Phase 4 needed it off.  handoff.md 7i.
+// The reason is not the one this file gave for a month, and the difference
+// matters.  The story was that these run before the re-queue, so they hold the
+// sender's credit.  detect_peaks was moved below the re-queue to test that:
+// hold_us fell from 2488 us to 1.5 us and the sustained rate did not move at
+// all, 1611/1511/1576 MiB/s before and after.  So the credit window was never
+// the mechanism.
+//
+// The mechanism is that this is one thread.  detect_peaks costs about 2400 us
+// of it per message at 4 MiB, and the next receive_ext cannot be called until
+// it returns, so the arrival interval is the consumer's loop time no matter
+// where in that loop the work sits.  Four slots of buffering do not help,
+// because the producer is not bursty: it is continuous and we are slower than
+// it.  Moving work out of the credit window only helps if something else can
+// use the thread, and here nothing can.
+//
+// The move was kept anyway.  It costs nothing, and hold_us is now an honest
+// measure of the credit window instead of a measure of whatever we left in it.
 //
 // The general form, which is the part worth carrying to another project: in any
 // pipeline where the consumer owns buffer lifetime, measure gate-to-credit-
-// returned as a first-class column.  Nothing else tells you whether the network
-// is slow or you are holding the buffer.  It is hold_us here.
+// returned as a first-class column.  It is hold_us here.  Then check it against
+// the arrival interval before concluding anything, because a large hold_us and
+// a slow consumer look identical from the sender's side.  Both show up as time
+// blocked in AcquireSendRegion.  Only the receiver can tell them apart.
 //
 // ─────────────────────────────────────────────────────────────────────────────
 // HOT PATH DISCIPLINE
@@ -265,13 +273,15 @@ static void usage() {
         "                  ramp, and a short run finishes before it does.\n"
         "  --slots   N     pool slots (default 4; step 6 uses 2)\n"
         "  --poison  on|off   repaint each slot before re-queueing (default on).\n"
-        "                  This is the ONLY thing left in the credit window, so\n"
-        "                  with it on the inter-arrival and sustained-rate lines\n"
-        "                  are withheld from the report rather than caveated.\n"
+        "                  The only thing left in the credit window. With this\n"
+        "                  on, or with --verify every, the inter-arrival and\n"
+        "                  sustained-rate lines are WITHHELD from the report\n"
+        "                  rather than printed with a caveat.\n"
         "  --verify  every|off  spectral check per message (default every).\n"
-        "                  Runs AFTER the slot re-queue, because it reads the\n"
-        "                  transform's output and never touches the slot, so it\n"
-        "                  is free of the sender's credit. Safe to leave on.\n"
+        "                  Runs AFTER the slot re-queue, so hold_us stays near\n"
+        "                  zero, but it still costs ~2400 us of the consumer\n"
+        "                  thread at 4 MiB and the next receive waits on it.\n"
+        "                  With this on the rate lines are WITHHELD.\n"
         "  --own-stream    run cuFFT on its own stream\n"
         "  --tol-bins N    peak tolerance in bins (default 2)\n"
         "  --stock         rdma-stock-nopoll arm: driver-allocated buffers,\n"
@@ -339,40 +349,45 @@ int main(int argc, char** argv) {
     // Poisoning is a full payload memcpy through the mapping the NIC will reuse,
     // so it has to happen before the re-queue.  It is the only thing left there.
     //
-    // Verifying used to be there too and did not need to be.  detect_peaks reads
-    // d_out, which is device memory holding the transform's output, and never
-    // touches the slot, so it now runs after the re-queue.  That reordering is
-    // worth 3.18x on sustained rate at 4 MiB and gives up nothing: every message
-    // is still checked.  It cost 2488 us per message and was read as fabric
-    // latency for a month.  handoff.md 7i.
+    // Verifying used to be there too and did not need to be: detect_peaks reads
+    // d_out, the transform's output in device memory, and never touches the
+    // slot.  It now runs after the re-queue.  That was expected to be worth the
+    // 3.18x the flag is worth.  It was worth nothing.  hold_us fell from 2488 us
+    // to 1.5 us and the sustained rate did not move, 1611/1511/1576 MiB/s before
+    // and after, because this is one thread and the next receive_ext waits for
+    // detect_peaks wherever in the loop it sits.  Extra slots do not help: the
+    // producer is not bursty, it is continuous and we are slower than it.  The
+    // move is kept because it makes hold_us mean what it says.
     //
-    // What this means for --echo on: neither poison nor verify sits inside the
-    // timed interval any more, because the ack is sent immediately after the
-    // gate and both of these now follow it.  Verify is therefore allowed in echo
-    // mode, and is worth having, since it is the only spectral check available
-    // there.  Poison is still refused: it is a 4 MiB memcpy on the consumer
-    // thread and echo mode has no other traffic to hide it behind, so it would
-    // show up in the next message's arrival rather than this one's latency,
-    // which is harder to see and just as wrong.
+    // So both flags still cost throughput, for different reasons, and both
+    // withhold the rate lines below.  Neither is refused outright: Phase 4 wants
+    // the spectral check and quotes latency, not rate, and taking the check away
+    // to protect a number it does not quote would be the wrong trade.
+    //
+    // --echo on with --poison on is refused, because there the contamination
+    // does not surface as a rate anyone would think to distrust.  Echo mode has
+    // no other traffic for a 4 MiB memcpy to hide behind, so poison delays the
+    // next message rather than this one.  Verify is fine in echo mode now that
+    // it is below the re-queue, which is below the ack, so it is outside the
+    // interval the sender times.
     if (echo_on && poison_on) {
         std::fprintf(stderr,
                      "--echo on requires --poison off.\n"
-                     "Poison is a full payload memcpy in the credit window. In "
+                     "Poison is a full payload memcpy on the consumer thread. In "
                      "echo mode there is no other traffic to absorb it, so it "
-                     "displaces the next message rather than this one and the "
+                     "delays the next message rather than this one and the "
                      "contamination moves somewhere harder to see.\n"
-                     "(--verify every is fine here: it moved below the re-queue "
-                     "and is no longer inside the timed interval.)\n");
+                     "(--verify every is fine here: it moved below the re-queue, "
+                     "which is below the ack, so it is outside the timed "
+                     "interval.)\n");
         return 1;
     }
     // The other half of the same rule, and the one that would otherwise let a
     // driver script and this file disagree in silence again.  scripts/
     // phase4_cell.sh passed --verify every for a month while the comment in this
-    // file said Phase 4 needed it off, and nothing caught it because a comment
-    // cannot refuse anything.  Verify is now safe, so the disagreement is gone.
-    // Poison is not, so the arrival rate and sustained rate are withheld rather
-    // than printed with a caveat.  A number that is not printed cannot be quoted.
-    const bool rate_is_reportable = !poison_on;
+    // file said Phase 4 needed it off, and nothing caught it, because a comment
+    // cannot refuse anything.  A withheld number can.
+    const bool rate_is_reportable = !poison_on && !verify_on;
     if (!fft_on && !echo_on) {
         std::fprintf(stderr,
                      "--fft off is only meaningful with --echo on. On its own it "
@@ -702,17 +717,22 @@ int main(int argc, char** argv) {
         // Everything between the gate above and the re-queue below is time the
         // NIC spends waiting for a slot it could already have had, and the
         // sender pays it inside AcquireSendRegion and reports it as send time.
-        // That is not a theoretical concern: the spectral check used to live
-        // here and it cost 2488 us per message, which was read as fabric
-        // latency for a month. See handoff.md 7i.
+        // hold_us measures exactly this interval, which is the only way to tell
+        // it apart from a slow consumer: both look like blocked send time from
+        // the other box.
         //
-        // The test for whether something belongs here is simple. Does it touch
-        // the slot? Poison does, because it writes through the mapping the NIC
-        // will reuse, so it has no choice. The spectral check does not: it
-        // reads d_out, which is cudaMalloc'd device memory holding the
-        // transform's output, and the transform has already been gated. So the
-        // check moved below the re-queue, where it costs the pipeline nothing
-        // and still verifies every message. Nothing was traded away.
+        // The test for whether something belongs here is whether it touches the
+        // slot. Poison does, because it writes through the mapping the NIC will
+        // reuse, so it has no choice. The spectral check does not: it reads
+        // d_out, cudaMalloc'd device memory holding the transform's output. So
+        // the check moved below the re-queue, and hold_us went from 2488 us to
+        // 1.5 us.
+        //
+        // The rate did not move. That is the useful part. Being out of the
+        // credit window does not help when there is one consumer thread and the
+        // next receive_ext is behind the same work. The move is still right,
+        // because now hold_us reports the credit window rather than reporting
+        // whatever we happened to leave in it.
         if (poison_on)
             std::memcpy(const_cast<uint8_t*>(ptr) + kPayloadOffset,
                         poison.data(), npts * sizeof(float));
@@ -739,15 +759,14 @@ int main(int argc, char** argv) {
         }
 
         // ── VERIFICATION, DELIBERATELY BELOW THE RE-QUEUE ────────────────
-        // The NIC may already be refilling the slot. That is fine and it is
-        // the point: this reads d_out, the transform's output in device
-        // memory, and never touches the slot. Keeping it above the re-queue
-        // bought nothing and cost 2488 us of the sender's time per message.
+        // The NIC may already be refilling the slot. That is fine: this reads
+        // d_out, the transform's output in device memory, and never touches the
+        // slot.
         //
-        // It still costs wall-clock on this thread, so it delays the next
-        // receive_ext call. With four slots in flight that is absorbed; with
-        // one it would not be, which is why the arrival rate is reported next
-        // to the consumer duty cycle rather than on its own.
+        // It costs about 2400 us of this thread per message at 4 MiB, and the
+        // next receive_ext is behind it, so it still sets the arrival rate. That
+        // is why the rate lines are withheld when it is on. Being below the
+        // re-queue makes hold_us honest; it does not make this cheap.
         float peak_hz = -1.0f, expect_hz = payload_tone_hz(seq);
         bool  ok = frame_ok;
         if (frame_ok && verify_on && fft_on) {
@@ -819,15 +838,18 @@ int main(int argc, char** argv) {
         std::printf("inter-arrival     : not meaningful with --echo on "
                     "(the sender is waiting for us)\n");
     } else if (!rate_is_reportable) {
-        std::printf("inter-arrival     : WITHHELD. --poison on puts a %zu-byte "
-                    "memcpy in the credit window,\n"
-                    "                    so the arrival rate below would be "
-                    "measuring this harness and not\n"
-                    "                    the transport. Re-run with --poison "
-                    "off. See handoff.md 7i for what\n"
-                    "                    happened the last time a number like "
-                    "this was printed anyway.\n",
-                    npts * sizeof(float));
+        std::printf("inter-arrival     : WITHHELD.%s%s\n"
+                    "                    Either one costs this thread more per "
+                    "message than the wire time, and\n"
+                    "                    the next receive waits on it, so the "
+                    "rate below would be measuring\n"
+                    "                    this harness and not the transport. "
+                    "Measured: 1576 MiB/s with\n"
+                    "                    --verify every against 4989 without, "
+                    "same run, same rep.\n"
+                    "                    Re-run with both off. handoff.md 7i.\n",
+                    poison_on ? " --poison on." : "",
+                    verify_on ? " --verify every." : "");
     } else if (g50 > 0.0) {
         const double mib_s = static_cast<double>(frame_bytes) / g50
                              * 1e6 / (1024.0 * 1024.0);

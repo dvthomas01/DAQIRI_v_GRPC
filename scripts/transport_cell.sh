@@ -265,13 +265,11 @@ for R in $(seq 1 "$REPS"); do
       stream-nv)
         # The same arm with the spectral check off, which is what the server's
         # own header said Phase 4 should have used and what Phase 4 did not do.
-        #
-        # HISTORICAL, and kept because the pairing is the evidence: detect_peaks
-        # used to run after the gate and before slot_requeue, so its cost was
-        # charged to the sender as credit it had not been given back, and this
-        # arm was worth 3.18x against stream. The check has since moved below the
-        # re-queue, so stream and stream-nv should now be one distribution. If
-        # they are not, the server binary predates that change; check its --help.
+        # Paired against stream, per rep, so the difference is the price of
+        # verifying in the consumer loop rather than a difference between two
+        # days. Worth 3.18x at 4 MiB, and it survived moving the check out of
+        # the credit window: hold_us went to 1.5 us and the rate did not change,
+        # because one thread is one thread.
         run_one "$ARM" "$R" "$NPTS" \
           "--poison off --verify off" "" \
           "$WARM_MSGS" "$MSGS" ;;

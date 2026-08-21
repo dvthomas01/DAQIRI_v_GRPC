@@ -1,13 +1,61 @@
 # Short-Term Context — Active Sprint
 **Phase:** RDMA transport for gRPC-Direct — measuring the transport itself
-**Branch:** `grpc-direct-optimization` @ `8912ac7`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
-**Updated:** 2026-08-21
+**Branch:** `grpc-direct-optimization` @ `ceb03b3`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
+**Updated:** 2026-08-21 (late)
 
 > **This file is committed now.** It was gitignored while tracked documents pointed at it.
 
 ---
 
-## THE HEADLINE, 2026-08-21: we were never measuring the transport, and the stall was ours
+## THE HEADLINE, 2026-08-21 LATE: the pipeline is at the wire, and one mechanism is retracted
+
+Full writeup in `handoff.md` §7j. Read it with §7i, which it corrects.
+
+**1. The 3.18x was real. The reason given for it was not.** §7i said the receiver's spectral
+check cost 3.18x because it held the slot between the transform's gate and `slot_requeue`, so
+the NIC could not refill it. `detect_peaks` reads `d_out`, device memory holding the transform's
+output, and never touches the slot, so it was moved below the re-queue. `hold_us` fell from
+2488 µs to **1.5 µs** and the rate **did not move**: 1611/1511/1576 MiB/s against 1561/1566/1458
+before. The credit window was never the mechanism.
+
+The mechanism is that the receiver is one thread. `detect_peaks` costs about 2400 µs of it per
+message at 4 MiB and `receive_ext` cannot be called again until it returns, so the arrival
+interval is the consumer's loop time wherever in the loop the work sits. That is also why the
+slot sweep in §7i was flat: buffering absorbs bursts, and this producer is continuous and faster
+than us. **The practical consequence: this is not fixable by reordering.** Verifying every
+message at 4 MiB needs sampling or a second thread, or throughput and correctness stay separate
+runs.
+
+**2. The sender's own copy was the whole remaining gap, and removing it reaches line rate.**
+`--gen inplace` on the client builds the sixteen frames complete at startup and writes only a
+16-byte header per message.
+
+| arm | gen p50 (µs) | send p50 (µs) | gap p50 (µs) | MiB/s |
+|---|---|---|---|---|
+| `stream-nv` (`--gen copy`) | 467.12, 468.70, 467.40 | 335.70, 335.25, 336.79 | 783.51, 804.39, 801.67 | 5100, 4973, 4989 |
+| `stream-inplace` | 0.16, 0.16, 0.13 | 688.20, 688.65, 687.99 | 662.98, 686.23, 680.29 | 6031, 5829, 5878 |
+
+Three of three, no overlap. `gap_p50` lands on the **685 µs** wire time and 5878 MiB/s median
+against Gate 3's measured **5843 MiB/s**. **The transport is not the bottleneck.** The "receive
+path sustains 85 percent of link" line is retired: the 85 percent was the harness measuring its
+own memcpy. A digitizer DMAs into the buffer it hands to the transport, so the inplace arm is
+also the more faithful one.
+
+**3. The binary now withholds the numbers it cannot support.** With `--poison on` or
+`--verify every` the server prints no inter-arrival, no sustained rate and no consumer duty,
+just the reason and the two contrasting figures. Not a warning. §7i happened because a rate sat
+in a log for a month with a comment somewhere else saying not to trust it. `phase4_cell.sh`
+keeps `--verify every`, which is right for the latency columns it quotes, and its `mib_s` now
+comes out `NA`. Verified against a live rep.
+
+**Next:** DAQiri cross-machine. Both DAQiri benchmarks are single-process loopback with both
+endpoints on the same address while the extbuf arm is genuinely PXI to Spark, so the standing
+comparison is loopback against wire. Needs `bench_daqiri_roce_pipeline.cc` split into real
+client and server roles.
+
+---
+
+## THE PREVIOUS HEADLINE, 2026-08-21: we were never measuring the transport, and the stall was ours
 
 Full writeup in `handoff.md` §7i. Three findings, all of which change conclusions this project
 had already written down.

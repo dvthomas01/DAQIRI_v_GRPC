@@ -8,6 +8,39 @@
 
 ---
 
+## Key findings (a mechanism retracted, 2026-08-21 late)
+
+These come from testing the previous day's own explanation and finding it wrong. That is the
+transferable part.
+
+- **A correct fix and a correct explanation are different things, and only one of them is
+  usually measured.** Turning verification off was worth 3.18x, three of three, no overlap. The
+  reason given for it, that the check held the receive buffer and starved the sender's credit,
+  was never tested; it was inferred from an instrument that pointed at it. Moving the check out
+  of the credit window dropped that instrument's reading by a factor of 1600 and changed the
+  throughput by nothing. **If you cannot state what measurement would distinguish your
+  explanation from a competing one, you have a correlation and a story.**
+- **Buffering absorbs bursts, not deficits.** Adding slots does nothing when the producer is
+  continuous and the consumer is simply slower. The depth sweep was flat for exactly the reason
+  the credit-window story was wrong, and the two facts sat side by side unconnected for a day.
+  When two results are both negative, check whether they are the same negative.
+- **On a single-threaded consumer, where work sits in the loop does not matter; only how much
+  there is.** Reordering is only a lever when something else can use the thread.
+- **Withhold a number you cannot support instead of printing it with a caveat.** The prior
+  month's contamination happened because a rate sat in a log and a warning about it sat in a
+  different file. The consumer here now prints no rate at all under the flags that invalidate
+  it, along with the two contrasting figures. A number that is not printed cannot be quoted.
+- **Instrument the sender's own preparation separately from its send call.** Two host copies of
+  the payload per message, one ours and one the library's, accounted for the entire gap between
+  the measured rate and line rate. Until they were timed apart, the first was invisible and the
+  second was being read as fabric time.
+- **A synthetic producer that manufactures its data is not the system you are claiming to
+  measure.** Real acquisition hardware DMAs into the buffer it hands to the transport. Removing
+  the harness's own copy was not an optimisation, it was a correction, and it moved the result
+  from 85 percent of link to line rate.
+- **Find the next bottleneck before writing the conclusion.** Both of this session's headline
+  claims were superseded within a day by the experiment they themselves suggested.
+
 ## Key findings (measuring the transport, 2026-08-21)
 
 Full writeup in `handoff.md` §7i. These are the durable, transferable parts.

@@ -187,14 +187,14 @@ run_rdma () {                   # $1 = arm name, $2 = rep, $3 = extra server arg
 
     cleanup
     clk_start
-    # --verify every is safe here as of the re-ordering in extbuf_fft_server.cu:
-    # the spectral check now runs after the slot re-queue, not before it. Until
-    # then this line and the comment at the top of that file disagreed about the
-    # flag for a month, and every throughput figure Phase 4 produced was really a
-    # measure of detect_peaks holding the sender's credit. handoff.md 7i.
-    #
-    # If you are re-running an old $RSRV, check that its --help says the check
-    # runs after the re-queue before quoting any rate from this cell.
+    # --verify every stays here, and Phase 4's LATENCY columns are unaffected by
+    # it: e2e stops at the transform's gate and the check runs after the slot
+    # re-queue. Its THROUGHPUT columns were never valid with it on. The check
+    # costs ~2400 us of the single consumer thread per message at 4 MiB, so the
+    # arrival rate it produces is a measure of detect_peaks. 1576 MiB/s with it,
+    # 4989 without, same rep. The server now withholds those lines rather than
+    # printing them, so this cell cannot reproduce the contamination. handoff.md
+    # 7i. For a rate, run scripts/transport_cell.sh, which has arms for it.
     ( cd "$ROOT/rdma" && timeout 900 "$RSRV" \
         --addr "$SPARK_RDMA_IP" --port "$RPORT" --npts "$NPTS" \
         --warmup "$WARM_MSGS" --msgs "$MSGS" --slots "$SLOTS" \
