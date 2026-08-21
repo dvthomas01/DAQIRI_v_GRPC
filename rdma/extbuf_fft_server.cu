@@ -41,6 +41,24 @@
 // completing.  That is the post-arrival window section 1 of the plan commits
 // to, and it is comparable with the existing arms.
 //
+// e2e_us IS NOT A PIPELINE LATENCY AND NEVER WAS.  It starts after the data has
+// landed.  Two other numbers exist now because quoting it alone misled us for
+// four weeks:
+//
+//   inter-arrival gap, printed by this program in streaming mode, on this box's
+//   clock alone.  It is how often a buffer actually shows up, so it is what
+//   bounds the pipeline.  At 4 MB it was 2205 us against a 685 us wire time
+//   while e2e was 72 us.
+//
+//   the echo round trip, printed by the sender with --echo on, on the sender's
+//   clock alone.  It is post-to-transform-complete and it is the number a
+//   system integrator asks for.  It cannot be measured by differencing the two
+//   boxes' clocks: they are 23.13 seconds apart and neither runs NTP.
+//
+// The two are instruments for different quantities and come from different
+// runs, because --echo on serialises the sender.  Do not put them in the same
+// table row.
+//
 // Throughput and inter-message gap are NOT quotable with --poison on or
 // --verify every, because both run after the timer stops but before the
 // re-queue, and the re-queue is the sender's credit.  Poisoning and verifying
@@ -198,6 +216,24 @@ static double now_us() {
         .count();
 }
 
+// Send the echo acknowledgement.  CONSUMES ar, exactly like the underlying
+// grpc_direct_server_send, so the caller must not destroy it afterwards.
+//
+// The response travels on the tx_session the library opened on port+1 at accept
+// time.  That session is ordinary internally-buffered easyrdma, not the external
+// pool: the pool is a receive-side arrangement and there is nothing to gain from
+// applying it to sixteen bytes.
+static bool echo_ack(GrpcDirectActiveRequest* ar, uint32_t seq, int npts,
+                     bool fft_ran) {
+    contract::EchoAck ack;
+    ack.magic     = contract::kEchoMagic;
+    ack.seq       = seq;
+    ack.n_samples = static_cast<uint32_t>(npts);
+    ack.flags     = fft_ran ? contract::kEchoFlagFft : 0u;
+    return grpc_direct_server_send(ar, reinterpret_cast<const uint8_t*>(&ack),
+                                   sizeof(ack)) == 0;
+}
+
 static void usage() {
     std::printf(
         "extbuf_fft_server — Phase 3 step 5 receiver\n"
@@ -221,6 +257,15 @@ static void usage() {
         "                  own. No re-queue; the library owns slot lifetime.\n"
         "  --reg-warmup N  unmeasured messages before timing, used to see and\n"
         "                  register every stock slot (default 32)\n"
+        "  --echo    on|off   send a 16-byte ack after the transform completes,\n"
+        "                  so the sender can time post-to-FFT-complete on its\n"
+        "                  own clock (default off). Serialises the pipeline:\n"
+        "                  this is the latency instrument, not the throughput\n"
+        "                  one. Requires --poison off --verify off.\n"
+        "  --fft     on|off   run the transform (default on). Off is the echo\n"
+        "                  calibration arm: with a tiny --npts it measures the\n"
+        "                  request-and-return path with no work in the middle,\n"
+        "                  and that gets subtracted from the full run.\n"
         "  --csv     PATH  per-message CSV\n"
         "  --sha     STR   git SHA stamped into every CSV row\n");
 }
@@ -237,6 +282,7 @@ int main(int argc, char** argv) {
     int         reg_warmup = 32;
     bool        poison_on = true, verify_on = true, own_stream = false;
     bool        stock = false;
+    bool        echo_on = false, fft_on = true;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -253,6 +299,8 @@ int main(int argc, char** argv) {
         else if (a == "--tol-bins")   tol_bins = std::stoi(next());
         else if (a == "--poison")     poison_on = (next() == "on");
         else if (a == "--verify")     verify_on = (next() != "off");
+        else if (a == "--echo")       echo_on = (next() == "on");
+        else if (a == "--fft")        fft_on = (next() != "off");
         else if (a == "--own-stream") own_stream = true;
         else if (a == "--stock")      stock = true;
         else if (a == "--reg-warmup") reg_warmup = std::stoi(next());
@@ -262,6 +310,36 @@ int main(int argc, char** argv) {
     }
     if (slots < 2) {
         std::fprintf(stderr, "--slots must be at least 2\n");
+        return 1;
+    }
+
+    // Poisoning is a full payload memcpy and verifying is a device-to-host read
+    // of the spectrum plus a scan.  Both run between the transform finishing and
+    // the slot going back to the NIC.  In streaming mode that only throttles the
+    // sender, which the header already warns about.  In echo mode it would sit
+    // inside the interval the sender is timing, so the headline latency would be
+    // partly a measure of the harness.  Refused rather than warned about,
+    // because a warning in a log is a warning nobody reads before quoting the
+    // number.
+    //
+    // The correctness that is given up here is not given up: the ack carries the
+    // request's seq, and the sender checks it, so a reply that belongs to a
+    // different message is still caught.  What is not checked in echo mode is
+    // the spectrum, and that was established in step 5 and again in every
+    // streaming Phase 4 run.
+    if (echo_on && (poison_on || verify_on)) {
+        std::fprintf(stderr,
+                     "--echo on requires --poison off --verify off.\n"
+                     "Both run after the transform and before the ack, so they "
+                     "would be inside the interval the sender is timing and the "
+                     "headline latency would be partly a measure of this "
+                     "harness.\n");
+        return 1;
+    }
+    if (!fft_on && !echo_on) {
+        std::fprintf(stderr,
+                     "--fft off is only meaningful with --echo on. On its own it "
+                     "is a receiver that measures nothing.\n");
         return 1;
     }
 
@@ -300,6 +378,10 @@ int main(int argc, char** argv) {
     }
     std::printf("page size         : %zu bytes\n", g_page);
     std::printf("payload offset    : %zu bytes into each slot\n", kPayloadOffset);
+    std::printf("mode              : %s, transform %s\n",
+                echo_on ? "echo (latency; sender is serialised)"
+                        : "streaming (throughput)",
+                fft_on ? "on" : "OFF (echo calibration, measures the paths only)");
 
     // ── poison, generated once ───────────────────────────────────────────
     SignalConfig poison_cfg;
@@ -385,10 +467,24 @@ int main(int argc, char** argv) {
             const unsigned char* dp =
                 stock ? stock_device_ptr(reinterpret_cast<const unsigned char*>(p), n)
                       : d_pool + wslot * slot_bytes;
-            fft.execute(reinterpret_cast<const float*>(dp + kPayloadOffset), d_out);
-            CUDA_OK(cudaEventRecord(consumed, fft.stream()));
-            CUDA_OK(cudaEventSynchronize(consumed));
-            grpc_direct_request_destroy(a);
+            if (fft_on) {
+                fft.execute(reinterpret_cast<const float*>(dp + kPayloadOffset), d_out);
+                CUDA_OK(cudaEventRecord(consumed, fft.stream()));
+                CUDA_OK(cudaEventSynchronize(consumed));
+            }
+            // The warmup has to ack too.  In echo mode the sender blocks on a
+            // reply for every message including the warmup ones, so a warmup
+            // that stayed silent would deadlock on message zero and look like a
+            // fabric problem.
+            if (echo_on) {
+                const auto* wh = reinterpret_cast<const ExtFrameHeader*>(p);
+                if (!echo_ack(a, wh->seq, npts, fft_on)) {
+                    std::fprintf(stderr, "FATAL: warmup ack failed at %d\n", m);
+                    return 2;
+                }
+            } else {
+                grpc_direct_request_destroy(a);
+            }
             if (!stock) grpc_direct_server_slot_requeue(srv, wslot);
         }
         if (stock) {
@@ -417,7 +513,11 @@ int main(int argc, char** argv) {
     if (!csv_path.empty()) {
         csv = std::fopen(csv_path.c_str(), "w");
         if (!csv) { std::perror("fopen"); return 2; }
-        std::fprintf(csv, "seq,slot,bytes,npts,e2e_us,fft_us,peak_hz,expect_hz,ok,gitsha\n");
+        // gap_us goes after ok rather than at the end, so that the existing
+        // field positions the Phase 4 script cuts on (5, 6 and 9) do not move.
+        std::fprintf(csv,
+                     "seq,slot,bytes,npts,e2e_us,fft_us,peak_hz,expect_hz,ok,"
+                     "gap_us,gitsha\n");
     }
 
     // ── the loop ─────────────────────────────────────────────────────────
@@ -428,6 +528,22 @@ int main(int argc, char** argv) {
     float    worst_err_hz = 0.0f, worst_seen_hz = 0.0f, worst_expect_hz = 0.0f;
     std::vector<double> e2e;
     e2e.reserve(msgs);
+
+    // Inter-arrival, measured on this box's clock only.
+    //
+    // This is the cadence the consumer actually sees, and it is the number the
+    // whole pipeline is bounded by. e2e says how long the work takes once a
+    // buffer is in hand; this says how often a buffer arrives. The first is
+    // useless without the second, and reporting only the first is how a 72 us
+    // post-arrival figure got quoted for a path whose buffers arrive every
+    // 2205 us.
+    //
+    // Taken after receive_ext returns, so it is arrival-to-arrival as observed,
+    // not as posted. In streaming mode it is the reciprocal of throughput. In
+    // echo mode it is meaningless, because the sender is waiting for us.
+    std::vector<double> gap;
+    gap.reserve(msgs);
+    double t_prev = 0.0;
 
     for (int m = 0; m < msgs; ++m) {
         const uint8_t* ptr  = nullptr;
@@ -444,6 +560,8 @@ int main(int argc, char** argv) {
             break;
         }
         const double t0 = now_us();
+        if (t_prev > 0.0) gap.push_back(t0 - t_prev);
+        t_prev = t0;
         ++received;
 
         const unsigned char* d_slot = nullptr;
@@ -495,24 +613,45 @@ int main(int argc, char** argv) {
         // must stay adjacent and in this order.
         const float* d_payload =
             reinterpret_cast<const float*>(d_slot + kPayloadOffset);
-        if (frame_ok) fft.execute(d_payload, d_out);
+        if (frame_ok && fft_on) fft.execute(d_payload, d_out);
 
         // ── THE GATE ─────────────────────────────────────────────────────
         // Nothing below may touch the slot until this event has completed, and
         // the re-queue below hands the slot to the NIC.  Currently redundant
         // because execute() blocks; see the header comment for why it is here.
-        CUDA_OK(cudaEventRecord(consumed, fft.stream()));
-        CUDA_OK(cudaEventSynchronize(consumed));
+        if (fft_on) {
+            CUDA_OK(cudaEventRecord(consumed, fft.stream()));
+            CUDA_OK(cudaEventSynchronize(consumed));
+        }
 
         const double t1 = now_us();
         e2e.push_back(t1 - t0);
+
+        // ── THE ACK ──────────────────────────────────────────────────────
+        // Immediately after the gate and before anything else, because
+        // everything else is harness. The sender's clock stops when this
+        // arrives, so any instruction placed above this line is charged to the
+        // transport in the headline number.
+        //
+        // This consumes ar. The verify, poison and re-queue below still run,
+        // and still delay the sender's credit, but they now do so while the ack
+        // is already in flight rather than before it leaves. In the sanctioned
+        // echo configuration verify and poison are both refused at startup, so
+        // what is left between here and the re-queue is a CSV line.
+        if (echo_on) {
+            if (!echo_ack(ar, seq, npts, fft_on && frame_ok)) {
+                std::fprintf(stderr, "\nFATAL: echo ack failed at seq %u\n", seq);
+                std::abort();
+            }
+            ar = nullptr;
+        }
 
         // Everything from here to the re-queue runs outside the timed window
         // and delays the sender's credit.  Correct for a harness, wrong for
         // Phase 4; run with --poison off --verify off there.
         float peak_hz = -1.0f, expect_hz = payload_tone_hz(seq);
         bool  ok = frame_ok;
-        if (frame_ok && verify_on) {
+        if (frame_ok && verify_on && fft_on) {
             auto peaks = fft.detect_peaks(d_out, 3, kSampleRateHz);
             peak_hz    = peaks.empty() ? -1.0f : peaks[0].first;
             const float err = std::fabs(peak_hz - expect_hz);
@@ -538,11 +677,12 @@ int main(int argc, char** argv) {
                         poison.data(), npts * sizeof(float));
 
         if (csv)
-            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%s\n",
+            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%.3f,%s\n",
                          seq, slot, len, npts, t1 - t0, fft.last_exec_us(),
-                         peak_hz, expect_hz, ok ? 1 : 0, git_sha.c_str());
+                         peak_hz, expect_hz, ok ? 1 : 0,
+                         gap.empty() ? 0.0 : gap.back(), git_sha.c_str());
 
-        grpc_direct_request_destroy(ar);
+        if (ar) grpc_direct_request_destroy(ar);
 
         // Hand the slot back. After this instruction the NIC may overwrite it.
         //
@@ -588,6 +728,33 @@ int main(int argc, char** argv) {
                     worst_seen_hz, worst_expect_hz);
     std::printf("e2e p50 / p99     : %.2f / %.2f us  (post-arrival, %zu samples)\n",
                 pct(0.50), pct(0.99), e2e.size());
+
+    // Inter-arrival and the rate it implies.
+    //
+    // Printed next to e2e deliberately, so that the two are read together. A
+    // consumer that finishes in 72 us and is handed a buffer every 2205 us is
+    // idle 97% of the time, and no amount of work on the 72 us changes that.
+    // The duty cycle is spelled out rather than left as an exercise.
+    std::sort(gap.begin(), gap.end());
+    auto gpct = [&](double p) {
+        if (gap.empty()) return 0.0;
+        return gap[static_cast<size_t>(p * (gap.size() - 1))];
+    };
+    const double g50 = gpct(0.50);
+    if (echo_on) {
+        std::printf("inter-arrival     : not meaningful with --echo on "
+                    "(the sender is waiting for us)\n");
+    } else if (g50 > 0.0) {
+        const double mib_s = static_cast<double>(frame_bytes) / g50
+                             * 1e6 / (1024.0 * 1024.0);
+        std::printf("inter-arrival     : %.2f / %.2f us p50/p99  (%zu samples)\n",
+                    g50, gpct(0.99), gap.size());
+        std::printf("sustained rate    : %.0f MiB/s of %zu-byte frames\n",
+                    mib_s, frame_bytes);
+        std::printf("consumer duty     : %.1f%%  (e2e p50 %.2f us of a %.2f us "
+                    "arrival interval)\n",
+                    100.0 * pct(0.50) / g50, pct(0.50), g50);
+    }
     std::printf("pool operations   : %llu alloc, %llu translate, %llu register "
                 "(unchanged since startup: %s)\n",
                 (unsigned long long)guard::allocs, (unsigned long long)guard::xlates,

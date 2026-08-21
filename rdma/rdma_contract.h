@@ -78,4 +78,43 @@ inline size_t ext_frame_bytes(uint32_t n_samples) {
     return kPayloadOffset + static_cast<size_t>(n_samples) * sizeof(float);
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// The echo acknowledgement
+//
+// WHY THIS EXISTS
+// Every latency number in this project so far starts its clock after the data
+// has landed. That is a real window and it was labelled honestly, but it is not
+// the number a system integrator needs, which is how long it takes from the
+// producer deciding to send until the transform is finished. Measuring that
+// across two machines by subtracting one box's clock from the other's does not
+// work here: the PXI's realtime clock is 23.13 seconds ahead of the Spark's,
+// measured by round trip on 2026-08-21, and neither box runs NTP or chrony.
+//
+// So the receiver sends this back after the transform completes, and the sender
+// times the whole span on its own clock. No synchronisation, no offset, no
+// assumption that two oscillators agree. The cost is that the return path is
+// included, which is why a calibration run with --fft off and a tiny --npts
+// measures the return path alone and gets subtracted.
+//
+// WHAT THIS DOES TO THE PIPELINE
+// grpc-direct's RDMA client keeps one pending response in a thread-local slot,
+// so waiting for an ack serialises the sender. Echo mode therefore measures
+// UNLOADED latency, one buffer at a time, with no pipelining. That is the right
+// instrument for latency and the wrong one for throughput. Sustained rate comes
+// from the receiver's inter-arrival gap in a separate streaming run, and the two
+// numbers must never be quoted as if they came from the same run.
+//
+// Sixteen bytes, because the return path is meant to be negligible and a bigger
+// ack would put the thing being measured inside the measurement.
+struct EchoAck {
+    uint32_t magic;      // kEchoMagic
+    uint32_t seq;        // echoes the request's seq, so the sender can check
+                         // that it is timing the reply it thinks it is
+    uint32_t n_samples;  // echoes the request's n_samples
+    uint32_t flags;      // bit 0 = the transform actually ran
+};
+
+inline constexpr uint32_t kEchoMagic   = 0x4b434145u;  // 'EACK'
+inline constexpr uint32_t kEchoFlagFft = 1u;
+
 }  // namespace contract

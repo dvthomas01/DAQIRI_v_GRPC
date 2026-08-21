@@ -4,7 +4,7 @@
 // then calls grpc_direct_client_send in a loop.  Everything interesting happens
 // on the receiver.
 //
-// WHY THIS DOES NOT WAIT FOR RESPONSES
+// WHY THIS DOES NOT WAIT FOR RESPONSES, IN STREAMING MODE
 // grpc_direct_client_send on the RDMA path acquires a send region, copies into
 // it, queues it, and returns.  It does not block on a reply.  So calling it
 // repeatedly without ever calling try_receive gives a streaming producer, and
@@ -18,12 +18,35 @@
 // nothing to free and calling destroy on it would be reasoning about a lifetime
 // that does not exist.
 //
-// ONE COPY HAPPENS HERE, AND THAT IS FINE
+// --ECHO ON, AND WHAT IT COSTS
+// With --echo on the receiver replies sixteen bytes after its transform
+// completes, and this program times the whole span on its own clock.  That is
+// the only way to get a post-to-transform-complete number here, because the two
+// boxes' realtime clocks are 23.13 seconds apart and neither runs NTP, so
+// subtracting one from the other produces a number off by seven orders of
+// magnitude in the wrong direction.
+//
+// The cost is that the same thread-local pending slot means one reply may be
+// outstanding at a time, so waiting for it serialises the sender completely.
+// Echo mode measures UNLOADED latency: one buffer, no pipelining, no queueing.
+// It is not the steady-state latency of a loaded pipeline and it must not be
+// reported next to a throughput number from a streaming run as though the two
+// described the same experiment.  Sustained rate comes from the receiver's
+// inter-arrival gap, in a separate run with --echo off.
+//
+// The return path is inside the measured span, so it is calibrated out: run the
+// receiver with --fft off and a tiny --npts, which measures request-and-return
+// with no work in the middle, and subtract that p50 from the full run's.
+//
+// ONE COPY HAPPENS HERE, AND IT IS NOT FREE
 // The payload is generated into a local buffer and memcpy'd into the send
-// region.  The sender is not the measured side: the window committed to in
-// section 1 of the plan starts when the receiver observes arrival.  Removing
-// this copy would need the send path's zero-copy reserve/commit API and would
-// change nothing we are measuring.
+// region.  At 4 MB that is two host copies of four mebibytes each before a byte
+// reaches the wire: this one, and the library's own copy inside client_send.
+// The first is timed separately as gen_us and the second is inside send_us, so
+// that a send_us of two milliseconds against a 685 us wire time can be
+// attributed rather than guessed at.  It was previously described here as fine
+// because the sender is not the measured side.  That was true of the window we
+// were measuring and false of the pipeline, which is the point of --echo.
 //
 // Build on the PXI:
 //   g++ -O2 -std=c++17 -o extbuf_fft_client extbuf_fft_client.cc signal_gen.cc \
@@ -51,7 +74,9 @@
 #include <thread>
 #include <vector>
 
+using contract::EchoAck;
 using contract::ExtFrameHeader;
+using contract::kEchoMagic;
 using contract::kExtFlagLast;
 using contract::kExtMagic;
 using contract::kPayloadOffset;
@@ -75,17 +100,25 @@ static void usage() {
         "  --pace-us N    sleep between sends; 0 = as fast as credit allows\n"
         "  --warmup  N    messages sent before timing starts (default 20)\n"
         "  --linger-ms N  wait before teardown so in-flight sends drain\n"
-        "                 (default 200)\n");
+        "                 (default 200)\n"
+        "  --echo    on|off  wait for the receiver's ack after every message\n"
+        "                 and time post-to-transform-complete on this box's\n"
+        "                 clock (default off). The receiver must be run with\n"
+        "                 --echo on too. Serialises the sender, so the result\n"
+        "                 is unloaded latency, not pipeline latency.\n"
+        "  --csv     PATH per-message CSV: seq,gen_us,send_us,rtt_us\n");
 }
 
 int main(int argc, char** argv) {
     std::string host = "192.168.20.1";
+    std::string csv_path;
     uint32_t    port    = 18800;
     int         npts    = 4096;
     int         msgs    = 200;
     int         pace_us = 0;
     int         warmup  = 20;
     int         linger_ms = 200;
+    bool        echo_on = false;
 
     for (int i = 1; i < argc; ++i) {
         std::string a = argv[i];
@@ -100,6 +133,8 @@ int main(int argc, char** argv) {
         else if (a == "--pace-us") pace_us = std::stoi(next());
         else if (a == "--warmup")  warmup = std::stoi(next());
         else if (a == "--linger-ms") linger_ms = std::stoi(next());
+        else if (a == "--echo")    echo_on = (next() == "on");
+        else if (a == "--csv")     csv_path = next();
         else { usage(); return 1; }
     }
 
@@ -144,52 +179,128 @@ int main(int argc, char** argv) {
     // receiver has not given back a slot. Reported separately from anything
     // else, because folding it into a latency figure would misrepresent both
     // this arm and the shmem arm, which drops rather than blocks.
-    std::vector<double> send_us;
+    //
+    // gen_us is separated from it so that the sender's own copy is visible.
+    // send_us contains the library's copy into the send region; gen_us contains
+    // ours into the frame. At 4 MB neither is small, and until they were split
+    // out a send_us of 2100 us was being read as fabric time.
+    std::vector<double> send_us, gen_us, rtt_us;
     send_us.reserve(msgs);
-    uint64_t failed = 0;
+    gen_us.reserve(msgs);
+    rtt_us.reserve(msgs);
+    uint64_t failed = 0, bad_ack = 0;
+
+    std::FILE* csv = nullptr;
+    if (!csv_path.empty()) {
+        csv = std::fopen(csv_path.c_str(), "w");
+        if (!csv) { std::perror("fopen"); return 2; }
+        std::fprintf(csv, "seq,gen_us,send_us,rtt_us\n");
+    }
+
     const double t_start = now_us();
 
     for (int m = 0; m < msgs; ++m) {
         const uint32_t seq = static_cast<uint32_t>(m);
+
+        const double g0 = now_us();
         hdr->magic     = kExtMagic;
         hdr->seq       = seq;
         hdr->n_samples = static_cast<uint32_t>(npts);
         hdr->flags     = (m == msgs - 1) ? kExtFlagLast : 0u;
         std::memcpy(pay, signals[seq % 16].data(), npts * sizeof(float));
+        const double g1 = now_us();
 
         const double s0 = now_us();
         GrpcDirectPendingResponse* p =
             grpc_direct_client_send(cli, frame.data(), frame_bytes);
         const double s1 = now_us();
-        (void)p;  // see the header comment: nothing to free on the RDMA path
 
         if (!p) {
             ++failed;
             std::fprintf(stderr, "  send failed at seq %u\n", seq);
             break;
         }
-        if (m >= warmup) send_us.push_back(s1 - s0);
+
+        // In streaming mode there is nothing to free: see the header comment.
+        // In echo mode the wait consumes the handle, and the span from s0 to
+        // here is the whole point of the run.
+        double rtt = 0.0;
+        if (echo_on) {
+            const uint8_t* resp = nullptr;
+            size_t         rlen = 0;
+            if (grpc_direct_client_wait_receive(p, &resp, &rlen) != 0) {
+                ++failed;
+                std::fprintf(stderr, "  no ack for seq %u\n", seq);
+                break;
+            }
+            const double s2 = now_us();
+            rtt = s2 - s0;
+
+            // An ack for the wrong message would silently produce a latency for
+            // a transform that has not happened yet, which is the same class of
+            // error the spectral check exists to catch on the other side. It
+            // replaces that check in echo mode, so it is not optional.
+            if (rlen < sizeof(EchoAck)) {
+                ++bad_ack;
+                std::fprintf(stderr, "  ack too short at seq %u: %zu bytes\n",
+                             seq, rlen);
+            } else {
+                EchoAck ack;
+                std::memcpy(&ack, resp, sizeof(ack));
+                if (ack.magic != kEchoMagic || ack.seq != seq) {
+                    ++bad_ack;
+                    std::fprintf(stderr,
+                                 "  ack mismatch at seq %u: magic %08x seq %u\n",
+                                 seq, ack.magic, ack.seq);
+                }
+            }
+        } else {
+            (void)p;  // see the header comment: nothing to free on the RDMA path
+        }
+
+        if (m >= warmup) {
+            gen_us.push_back(g1 - g0);
+            send_us.push_back(s1 - s0);
+            if (echo_on) rtt_us.push_back(rtt);
+            if (csv)
+                std::fprintf(csv, "%u,%.3f,%.3f,%.3f\n", seq, g1 - g0, s1 - s0, rtt);
+        }
         if (pace_us > 0)
             std::this_thread::sleep_for(std::chrono::microseconds(pace_us));
     }
 
     const double t_total = now_us() - t_start;
+    if (csv) std::fclose(csv);
 
-    std::sort(send_us.begin(), send_us.end());
-    auto pct = [&](double p) {
-        if (send_us.empty()) return 0.0;
-        return send_us[static_cast<size_t>(p * (send_us.size() - 1))];
+    auto pct_of = [](std::vector<double>& v, double p) {
+        if (v.empty()) return 0.0;
+        return v[static_cast<size_t>(p * (v.size() - 1))];
     };
     double sum = 0.0;
     for (double v : send_us) sum += v;
+    std::sort(send_us.begin(), send_us.end());
+    std::sort(gen_us.begin(), gen_us.end());
+    std::sort(rtt_us.begin(), rtt_us.end());
 
     std::printf("sent              : %llu of %d (%llu failed)\n",
                 (unsigned long long)(msgs - failed), msgs,
                 (unsigned long long)failed);
+    std::printf("frame build p50   : %.2f us  (our memcpy of %zu bytes, "
+                "not on the wire)\n",
+                pct_of(gen_us, 0.50), frame_bytes);
     std::printf("send call p50/p99 : %.2f / %.2f us  (%zu timed, %d warmup skipped)\n",
-                pct(0.50), pct(0.99), send_us.size(), warmup);
+                pct_of(send_us, 0.50), pct_of(send_us, 0.99), send_us.size(),
+                warmup);
     std::printf("blocked in send   : %.1f us total, %.1f%% of wall time\n",
                 sum, t_total > 0 ? 100.0 * sum / t_total : 0.0);
+    if (echo_on) {
+        std::printf("echo rtt p50/p99  : %.2f / %.2f us  "
+                    "(post to transform-complete, this box's clock, UNLOADED)\n",
+                    pct_of(rtt_us, 0.50), pct_of(rtt_us, 0.99));
+        std::printf("bad acks          : %llu\n", (unsigned long long)bad_ack);
+        std::printf("  subtract a --fft off calibration run's rtt p50 to remove "
+                    "the return path.\n");
+    }
     std::printf("wall              : %.1f us\n", t_total);
 
     // Wait before tearing the session down.  client_send returns once the
@@ -211,6 +322,7 @@ int main(int argc, char** argv) {
         std::this_thread::sleep_for(std::chrono::milliseconds(linger_ms));
 
     grpc_direct_client_destroy(cli);
-    std::printf("DONE_EXTBUF_CLIENT rc=%d\n", failed ? 1 : 0);
-    return failed ? 1 : 0;
+    const int rc = (failed || bad_ack) ? 1 : 0;
+    std::printf("DONE_EXTBUF_CLIENT rc=%d\n", rc);
+    return rc;
 }
