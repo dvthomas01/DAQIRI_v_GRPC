@@ -133,7 +133,17 @@ at line 200 with identical semantics.
 **If you read only one more thing, read section 1.** Five of this project's headline numbers
 turned out to be measurement artifacts or overreaches rather than results, and all five were
 caught late. Sections 5, 7c and 7g contain the retractions. **7g retracts part of 7c**, so read
-them as a pair or not at all.
+them as a pair or not at all. **7i is the sixth**, and it is the largest: the sender's 2205 us
+stall was the receiver's own spectral check holding the slot, and removing it is worth 3.18x.
+
+**The pipeline now has a transport number, and it did not before (7i).** Every latency figure
+in this document above section 7i starts its clock after the data has landed. That was
+deliberate and labelled, but it means none of them bounded the pipeline. Post-to-FFT-complete
+from the PXI at 4 MiB is about **1364 us unloaded**, measured by round-trip echo on the sender's
+single clock because the two boxes' realtime clocks differ by 23.13 seconds and neither runs
+NTP. Sustained, with the receiver's verification moved out of the credit window, the path runs
+at **4983 MiB/s, 85 percent of line rate**, up from 27 percent. Slot depth is closed negative.
+What limits it now is the sender's own CPU doing two 4 MiB host memcpys per message.
 
 ### Where to look for what
 
@@ -146,7 +156,8 @@ them as a pair or not at all.
 | 7c | `cudaHostAlloc` versus `cudaHostRegister`. **Scope narrowed by 7g. Do not quote alone.** |
 | 7d | The RoCE-into-`cudaHostAlloc` design, the four gates, and the machine state that dies on reboot |
 | 7g | What the 10.94 us actually belongs to, and why it does not transfer to RDMA |
-| 7h | The 4 MB Phase 4 cell: the two provenances measured in the real receiver |
+| 7h | The 4 MB Phase 4 cell: the two provenances measured in the real receiver. **Its throughput and blocked-send figures are contaminated; see 7i.** |
+| 7i | The transport number, the 3.18x from moving verification out of the credit window, slot depth closed negative, and the sender's CPU as the new bound |
 
 ## 1. How to measure on this box (read this before you run anything)
 
@@ -1265,6 +1276,144 @@ blocked in the sender against a 686 us wire time. Shmem at 4 MB also lost nothin
 16 KB where it drops 14 percent paced and 71 percent unpaced. Delivered count and blocked-send
 time are separate columns and must never be combined.
 
+> **The blocked-send figure in that last paragraph is contaminated, and 7i explains how.**
+> This cell ran with `--verify every`, which puts a spectral peak search between the transform
+> and the slot re-queue. The sender was blocked because the receiver was verifying, not because
+> the fabric was busy. The e2e and cuFFT columns above are unaffected, because they stop before
+> the verify begins, so the two-provenance result stands. **The throughput and back-pressure
+> figures from this cell are not representative of the path and should not be quoted.**
+
+## 7i. The transport was never being measured, and the sender's stall was ours (2026-08-21)
+
+Every latency number this project produced before today starts its clock **after** the data has
+landed. That was deliberate and it was labelled honestly, because the question at the time was
+where the GPU's time goes. It was never revisited when the question changed to why DAQiri is
+faster, and by then the window being reported was a small slice of the pipeline it was being
+read as.
+
+| Benchmark | `e2e` timer starts | measures the wire |
+|---|---|---|
+| `rdma/extbuf_fft_server.cu` | after `grpc_direct_server_receive_ext()` returns | no |
+| `daqiri/bench_daqiri_pipeline.cc` | after the burst is parsed | no, `wire_latency_us` is hardcoded 0 |
+| `daqiri/bench_daqiri_roce_pipeline.cc` | after the RDMA completion | no |
+| `grpc_direct/bench_grpc_server.cc` | after `reader->Read()` | yes, line 232, via `send_timestamp_ns` |
+
+Two other things fell out of the same audit and should be recorded before they are rediscovered.
+The cuFFT **output** goes to `cudaMalloc`'d device memory in all four benchmarks with no
+device-to-host copy anywhere, inside or outside the timed region, so that hypothesis is closed
+negative. The cuFFT **input** does not: the extbuf receiver transforms `cudaHostAlloc(Mapped)`
+host memory, while the gRPC and DAQiri paths transform `cudaMalloc`'d device memory after a
+host-to-device copy. `fft_p50` is therefore not the same operation across paths and must not be
+compared across them without saying so. Both DAQiri benchmarks are also **single-process
+loopback**, both endpoints on the same address, while the extbuf RDMA arm is genuinely
+cross-machine, so the headline comparison has been loopback against wire.
+
+### The instruments
+
+Two of them, for two different quantities, from two different runs. `scripts/transport_cell.sh`
+drives both. They must not appear in the same table row.
+
+**Echo, on the sender's clock alone.** The PXI timestamps before it posts, the Spark transforms
+and replies with a 16-byte ack, the PXI timestamps the reply. This cannot be done by
+differencing wall clocks: the PXI's realtime clock is **23.13 seconds ahead** of the Spark's,
+measured by round trip, and neither box runs NTP or chrony. The ack is sent immediately after
+the transform's gate and before anything else, so any instruction placed above it would be
+charged to the transport. `--echo on` **refuses to start** with `--poison on` or
+`--verify every`, because both sit between the gate and the ack and would land inside the
+interval the sender is timing. Refused rather than warned about, since a warning in a log is a
+warning nobody reads before quoting the number.
+
+**Inter-arrival, on the receiver's clock alone**, from a separate streaming run, reported next
+to the sustained rate and the consumer duty cycle so the three are read together.
+
+### Result 1: post to FFT-complete, 4 MiB
+
+The calibration arm runs the same round trip with `--fft off` at 64 points, so it measures the
+request-and-return path with no work in the middle. Subtracted paired per rep.
+
+| rep | echo rtt p50 (us) | calibration rtt p50 (us) | difference (us) |
+|---|---|---|---|
+| 1 | 1379.05 | 109.39 | 1269.7 |
+| 2 | 1438.43 | 23.47 | 1415.0 |
+| 3 | 1390.98 | 26.76 | 1364.2 |
+
+Three of three positive. Median about **1364 us**. `data/transport_cell_1048576_s4.csv`.
+
+**Two caveats, both load-bearing.** First, waiting for the ack serialises the sender, because
+the RDMA pending response is a thread-local slot that the next send overwrites. This is
+therefore **unloaded latency**, the cost of one message with nothing else in flight, and it is
+not the cost per message under load. Throughput has to come from the streaming arm. Second,
+**rep 1's calibration is an outlier**, 109 us against 23 and 27, so that row's difference is the
+weakest of the three. The other two agree to within 51 us.
+
+The clock starts at the send call, not at frame construction, so the 487 us the sender spends
+building the frame is outside this number.
+
+### Result 2: the sender's 2205 us stall was our own verification
+
+Phase 4's 4 MB cell recorded the sender blocked about 2205 us per buffer against a 685 us wire
+time. That was read as a fabric or depth problem for weeks. It was neither.
+
+The instrument that found it is `hold_us`, measured on the receiver from the transform's gate
+completing to `grpc_direct_server_slot_requeue` returning. `detect_peaks` runs inside that
+window. For two and a half milliseconds a slot the NIC could be refilling is sitting in a peak
+search, and the sender blocks in `AcquireSendRegion` for exactly that long and reports it as
+send time. `rq_us`, the re-queue call itself, is 1 to 8 us throughout and was never a candidate.
+
+Paired per rep, 4 MiB, 1000 measured messages, three reps, arms rotated.
+`data/tc_verifycost_1048576_s4.csv`.
+
+| arm | send p50 (us) | hold p50 (us) | gap p50 (us) | MiB/s |
+|---|---|---|---|---|
+| `stream` (`--verify every`) | 2090.71 | 2488.58 | 2561.85 | 1561 |
+| `stream-nv` (`--verify off`) | 340.56 | 11.54 | 812.13 | 4925 |
+| `stream` | 2070.10 | 2480.34 | 2553.49 | 1566 |
+| `stream-nv` | 331.83 | 12.05 | 776.45 | 5149 |
+| `stream` | 2250.71 | 2666.04 | 2743.11 | 1458 |
+| `stream-nv` | 345.44 | 13.71 | 820.58 | 4875 |
+
+Three of three, no overlap between the arms, **3.18x on the median**. 4983 MiB/s against the
+5843 MiB/s Gate 3 measured with `ib_write_lat`, so **85 percent of the link where it had been
+27 percent**.
+
+`rdma/extbuf_fft_server.cu` already carried the comment that verification belongs outside the
+credit window and that Phase 4 should run with `--verify off`. `scripts/phase4_cell.sh:193`
+passed `--verify every`. The two files disagreed in the repository for a month and nothing
+reconciled them, which is why the server now refuses the combination outright rather than
+relying on the caller to remember. **Every throughput and blocked-send figure from the Phase 4
+cell is contaminated by this and should not be quoted.** The latency columns from that cell are
+not, because they stop at the gate.
+
+### Result 3: slot depth is innocent, closed by measurement
+
+`stream-nv` at 2, 4, 8 and 16 slots, three reps each. `data/transport_cell_1048576_s{2,4,8,16}.csv`.
+
+| slots | MiB/s |
+|---|---|
+| 2 | 4785, 5030, 4975 |
+| 4 | 4925, 5149, 4875 |
+| 8 | 5017, 4986, 5009 |
+| 16 | 5027, 4942, 4977 |
+
+One distribution. Depth was the most attractive of the four candidates because it would have
+been a one-line fix with a large effect, and it is worth recording that it was wrong. Two slots
+is enough, which also means the release-before-completion race matters at the depth the pipeline
+actually needs.
+
+### Result 4: what bounds it now is the sender's CPU
+
+`gen_p50` 468 us plus `send_p50` 335 us is 803 us of single-threaded host memcpy against a
+`gap_p50` of 800 us. There is no time left over for anything else to be the bottleneck. The PXI
+copies 4 MiB **twice** per message: once in `extbuf_fft_client.cc` building the frame, and once
+inside `grpc_direct_client_send`, which copies the frame into the send region. About 10 GB/s
+each, which is an ordinary single-threaded memcpy rate.
+
+This matters for how the result is framed. **The receive path sustains 85 percent of line rate,
+and what limits the run is a synthetic sender doing work a real digitizer would not do**, namely
+manufacturing a waveform in host memory and then handing it to a library that copies it again.
+That framing is worth confirming by measurement rather than asserting, which is the next
+experiment.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build
@@ -1387,15 +1536,30 @@ list they came from is what a reader would otherwise reconstruct.
    cell needs re-running with four arms. `scripts/phase4_cell.sh`, `NPTS=4096` and
    `NPTS=1048576`. Note the warmup formula asks for roughly 893,000 messages at 16 KB to reach
    four seconds of traffic, which is legitimate but worth a wall-clock sanity check first.
-5. **The release-before-completion race, step 6.** Correctness, not performance, so it is worth
-   doing regardless of which mechanism won. The gate is already in the right place in the
-   receiver, so the diff should only touch the launch. Demonstrate corruption at 16 KB with 2
-   slots, where the window arithmetic says it reproduces: one arrival is about 4.5 us, so with
-   2 slots the window is about 9 us against a measured ~8 us `fft_p50`. At 4 MB one arrival is
-   694.76 us and the window is about 1.39 ms, so it will not reproduce naturally. **Write the
-   4 MB case up with the arithmetic rather than widening the window with artificial GPU work**,
-   which would weaken the demonstration rather than strengthen it. Failing test first.
-6. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
+   **Its throughput columns must be re-collected with `--verify off`; see 7i.**
+5. ~~**The release-before-completion race, step 6.**~~ **Dropped by decision, 2026-08-21.** It is
+   a correctness property that can be described analytically, and 7i showed the depth arithmetic
+   it rested on is the depth the pipeline actually runs at, so the argument is stronger on paper
+   than the demonstration would have been with the calendar available. The window arithmetic is
+   preserved in the struck text below rather than deleted.
+
+   ~~Demonstrate corruption at 16 KB with 2 slots, where the window arithmetic says it
+   reproduces: one arrival is about 4.5 us, so with 2 slots the window is about 9 us against a
+   measured ~8 us `fft_p50`. At 4 MB one arrival is 694.76 us and the window is about 1.39 ms,
+   so it will not reproduce naturally. Write the 4 MB case up with the arithmetic rather than
+   widening the window with artificial GPU work.~~
+6. **Generate in place on the sender.** This is the current bottleneck and the highest-value
+   experiment left. 7i shows the PXI spends 803 us per 4 MiB message in two host memcpys against
+   an 800 us arrival interval, so the sender is the whole limit. Removing one of the two copies
+   should move the number a long way. It also decides how the headline is framed: whether the
+   85 percent of line rate is bounded by a synthetic sender doing work a digitizer would not do,
+   which is currently an assertion rather than a measurement.
+7. **DAQiri cross-machine.** Both DAQiri benchmarks are single-process loopback with both
+   endpoints on the same address, while the extbuf RDMA arm is genuinely PXI to Spark, so the
+   standing comparison is loopback against wire. Fixing it means splitting
+   `daqiri/bench_daqiri_roce_pipeline.cc` into real client and server roles, which is real work
+   rather than a flag.
+8. **Attack the residual floor.** We sit near 5.5 to 6.7 us against DAQiri's 4.9. Worth 0.3 to
    1.7 us, smaller than the above but fully ours. `--opt-stream` took the easy part; what is
    left is per-message CUDA event record/query overhead and metrics bookkeeping. Consider
    whether both events per buffer are needed.

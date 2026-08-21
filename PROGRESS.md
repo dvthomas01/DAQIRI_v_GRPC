@@ -1,6 +1,9 @@
 # PROGRESS — DAQiri GPU FFT Pipeline
 **Project:** NVIDIA DAQiri → GPU FFT Benchmark  
-**Updated:** 2026-08-20 (Phase 7 complete. **Phase 1 (the flag experiment) is negative**: no `cudaHostRegister` flag recovers any part of the penalty, and the penalty turns out not to exist below about 1 MB, so the 10.94 µs figure only ever meant 10.94 µs **at 4 MB**. **Phase 2 (the minimal RDMA data path) passes**: 31,800 messages from the PXI landed in a `cudaHostAlloc`'d pool on the Spark and were spectrally verified, with zero completion errors and nothing allocated or registered after startup. The deliberately-broken-ordering control was run *first* and fails as required, which is what makes the green runs mean anything. Next is Phase 3, integration into the Rust transport. The Spark went off the network briefly and is back at the same address; both machines are up and the RoCE fabric is verified end to end. **The PXI's undocumented copy of `grpc-direct` has been audited against upstream**: 125 of 127 files are byte-identical to `ni/grpc-direct` HEAD `2d404a5`, the only modified source file is `src/lib.rs` at +529/-31, and the four `lib.rs.bak` snapshots were hiding nothing.)
+**Updated:** 2026-08-21 (**The pipeline has a transport number for the first time, and the sender's stall turned out to be ours.** Every latency figure this project produced before today started its clock after the data had landed. Post-to-FFT-complete from the PXI at 4 MiB is now measured at about **1364 µs unloaded**, by round-trip echo on the sender's single clock, because the two boxes' realtime clocks differ by 23.13 seconds and neither runs NTP. The 2205 µs the sender spent blocked per 4 MiB buffer was **the receiver's own spectral check holding the slot between the transform and the re-queue**: moving it out is worth **3.18x**, taking the path from 27 percent of line rate to **85 percent**. Slot depth is closed negative, 2 through 16 slots are one distribution. What limits it now is the sender's own CPU doing two 4 MiB host memcpys per message. Phase 4's cell ran with verification on, so **its throughput and blocked-send figures are contaminated and must not be quoted**; its latency columns are unaffected. handoff.md §7i.)
+
+<!-- historical header line -->
+**Previously:** 2026-08-20 (Phase 7 complete. **Phase 1 (the flag experiment) is negative**: no `cudaHostRegister` flag recovers any part of the penalty, and the penalty turns out not to exist below about 1 MB, so the 10.94 µs figure only ever meant 10.94 µs **at 4 MB**. **Phase 2 (the minimal RDMA data path) passes**: 31,800 messages from the PXI landed in a `cudaHostAlloc`'d pool on the Spark and were spectrally verified, with zero completion errors and nothing allocated or registered after startup. The deliberately-broken-ordering control was run *first* and fails as required, which is what makes the green runs mean anything. Next is Phase 3, integration into the Rust transport. The Spark went off the network briefly and is back at the same address; both machines are up and the RoCE fabric is verified end to end. **The PXI's undocumented copy of `grpc-direct` has been audited against upstream**: 125 of 127 files are byte-identical to `ni/grpc-direct` HEAD `2d404a5`, the only modified source file is `src/lib.rs` at +529/-31, and the four `lib.rs.bak` snapshots were hiding nothing.)
 
 > **This file is committed.** It used to be gitignored while three tracked documents pointed
 > readers at it, which made it a handoff artifact nobody outside this machine could read. See
@@ -64,6 +67,11 @@
 | P2 | Minimal RDMA data path, PXI → Spark → cuFFT, spectrally verified | **COMPLETE — PASSING** | `7a49963`. 1800 verified over nine sizes + 30000 in soak, 0 CQ errors, 0 timeouts |
 | P2-ctrl | Deliberately-broken ordering must FAIL the verification | **COMPLETE — FAILS AS REQUIRED** | 59/60 wrong, reporting the 400 kHz poison tone. Ran *before* the real implementation. One 16 KB message in 20 passed anyway, so the test's sensitivity is size-dependent |
 | P3 | Integrate into the Rust `grpc-direct` transport | **IN PROGRESS** | Scoping in `rdma_transport_plan.md` §6. Fork audited against upstream (§6.5). **Gate 5 PASSED** 17/17, 3 reps (§6.4): easyrdma accepts a `cudaHostAlloc` pool and the GPU reads the received bytes in place. Next: bind the FFI |
+| P5 | Measure the transport, not just what happens after it | **COMPLETE** | `0f6c278`, `b8cdbe2`, `8912ac7`. Round-trip echo on the sender's single clock, plus receiver-side inter-arrival. Post-to-FFT-complete at 4 MiB ≈ **1364 µs unloaded**, 3/3, calibration subtracted paired. handoff.md §7i |
+| P5b | Diagnose the sender's 2205 µs stall | **COMPLETE — IT WAS OURS** | `detect_peaks` ran between the transform's gate and `slot_requeue`, holding the slot 2488 µs. `--verify off`: hold 2488→12 µs, **1561→4925 MiB/s, 3.18x, 3/3, no overlap**. 85 % of line rate, was 27 % |
+| P5c | Is four slots enough depth? | **COMPLETE — NEGATIVE** | 2, 4, 8 and 16 slots all land 4785–5149 MiB/s. One distribution. The most attractive candidate and the wrong one |
+| P5d | Generate in place on the sender | **NEXT** | The new bound: `gen_p50` 468 + `send_p50` 335 = 803 µs of host memcpy against an 800 µs arrival interval. The PXI copies 4 MiB twice per message |
+| P6 | Release-before-completion race | **DROPPED** | Analytic property, and P5c showed the pipeline runs fine at the depth where the race is describable. Window arithmetic preserved in handoff.md §10 |
 
 **Note on this file's status.** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md`
 were in `.gitignore` under "personal / local-only docs" while `handoff.md`,
@@ -75,6 +83,66 @@ anyone else.
 ---
 
 ## Results Log
+
+### Phase 5 — the transport number, and the stall we were causing ourselves (2026-08-21, commits `0f6c278`, `b8cdbe2`, `8912ac7`)
+
+Full writeup in `handoff.md` §7i. Driver `scripts/transport_cell.sh`, arms `echo`, `echo-cal`,
+`stream`, `stream-nv`.
+
+**Why the instrument had to be a round trip.** The PXI's realtime clock is 23.13 seconds ahead
+of the Spark's and neither box runs NTP or chrony, so differencing wall clocks across the two
+machines is worthless. The sender timestamps before it posts, the receiver acks 16 bytes
+immediately after the transform's gate, the sender timestamps the ack. One clock throughout.
+A calibration arm runs the same round trip with `--fft off` at 64 points and is subtracted
+paired per rep.
+
+| rep | echo rtt p50 (µs) | calibration (µs) | difference (µs) |
+|---|---|---|---|
+| 1 | 1379.05 | 109.39 | 1269.7 |
+| 2 | 1438.43 | 23.47 | 1415.0 |
+| 3 | 1390.98 | 26.76 | 1364.2 |
+
+Median ≈ **1364 µs**, 3/3 positive. **Two caveats.** Waiting for the ack serialises the sender,
+so this is *unloaded* latency and not the per-message cost under load. And rep 1's calibration
+is an outlier at 109 µs against 23 and 27, so that row is the weakest of the three.
+
+**The 2205 µs was the harness verifying inside the credit window.** New receiver instrument
+`hold_us` measures from the transform's gate completing to `slot_requeue` returning.
+`detect_peaks` runs in that gap, so the slot the NIC could be refilling sits in a peak search
+and the sender blocks in `AcquireSendRegion` for exactly that long, then reports it as send
+time. `rq_us`, the re-queue call itself, is 1–8 µs and was never a candidate.
+
+| arm | send p50 | hold p50 | gap p50 | MiB/s |
+|---|---|---|---|---|
+| `stream` (`--verify every`) | 2090.71 | 2488.58 | 2561.85 | 1561 |
+| `stream-nv` (`--verify off`) | 340.56 | 11.54 | 812.13 | 4925 |
+| `stream` | 2070.10 | 2480.34 | 2553.49 | 1566 |
+| `stream-nv` | 331.83 | 12.05 | 776.45 | 5149 |
+| `stream` | 2250.71 | 2666.04 | 2743.11 | 1458 |
+| `stream-nv` | 345.44 | 13.71 | 820.58 | 4875 |
+
+3/3, no overlap, **3.18x**. 4983 MiB/s against the 5843 Gate 3 measured, so **85 percent of the
+link where it had been 27**. `rdma/extbuf_fft_server.cu` already said Phase 4 needed
+`--verify off`; `scripts/phase4_cell.sh:193` passed `--verify every`. The two files disagreed
+in the repository for a month. The server now refuses the combination rather than trusting the
+caller to remember.
+
+**Slot depth is innocent.** `stream-nv` at 2/4/8/16 slots: 4785–5030, 4875–5149, 4986–5017,
+4942–5027 MiB/s. One distribution. This was the most attractive of the four candidates because
+it would have been a one-line fix with a large effect, and it was wrong.
+
+**The new bound is the sender's CPU.** `gen_p50` 468 µs plus `send_p50` 335 µs is 803 µs of
+single-threaded host memcpy against a `gap_p50` of 800 µs. The PXI copies 4 MiB twice per
+message, once building the frame and once inside `grpc_direct_client_send`. So the receive path
+sustains 85 percent of line rate and the limit is a synthetic sender doing work a real digitizer
+would not do. That framing is currently an assertion and the next experiment is to measure it.
+
+**Two side findings from the same audit.** The cuFFT *output* is `cudaMalloc`'d device memory in
+all four benchmarks with no device-to-host copy anywhere, so that hypothesis is closed negative.
+The cuFFT *input* is not the same across paths: extbuf transforms `cudaHostAlloc(Mapped)` host
+memory while gRPC and DAQiri transform device memory after an H2D copy, so `fft_p50` is
+confounded across paths. Both DAQiri benchmarks are also single-process loopback while the
+extbuf RDMA arm is genuinely cross-machine.
 
 ### Phase 2 — the RDMA data path works, and the checker was validated first (2026-08-20, commit `7a49963`)
 

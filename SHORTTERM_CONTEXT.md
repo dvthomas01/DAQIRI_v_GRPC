@@ -1,9 +1,62 @@
 # Short-Term Context — Active Sprint
-**Phase:** RDMA transport for gRPC-Direct — Phase 3, integration into the Rust library
-**Branch:** `grpc-direct-optimization` @ `7a49963`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
-**Updated:** 2026-08-20
+**Phase:** RDMA transport for gRPC-Direct — measuring the transport itself
+**Branch:** `grpc-direct-optimization` @ `8912ac7`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
+**Updated:** 2026-08-21
 
 > **This file is committed now.** It was gitignored while tracked documents pointed at it.
+
+---
+
+## THE HEADLINE, 2026-08-21: we were never measuring the transport, and the stall was ours
+
+Full writeup in `handoff.md` §7i. Three findings, all of which change conclusions this project
+had already written down.
+
+**1. There is a transport number now, and it is about 1364 µs.** Every latency figure before
+today started its clock *after* the data had landed. Post-to-FFT-complete from the PXI at
+4 MiB, measured by round-trip echo, is 1269.7 / 1415.0 / 1364.2 µs across three reps with the
+calibration arm subtracted paired. Median about **1364 µs**, three of three.
+
+It had to be a round trip. The PXI's realtime clock is **23.13 seconds ahead** of the Spark's
+and neither box runs NTP or chrony, so differencing wall clocks across the two machines
+produces nothing. The sender timestamps before it posts, the receiver acks 16 bytes immediately
+after the transform's gate, the sender timestamps the ack. One clock throughout.
+
+**Two caveats that must travel with the number.** Waiting for the ack serialises the sender,
+because the RDMA pending response is a thread-local slot the next send overwrites, so this is
+**unloaded** latency and not the per-message cost under load. And rep 1's calibration is an
+outlier, 109 µs against 23 and 27, so that row's difference is the weakest of the three.
+
+**2. The sender's 2205 µs stall was the receiver's own spectral check.** `detect_peaks` runs
+between the transform's gate and `grpc_direct_server_slot_requeue`, so for two and a half
+milliseconds a slot the NIC could be refilling is sitting in a peak search. The sender blocks in
+`AcquireSendRegion` for exactly that long and reports it as send time. Turning it off:
+
+| arm | hold p50 (µs) | send p50 (µs) | gap p50 (µs) | MiB/s |
+|---|---|---|---|---|
+| `--verify every` | 2488, 2480, 2666 | 2091, 2070, 2251 | 2562, 2553, 2743 | 1561, 1566, 1458 |
+| `--verify off` | 12, 12, 14 | 341, 332, 345 | 812, 776, 821 | 4925, 5149, 4875 |
+
+Three of three, no overlap, **3.18x**. 4983 MiB/s against the 5843 Gate 3 measured, so **85
+percent of the link where it had been 27**. `rdma/extbuf_fft_server.cu` already carried the
+comment that Phase 4 needs `--verify off`; `scripts/phase4_cell.sh:193` passed `--verify every`.
+The two files disagreed in the repository for a month.
+
+**Consequence for what is already written down: Phase 4's cell ran with verification on, so its
+throughput and blocked-send figures are contaminated and must not be quoted.** Its latency
+columns are unaffected, because they stop at the gate, so the two-provenance result in §7h
+stands.
+
+**3. Slot depth is closed negative, and the sender's CPU is the new bound.** `stream-nv` at
+2, 4, 8 and 16 slots lands between 4785 and 5149 MiB/s, one distribution. Depth was the most
+attractive of the four candidates because it would have been a one-line fix with a large effect,
+and it was wrong. What limits it now is `gen_p50` 468 µs plus `send_p50` 335 µs of
+single-threaded host memcpy against an arrival interval of 800 µs: the PXI copies 4 MiB twice
+per message, once building the frame and once inside `grpc_direct_client_send`.
+
+So the receive path sustains 85 percent of line rate and the limit is a synthetic sender doing
+work a real digitizer would not do. **That framing is currently an assertion, and measuring it
+is the next experiment.**
 
 ---
 
@@ -12,6 +65,14 @@
 It was power-cycled and returned at the same address, 10.198.65.106. Both machines are
 reachable and the RoCE fabric is up end to end. Phase 3 is unblocked. Two lessons from the
 outage are kept below because both are durable.
+
+**Before blaming either box, check the VPN (added 2026-08-21).** Both hosts timed out for an
+hour and both were fine: the Spark reported `up 21:52` when it came back, so it had never gone
+down. This workstation had dropped off the NI network onto home Wi-Fi. Every wired adapter sat
+on a `169.254/16` APIPA address, the only route was a home gateway, and FortiClient was running
+with its tunnel down. One line settles it, and it is cheaper than an ARP sweep:
+`Get-NetIPAddress -AddressFamily IPv4 | ? { $_.IPAddress -notlike '127.*' }`. If nothing is on
+`10.198.65.x`, the VPN is down and no amount of probing the lab will say so.
 
 **Do not trust `ip neigh` without flushing first.** The first check from the PXI showed
 `10.198.65.106 dev eno0 lladdr 4c:bb:47:2e:ac:69 DELAY`, i.e. the Spark's own management MAC,

@@ -1,12 +1,52 @@
 # Long-Term Context — Architectural Reference
 **Project:** DAQiri GPU FFT Pipeline Benchmark  
-**Updated:** 2026-08-20  
+**Updated:** 2026-08-21  
 **Precursor project:** gRPC / gRPC Direct benchmark — all 20 milestones complete 2026-07-08
 
 > **This file is committed now.** It was gitignored while `handoff_roce_2026-08-06.md`,
 > `presentation/HANDOFF.md` and `scripts/find_spark.sh` all pointed readers at it.
 
 ---
+
+## Key findings (measuring the transport, 2026-08-21)
+
+Full writeup in `handoff.md` §7i. These are the durable, transferable parts.
+
+- **A pipeline benchmark that starts its clock after arrival is not measuring the pipeline.**
+  Every latency figure this project produced before today started after
+  `grpc_direct_server_receive_ext()` returned, or after the burst was parsed, or after the RDMA
+  completion. That scoping was deliberate and labelled honestly while the question was where the
+  GPU's time goes. Nobody revisited it when the question became why the other transport is
+  faster. **When the question changes, re-derive what the instrument covers.** One of four
+  benchmarks measured the wire, and only because it happened to carry a `send_timestamp_ns`.
+- **Two machines with no NTP cannot be differenced.** The PXI's realtime clock is 23.13 seconds
+  ahead of the Spark's and neither runs NTP or chrony. Any cross-machine one-way latency taken
+  from wall clocks is fiction. The fix is a **round trip on one clock**: sender timestamps, far
+  side acks a few bytes, sender timestamps again, and a calibration run with the work removed is
+  subtracted paired per rep. This is worth reaching for before trying to synchronise anything.
+- **A round-trip instrument serialises the thing it measures, so it gives unloaded latency and
+  not throughput.** Those are two numbers from two runs and they must not share a table row.
+  State it in the tool's own output rather than in a footnote someone will drop.
+- **A correctness check placed inside the credit window becomes the transport number.** The
+  receiver's spectral verification ran between the transform's gate and the slot re-queue, so
+  the sender blocked in `AcquireSendRegion` for 2.5 ms per buffer and reported it as send time.
+  Read as fabric latency for a month. Removing it is worth 3.18x and takes the path from 27 to
+  **85 percent of line rate**. **In any pipeline where the consumer owns buffer lifetime,
+  instrument gate-to-credit-returned as a first-class column**, because nothing else
+  distinguishes "the network is slow" from "we are holding the buffer".
+- **Two files disagreed about the same flag for a month and nothing caught it.**
+  `rdma/extbuf_fft_server.cu` said Phase 4 must run with `--verify off`; `phase4_cell.sh` passed
+  `--verify every`. A comment cannot enforce anything. The program now refuses the combination.
+  **If a configuration invalidates a measurement, make the binary reject it, not document it.**
+- **The most attractive hypothesis was the wrong one, and closing it by measurement was cheap.**
+  Slot depth would have been a one-line fix with a large effect. 2, 4, 8 and 16 slots are one
+  distribution, 4785 to 5149 MiB/s. Attractiveness is not evidence.
+- **Find the new bottleneck before celebrating the old one.** After the fix, `gen_p50` 468 µs
+  plus `send_p50` 335 µs is 803 µs of single-threaded host memcpy against an 800 µs arrival
+  interval, so the sender's own CPU is now the entire limit. It copies 4 MiB twice per message,
+  once building the frame and once inside the library's send. The honest framing is that the
+  receive path sustains 85 percent of line rate and the limit is a synthetic sender doing work a
+  real digitizer would not do, and that framing is an assertion until it is measured.
 
 ## Key findings (the RDMA transport, 2026-08-20)
 
