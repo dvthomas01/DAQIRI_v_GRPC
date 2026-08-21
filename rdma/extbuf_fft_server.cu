@@ -545,6 +545,21 @@ int main(int argc, char** argv) {
     gap.reserve(msgs);
     double t_prev = 0.0;
 
+    // Credit return, also on this box's clock.
+    //
+    // hold_us is from the transform's gate completing to the re-queue call
+    // returning, which is how long the NIC waits for a slot it could already
+    // have had. rq_us is the re-queue call itself. If the sender is blocked
+    // 2205 us per buffer and hold_us is large, the receiver is the reason and
+    // the fix is on this side. If hold_us is near zero, it is not, and the
+    // question moves to the sender's two host copies or to the depth of the
+    // slot pool.
+    //
+    // Both are outside e2e and always will be: e2e stops at the gate.
+    std::vector<double> hold, rq_us;
+    hold.reserve(msgs);
+    rq_us.reserve(msgs);
+
     for (int m = 0; m < msgs; ++m) {
         const uint8_t* ptr  = nullptr;
         size_t         len  = 0;
@@ -692,11 +707,15 @@ int main(int argc, char** argv) {
         // is safe here only because execute() blocks, which is exactly the
         // hazard step 6 is about.
         if (!stock) {
+            const double r0 = now_us();
             const int32_t rq = grpc_direct_server_slot_requeue(srv, slot);
+            const double r1 = now_us();
             if (rq != 0) {
                 std::fprintf(stderr, "\nFATAL: slot_requeue(%zu) -> %d\n", slot, rq);
                 std::abort();
             }
+            rq_us.push_back(r1 - r0);
+            hold.push_back(r1 - t1);
         }
 
         if (guard::allocs != frozen_allocs || guard::xlates != frozen_xlates ||
@@ -754,6 +773,16 @@ int main(int argc, char** argv) {
         std::printf("consumer duty     : %.1f%%  (e2e p50 %.2f us of a %.2f us "
                     "arrival interval)\n",
                     100.0 * pct(0.50) / g50, pct(0.50), g50);
+    }
+    if (!hold.empty()) {
+        std::sort(hold.begin(), hold.end());
+        std::sort(rq_us.begin(), rq_us.end());
+        auto hp = [&](std::vector<double>& v, double p) {
+            return v[static_cast<size_t>(p * (v.size() - 1))];
+        };
+        std::printf("credit return     : %.2f us p50 gate-to-requeued, "
+                    "%.2f us p50 in the requeue call itself\n",
+                    hp(hold, 0.50), hp(rq_us, 0.50));
     }
     std::printf("pool operations   : %llu alloc, %llu translate, %llu register "
                 "(unchanged since startup: %s)\n",

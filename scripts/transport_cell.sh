@@ -200,6 +200,8 @@ run_one () {
     GEN50=$(awk '/^frame build p50/{print $5; exit}' "$clog")
     SEND50=$(awk '/^send call p50/{print $5; exit}' "$clog")
     MIBS=$(awk '/^sustained rate/{print $4; exit}' "$slog")
+    HOLD50=$(awk '/^credit return/{print $4; exit}' "$slog")
+    RQ50=$(awk '/^credit return/{print $8; exit}' "$slog")
     BADACK=$(awk '/^bad acks/{print $4; exit}' "$clog")
 
     [ -n "${RTT50:-}" ] || RTT50=NA
@@ -207,13 +209,15 @@ run_one () {
     [ -n "${GEN50:-}" ] || GEN50=NA
     [ -n "${SEND50:-}" ] || SEND50=NA
     [ -n "${MIBS:-}" ]  || MIBS=NA
+    [ -n "${HOLD50:-}" ] || HOLD50=NA
+    [ -n "${RQ50:-}" ]  || RQ50=NA
     [ -n "${BADACK:-}" ] || BADACK=0
     [ -n "${G50:-}" ]   || G50=NA
 }
 
 # ── go ───────────────────────────────────────────────────────────────────────
 mkdir -p "$ROOT/data"
-echo "arm,npts,bytes,slots,rep,rtt_p50,rtt_p99,gen_p50,send_p50,e2e_p50,fft_p50,gap_p50,mib_s,n,verified,bad_ack,sm_mhz,result,gitsha" > "$OUT"
+echo "arm,npts,bytes,slots,rep,rtt_p50,rtt_p99,gen_p50,send_p50,e2e_p50,fft_p50,gap_p50,hold_p50,rq_p50,mib_s,n,verified,bad_ack,sm_mhz,result,gitsha" > "$OUT"
 
 echo "transport cell: ${BYTES} bytes (${NPTS} pts), ${SLOTS} slots, $REPS reps, sha $GITSHA"
 echo "  echo    warmup ${ECHO_WARM} then ${ECHO_MSGS} measured, serialised"
@@ -279,7 +283,7 @@ for R in $(seq 1 "$REPS"); do
     printf "%-10s %-4s %-10s %-9s %-9s %-9s %-9s %-8s %-7s %s\n" \
       "$ARM" "$R" "${RTT50}" "${GEN50}" "${SEND50}" "${E50}" "${G50}" \
       "${MIBS}" "${SM:-NA}" "$RES"
-    echo "$ARM,$NPTS,$BYTES,$SLOTS,$R,$RTT50,$RTT99,$GEN50,$SEND50,$E50,$F50,$G50,$MIBS,$N,$VERIF,$BADACK,${SM:-NA},$RES,$GITSHA" >> "$OUT"
+    echo "$ARM,$NPTS,$BYTES,$SLOTS,$R,$RTT50,$RTT99,$GEN50,$SEND50,$E50,$F50,$G50,$HOLD50,$RQ50,$MIBS,$N,$VERIF,$BADACK,${SM:-NA},$RES,$GITSHA" >> "$OUT"
   done
 done
 
