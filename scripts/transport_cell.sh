@@ -255,6 +255,16 @@ for R in $(seq 1 "$REPS"); do
         run_one "$ARM" "$R" "$NPTS" \
           "--poison off --verify every" "" \
           "$WARM_MSGS" "$MSGS" ;;
+      stream-nv)
+        # The same arm with the spectral check off, which is what the server's
+        # own header said Phase 4 should have used and what Phase 4 did not do.
+        # detect_peaks runs after the gate and before slot_requeue, so its cost
+        # is charged to the sender as credit it has not been given back. Paired
+        # against stream, per rep, so the difference is the price of verifying
+        # inside the hot loop rather than a difference between two days.
+        run_one "$ARM" "$R" "$NPTS" \
+          "--poison off --verify off" "" \
+          "$WARM_MSGS" "$MSGS" ;;
       *) echo "unknown arm $ARM" >&2; continue ;;
     esac
 
