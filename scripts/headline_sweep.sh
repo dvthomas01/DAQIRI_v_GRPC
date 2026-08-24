@@ -35,10 +35,28 @@ CLIENT=build_grpc/bench_grpc_client
 DAQ=./build/daqiri/bench_daqiri_roce_pipeline
 YAML=daqiri/config_roce_pipeline.yaml
 
+# The extbuf arm. Both endpoints on this box at the Spark's own RoCE IP, which
+# is the same address and the same device DAQiri hardcodes for its TX and RX
+# threads, so the two arms share a topology. DAQiri is two threads in one
+# process and extbuf is two processes; that difference is real and stays in the
+# caption. Section 7l.
+EXSRV="${EXSRV:-/tmp/extbuf_fft_server}"
+EXCLI="${EXCLI:-/tmp/extbuf_fft_client}"
+RDMA_IP="${RDMA_IP:-192.168.20.1}"
+EXPORT_="${EXPORT_:-18841}"
+EXSLOTS="${EXSLOTS:-4}"
+
 SIZES="${SIZES:-4096 8192 16384 32768 65536 131072 262144 524288 1048576}"
 ARMS="${ARMS:-base opt daq}"
 REPS="${REPS:-2}"
-N=200; W=50; PACE=400; PORT=50104
+# PACE is a treatment, not a constant, and it was hardcoded at 400 here for a
+# long time.  scripts/pace_probe.sh at 16 KB: extbuf posts cuFFT p50 5.5 to 6.7
+# us at paces 0, 25 and 100, then 16.7 to 20.7 us at 400, while DAQiri holds 4.6
+# to 4.9 us across all four.  400 us is inside one arm's degradation region and
+# outside the other's, so a table taken there reports a DAQiri win at small
+# sizes that is a property of the pacing.  Default stays 400 so the older rows
+# remain reproducible; Table B overrides it.
+N="${N:-200}"; W="${W:-50}"; PACE="${PACE:-400}"; PORT="${PORT:-50104}"
 # ── GPU clock gate ──────────────────────────────────────────────────────────
 # The GB10 parks at idle clocks and only ramps under sustained load, and this
 # was nearly read as a transport result: a run taken minutes after a reboot
@@ -82,6 +100,27 @@ if ! grep -qa -- '--no-opt-stream' "$SERVER"; then
     exit 1
 fi
 
+# Same guard for the extbuf arm, and only when it is selected.  Its binaries are
+# built by hand on this box rather than by cmake, so nothing else would notice
+# that they are stale or missing.  The client in particular must be linked with
+# -Wl,--disable-new-dtags or it builds clean and dies at exec looking for
+# libeasyrdma.so.1, which RUNPATH does not resolve for a transitive dependency.
+case " $ARMS " in *\ extbuf\ *)
+    for B in "$EXSRV" "$EXCLI"; do
+        [ -x "$B" ] || { echo "ABORT: extbuf arm needs $B on this box."; exit 1; }
+    done
+    if [ rdma/extbuf_fft_server.cu -nt "$EXSRV" ]; then
+        echo "ABORT: rdma/extbuf_fft_server.cu is newer than $EXSRV."; exit 1
+    fi
+    if [ rdma/extbuf_fft_client.cc -nt "$EXCLI" ]; then
+        echo "ABORT: rdma/extbuf_fft_client.cc is newer than $EXCLI."; exit 1
+    fi
+    ip -o -4 addr show 2>/dev/null | grep -q "$RDMA_IP" || {
+        echo "ABORT: $RDMA_IP is not on this box, so the extbuf arm would not be"
+        echo "  loopback and would not share DAQiri's topology."; exit 1; }
+    ;;
+esac
+
 # The tree on the Spark is an scp mirror, not a clone, so there is usually no
 # git metadata here to read.  Pass the workstation's SHA in explicitly:
 #     GITSHA=952b68a bash scripts/headline_sweep.sh
@@ -103,9 +142,21 @@ clean_all () {
     pkill -9 -f bench_grpc_server 2>/dev/null
     pkill -9 -f bench_grpc_client 2>/dev/null
     pkill -9 -f bench_daqiri_roce_pipeline 2>/dev/null
+    pkill -9 -f extbuf_fft_server 2>/dev/null
+    pkill -9 -f extbuf_fft_client 2>/dev/null
     rm -rf /tmp/iceoryx2 2>/dev/null
     rm -f /dev/shm/iox2_* 2>/dev/null
     sleep 1
+}
+
+# Percentile of one column of a per-message CSV.  The extbuf server reports its
+# own e2e percentiles on stdout but not a cuFFT percentile, and the per-message
+# CSV has both at full resolution, so take all of them from the same place
+# rather than half from stdout and half from the file.
+# Fields: 1 seq 2 slot 3 bytes 4 npts 5 e2e_us 6 fft_us ... 10 gap_us
+col_p50 () {
+    tail -n +2 "$1" 2>/dev/null | cut -d, -f"$2" | grep -E '^[0-9.]+$' | sort -g \
+      | awk -v p="$3" '{v[n++]=$1} END{ if(n) printf "%.3f", v[int(p*(n-1))] }'
 }
 
 # The clock has to be sampled DURING the run, not before or after it.
@@ -170,7 +221,7 @@ warm_clocks () {
     return 1
 }
 
-echo "arm,size,kb,rep,e2e_p50,e2e_p99,fft_p50,resid,n,result,gitsha,sm_mhz" > "$OUT"
+echo "arm,size,kb,rep,e2e_p50,e2e_p99,fft_p50,resid,n,result,gitsha,sm_mhz,pace_us,msgs" > "$OUT"
 
 printf "%-6s %-9s %-6s %-4s %-9s %-9s %-9s %-8s %-6s %-7s %s\n" \
   "arm" "size" "KB" "rep" "e2e_p50" "e2e_p99" "fft_p50" "resid" "n" "sm_mhz" "result"
@@ -201,6 +252,25 @@ for S in $SIZES; do
         e2e50=$(awk '/E2E latency/{f=1} f&&/p50/{print $3; exit}' "$LOG")
         e2e99=$(awk '/E2E latency/{f=1} f&&/p99/{print $3; exit}' "$LOG")
         fft50=$(awk '/cuFFT execution/{f=1} f&&/p50/{print $3; exit}' "$LOG")
+      elif [ "$ARM" = "extbuf" ]; then
+        # Same message count, same warmup and same pacing as every other arm, so
+        # the comparison is not also a comparison of run lengths. --verify off
+        # because the rate columns are not what this sweep reports and the check
+        # costs this thread more per message than the transfer does; 7i.
+        timeout 90 $EXSRV --addr $RDMA_IP --port $EXPORT_ --npts $S \
+            --warmup $W --msgs $N --slots $EXSLOTS --csv "$CSV" \
+            --sha "$GITSHA" --verify off >"$LOG" 2>&1 &
+        SPID=$!
+        sleep 2
+        ( cd /tmp && GRPC_DIRECT_RDMA_LOCAL=$RDMA_IP timeout 60 $EXCLI \
+            --host $RDMA_IP --port $EXPORT_ --npts $S --msgs $((W + N)) \
+            --warmup $W --pace-us $PACE --linger-ms 400 --gen inplace \
+            --csv /tmp/hl_extbuf_cli.csv ) >>"$LOG" 2>&1
+        wait $SPID 2>/dev/null
+        n=$(tail -n +2 "$CSV" 2>/dev/null | wc -l)
+        e2e50=$(col_p50 "$CSV" 5 0.50)
+        e2e99=$(col_p50 "$CSV" 5 0.99)
+        fft50=$(col_p50 "$CSV" 6 0.50)
       else
         case "$ARM" in
           base) FL="--zero-copy --no-zc-align --no-opt-stream" ;;
@@ -242,7 +312,7 @@ for S in $SIZES; do
       printf "%-6s %-9s %-6s %-4s %-9s %-9s %-9s %-8s %-6s %-7s %s\n" \
         "$ARM" "$S" "$KB" "$R" "${e2e50:-NA}" "${e2e99:-NA}" "${fft50:-NA}" \
         "$resid" "${n:-NA}" "${SM:-NA}" "$res"
-      echo "$ARM,$S,$KB,$R,${e2e50:-NA},${e2e99:-NA},${fft50:-NA},$resid,${n:-NA},$res,$GITSHA,${SM:-NA}" >> "$OUT"
+      echo "$ARM,$S,$KB,$R,${e2e50:-NA},${e2e99:-NA},${fft50:-NA},$resid,${n:-NA},$res,$GITSHA,${SM:-NA},$PACE,$N" >> "$OUT"
 
       # A cell that came in under the threshold means the box cooled off or
       # something else took the GPU. Re-ramp before the next cell rather than

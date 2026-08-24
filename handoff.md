@@ -145,8 +145,12 @@ single clock because the two boxes' realtime clocks differ by 23.13 seconds and 
 NTP.
 
 **Sustained, the path runs at the wire (7j).** With the receiver's per-message verification off
-and the sender's own frame-build copy removed, 4 MiB moves at **5878 MiB/s median against Gate
-3's measured 5843 MiB/s**, with an inter-arrival of 663 to 686 us against a 685 us wire time.
+and the sender's own frame-build copy removed, 4 MiB moves at **5796 to 5803 MiB/s against the
+5960 MiB/s payload ceiling**, 97.3 percent of it, with an inter-arrival of 663 to 686 us
+against a 685 us wire time. (Corrected in 7p. The figure first published here was 5878 MiB/s,
+one over a median gap; the span-derived rate is slightly lower and sits just under Gate 3's
+5843 MiB/s rather than just over it. 4 MiB is the one size where the two constructions agree
+to within 1 percent, so the claim itself survives the correction.)
 The transport is not the bottleneck and neither is the receive path. The earlier "85 percent of
 line rate" was the harness measuring its own memcpy. Slot depth is closed negative at 2, 4, 8
 and 16.
@@ -1373,9 +1377,14 @@ Paired per rep, 4 MiB, 1000 measured messages, three reps, arms rotated.
 | `stream` | 2250.71 | 2666.04 | 2743.11 | 1458 |
 | `stream-nv` | 345.44 | 13.71 | 820.58 | 4875 |
 
-Three of three, no overlap between the arms, **3.18x on the median**. 4983 MiB/s against the
-5843 MiB/s Gate 3 measured with `ib_write_lat`, so **85 percent of the link where it had been
-27 percent**.
+Three of three, no overlap between the arms, **3.18x on the median**. The 3.18x is a paired
+ratio of `gap p50` between two arms measured in the same rotation and it is unaffected by 7m.
+The absolute MiB/s column is not: it is one over a median gap, and for the `--verify every`
+rows the cadence is strongly bimodal because the verification stalls the consumer, which is
+the exact condition 7m says the construction cannot survive. `transport_cell.sh` now refuses
+to emit a rate for any `--verify every` arm. Read the column as arm-to-arm ratio only. The
+`stream-nv` figure of 4983 MiB/s should be compared against the 5960 MiB/s payload ceiling,
+not against Gate 3's 5843, which came from `ib_write_bw` rather than `ib_write_lat`.
 
 > **The explanation below this line was wrong, and the correction is in 7j.** The finding that
 > `--verify every` costs 3.18x is a paired measurement and it stands. The mechanism given for it
@@ -1490,10 +1499,16 @@ region stays. The receiver cannot tell the two arms apart: same flags, same traf
 Three of three, no overlap. `gen_p50` goes from 467 us to 0.16 us, which is the header write.
 
 **The pipeline is now at the wire.** `gap_p50` of 663 to 686 us against the 685 us Gate 3
-measured for 4 MiB, and 5878 MiB/s median against Gate 3's 5843 MiB/s. There is nothing left to
-recover at this size. `send_p50` rising from 336 to 688 us is the same statement from the other
-side: with the frame build gone, the send call is where the sender waits for the wire, and it
-waits exactly one wire time.
+measured for 4 MiB, and 5796 to 5803 MiB/s against the 5960 MiB/s payload ceiling. There is
+nothing left to recover at this size. `send_p50` rising from 336 to 688 us is the same
+statement from the other side: with the frame build gone, the send call is where the sender
+waits for the wire, and it waits exactly one wire time.
+
+> **The MiB/s column above is one over a median gap and 7m retracts that construction.** At
+> 4 MiB it happens to be safe: the mean and median gap agree to within 1 percent, so the
+> span-derived rate is 5796 to 5803 against the 5878 printed here. The claim stands, the
+> number moves by 1.3 percent, and it lands just below Gate 3's 5843 rather than just above.
+> Do not carry this column to any smaller size; see the audit in 7p.
 
 **This changes the claim in Result 4.** It is no longer "the receive path sustains 85 percent of
 link and a synthetic sender limits it". It is: **the receive path is not the limit, and neither
@@ -1610,10 +1625,188 @@ the same clock. Until that is reconciled the 4 MiB row is mostly reporting an FF
 The thing to check first is whether the two arms run the same transform at all, real-to-complex
 against complex-to-complex, since that alone would account for a factor of roughly this size.
 
+### 7l. Table B: extbuf loopback against DAQiri loopback, same box, same window (2026-08-24)
+
+> **Superseded by 7n.** The table below paired an unpaced extbuf arm against a 400 us paced
+> DAQiri arm. Both small-size rows change sign once the two arms are sent at the same rate,
+> and the 4 MiB gap shrinks by a third. The topology and window paragraphs still hold and are
+> not repeated in 7n. Read 7n for the numbers.
+
+**Topology, stated because the last two versions of section 7 were retracted for not stating
+it.** Both arms in this table are loopback on the Spark. DAQiri's
+`bench_daqiri_roce_pipeline.cc` hardcodes `SERVER_ADDR` and `CLIENT_ADDR` both to
+`192.168.20.1` and runs TX and RX as two threads in one process. `stream-loopback` runs
+`extbuf_fft_client` and `extbuf_fft_server` as two processes on that same address over the
+same local RoCE device. The PXI is not involved in either. Nothing here crosses a machine
+boundary, and no number in this table may be compared to a cross-machine number.
+
+**Window, identical by construction.** Both clocks start once the buffer has landed and stop
+after the transform. DAQiri takes `t_rx` when the RECEIVE completion is dequeued; extbuf takes
+`t0` when `receive_ext` returns and `t1` after the CUDA event gate. This is post-arrival
+processing latency for both. Time in flight is outside the window for both.
+
+Medians of 3 reps for extbuf (sha `loopback`, `sm_mhz` 2509 to 2548 on every row), against the
+2-rep DAQiri figures from the table in section 7 (sha `952b68a`). All microseconds.
+
+| size | extbuf e2e | DAQiri e2e | delta | extbuf resid | DAQiri resid |
+|---|---|---|---|---|---|
+| 16 KB | **9.63** | 11.70 | -2.07 | 4.83 | 5.13 |
+| 256 KB | **19.73** | 20.74 | -1.01 | 5.07 | 4.87 |
+| 1 MiB | 34.72 | **28.27** | +6.45 | 9.12 | 4.96 |
+| 4 MiB | 104.14 | **62.31** | +41.83 | 21.90 | 4.95 |
+
+Negative delta means extbuf is faster. It is a crossover, not a win: extbuf is ahead at the
+two small sizes by 1 to 2 us and behind at the two large ones, by 1.67x at 4 MiB. Anyone
+quoting this table at one size is quoting the opposite result to whoever quotes it at another,
+which is the reason it is printed at four sizes and not one.
+
+**Three limits on it, none of which are small.**
+
+First, the two arms were **not interleaved with each other**. Extbuf is 3 reps taken today,
+DAQiri is 2 reps taken on 2026-08-19 on a different build. Sections 7 version 1 and version 2
+were both retracted for exactly this, and a 6.8 us drift between two DAQiri runs is on the
+record there. The 1 and 2 us deltas at 16 KB and 256 KB are inside that drift and should be
+read as a tie. The 41.83 us at 4 MiB is not.
+
+Second, **the residual columns do not mean the same thing in the two arms.** Extbuf's residual
+is `e2e - fft.last_exec_us()`, and it grows 4.83 -> 5.07 -> 9.12 -> 21.90 with size while
+DAQiri's sits flat at 4.87 to 5.13. A residual that scales with payload is the signature of
+work that `last_exec_us` is not counting and the event gate is then waiting on, so the extbuf
+fft/residual split is an artefact of where the transform's own timer stops. The e2e column is
+unaffected by this and is the only column in the table that is like for like.
+
+Third, and it governs the 4 MiB row: **most of that 41.83 us is in the transform, not the
+transport.** Taking DAQiri's cuFFT term as `e2e - resid` gives 57.36 us at 4 MiB against
+extbuf's 82.24 us, a 43% difference on what should be the same transform on the same GPU at
+the same clock. Until that is reconciled the 4 MiB row is mostly reporting an FFT difference.
+The thing to check first is whether the two arms run the same transform at all, real-to-complex
+against complex-to-complex, since that alone would account for a factor of roughly this size.
+
 **What the table does establish.** The comparison the project was built around is now
 same-topology and same-window, and it can be run again interleaved in one sitting whenever the
 DAQiri arm is rebuilt, because both arms are now driven from `scripts/transport_cell.sh`. That
 was the blocker, and it is gone.
+
+*(The last sentence was wrong when written. `transport_cell.sh` never had a DAQiri arm; only
+`stream-loopback` had been added to it. The interleaved run in 7n was done by adding an
+`extbuf` arm to `scripts/headline_sweep.sh`, which already rotated `base`, `opt` and `daq`,
+rather than the other way round.)*
+
+### 7n. Table B, interleaved and pace-matched. Two rows change sign (2026-08-24)
+
+Same topology and same window as 7l, which are not restated. What changed is that all four
+arms now run inside one rotation of one script, in one thermal window, at one message rate.
+`scripts/headline_sweep.sh` with `ARMS="base opt daq extbuf"`, `REPS=3`, arms rotated inside
+each rep, 1000 measured messages after 500 warmup, `PACE=25`. Rows in
+`data/tableB_interleaved.csv`, sha `tableB`.
+
+**First, the thing that made the old table wrong.** The extbuf rows in 7l came from the
+streaming loopback sweep, which sends back to back. The DAQiri rows came from the headline
+sweep, which had `PACE=400` hardcoded. Those are not the same experiment, and at 16 KB the
+difference is not small. `scripts/pace_probe.sh`, arms rotated inside each pace,
+`data/pace_probe.csv`:
+
+| pace us | extbuf e2e | extbuf cuFFT | DAQiri e2e | DAQiri cuFFT |
+|---|---|---|---|---|
+| 0 | 10.90 / 13.76 | 5.76 / 7.78 | 9.58 / 9.33 | 4.83 / 4.67 |
+| 25 | 10.67 / 10.74 | 5.54 / 5.70 | 9.31 / 9.31 | 4.67 / 4.61 |
+| 100 | 11.07 / 12.11 | 5.95 / 6.72 | 9.38 / 9.49 | 4.67 / 4.77 |
+| 400 | **41.06 / 32.34** | **20.70 / 16.74** | 9.84 / 9.81 | 4.93 / 4.90 |
+
+Extbuf's transform triples between 100 and 400 us of pacing. DAQiri's does not move at all.
+`sm_mhz` is 2405 to 2548 in every one of those cells, so the clock gate is not what is
+happening, and a warmup probe over 50, 500, 2000 and 20000 warmup messages moved extbuf's
+paced numbers by under 2 us, so it is not a cold start either. The mechanism is not yet known.
+What is known is that 400 us sits inside one arm's degradation region and outside the other's,
+so any table taken there is partly a report about the pacing. `PACE` is now a variable in
+`headline_sweep.sh` and is stamped into every row of the output.
+
+**Table B, corrected.** Medians of 3 reps, microseconds. Positive delta means DAQiri is faster.
+
+| size | extbuf e2e | DAQiri e2e | delta | was, in 7l |
+|---|---|---|---|---|
+| 16 KB | 10.74 | **9.46** | +1.28 | -2.07 |
+| 256 KB | 20.82 | **18.22** | +2.59 | -1.01 |
+| 1 MiB | 30.43 | **25.07** | +5.36 | +6.45 |
+| 4 MiB | 94.14 | **68.98** | +25.17 | +41.83 |
+
+**DAQiri is faster at every size.** The crossover in 7l was not real. Both small-size rows
+changed sign, which is the outcome 7l's own first limit warned about, and the 4 MiB gap fell
+by a third once the two arms shared a window. The direction of the 1 MiB and 4 MiB rows
+survived, so those were the trustworthy rows in the old table, as its limits said.
+
+The 16 KB DAQiri figure rests on one rep, not three: the clock gate marked reps 1 and 3
+`CLOCKLOW` at 2379 and 1560 MHz. Their e2e values are 9.408 and 9.344 against the surviving
+rep's 9.456, so the excluded rows agree with the kept one and the row is not in doubt, but it
+is one rep and is written down as one rep. The DAQiri cell at 16 KB is short enough that the
+0.2 s clock sampler can miss the loaded part of it, which is a gate problem rather than a
+thermal one.
+
+**Where the gap lives.** Splitting e2e into the transform and everything else:
+
+| size | extbuf cuFFT | DAQiri cuFFT | delta | extbuf resid | DAQiri resid | delta |
+|---|---|---|---|---|---|---|
+| 16 KB | 5.70 | 4.77 | +0.93 | 5.04 | 4.69 | +0.35 |
+| 256 KB | 15.68 | 13.50 | +2.18 | 5.14 | 4.72 | +0.42 |
+| 1 MiB | 24.10 | 20.35 | +3.74 | 6.34 | 4.72 | +1.62 |
+| 4 MiB | 78.40 | 64.13 | +14.27 | 15.74 | 4.85 | +10.89 |
+
+At 16 and 256 KB the residuals are within 0.42 us and essentially the whole gap is transform
+time. At 4 MiB both terms fail: the transform is 14.27 us slower and the residual is 10.89 us
+slower. 7l's second limit stands unchanged, and is now measured against a DAQiri arm from the
+same rotation rather than one from five days earlier: extbuf's residual climbs 5.04 -> 15.74
+with size while DAQiri's is flat at 4.69 to 4.85.
+
+### 7o. The transform is identical, and that is the problem (2026-08-24)
+
+7l's third limit told the reader to check whether the two arms run the same transform, and
+said a real-to-complex against complex-to-complex mismatch would account for the whole 4 MiB
+gap. **It would have, and there is no mismatch.** The limit is withdrawn.
+
+Both arms construct `fft/cufft_executor.h`'s `CuFFTExecutor`. Same `cufftPlan1d` R2C, same
+batch of 1, default strides, out of place in both, no `cufftSetWorkArea` in either, one JIT
+warmup each, plan built once and reused. Both write into `cudaMalloc`'d device memory. The
+sizes match too, which is worth checking rather than assuming, because the two harnesses take
+their size argument in different units: DAQiri's `--bufsize` is in samples
+(`bench_daqiri_roce_pipeline.cc:459` prints `buf_size * 4 / 1024` as KB) and extbuf's `--npts`
+is also samples, so 4 MiB is n = 1048576 in both. `last_exec_us()` is CUDA-event GPU time of
+the transform in both modes, so the two numbers are the same measurement.
+
+**Alignment is not it either.** Extbuf transforms from `base + kPayloadOffset`, 256 bytes into
+each slot, while DAQiri transforms from an RC buffer base its own comment describes as page
+aligned. `fft/bench_fft_memsrc.cc` exists partly to test exactly this and has `*_off` arms for
+it. Interleaved, 5 reps, n = 1048576, `--offset-bytes 256`, `ha_off` minus `hostalloc` per rep:
+-0.10, -0.74, +0.58, -0.58, -1.73 us. Two of five positive and every one of them inside the
+run to run spread. A 256 byte offset from a 2 MB aligned base costs nothing.
+
+**What the memory class does cost, measured inside the Table B rotation itself.** The `base`
+arm copies host to device and transforms from `cudaMalloc`'d memory; `opt`, `daq` and `extbuf`
+all transform in place from pinned host memory. At 4 MiB, one window, arms rotated:
+
+| arm | cuFFT p50 | reads from |
+|---|---|---|
+| `base` | 47.78 | device memory, after an H2D copy |
+| `daq` | 64.13 | pinned host, mapped |
+| `opt` | 64.99 | pinned host, mapped |
+| `extbuf` | 78.40 | pinned host, mapped |
+
+`opt` and `daq` land within 0.9 us of each other, which is the check that the ladder is real:
+two different transports, same memory class, same transform time. The isolated ladder in
+`fft/bench_fft_memsrc.cc` reproduces the shape on its own, device 47.1 against hostalloc 59.1
+against shmreg 62.4 in a 4-arm run. Reading from pinned host memory instead of device memory
+costs about 16 us at 4 MiB, and that is the price of zero copy, paid knowingly.
+
+**So extbuf's 78.40 is the outlier and it is not explained.** Same plan, same n, same memory
+class, same timing method, same box, same window, same pace as `daq` and `opt`, and 14 us
+slower than both. The candidates left are the ones that were never differences in the FFT
+itself: `CuFFTExecutor fft(npts, own_stream)` with `own_stream = true` in extbuf against the
+default `false` in `daq` and `opt`, and extbuf's slot geometry, where `slot_bytes` is rounded
+to a multiple of 256 rather than to a page or a 2 MB boundary
+(`rdma/extbuf_fft_server.cu:404`), so consecutive slots put the payload at 256, 512, 768 and
+1024 bytes past a 2 MB boundary and no slot payload is page aligned. The `ha_off` probe only
+tested the first of those four offsets. Neither has been tested; both are cheap to test and
+neither should be quoted as the cause until one is.
+
 
 ### 7m. The sustained rate was one over a median, and it was never a rate (2026-08-24)
 
@@ -1675,6 +1868,59 @@ every stall the smaller sizes are punctuated by.
 than 2% and marks it `ABOVELINK`. That would have caught this on the run that produced it.
 The deeper lesson is the one from 7i one layer further out: a median is not a rate, and an
 impossible number reads as the best result in the table rather than as the broken one.
+
+### 7p. Audit of every rate claim in this document against the mean/median rule (2026-08-24)
+
+7m retracted one number. The rule it established is that **a rate built as one over a median
+inter-arrival is only meaningful when the mean and the median agree**, because the median of a
+bimodal cadence sits on the boundary between the two clusters and reports the consumer loop
+rather than the wire. This is the sweep of everything else in this document that quotes a rate,
+sorted by how the number was built, because the construction is what decides whether the fault
+applies.
+
+**Group 1: built as one over a median inter-arrival. The fault applies. Four claims.**
+
+| claim | where | mean/median | verdict |
+|---|---|---|---|
+| 4 MiB at 5878 MiB/s, above Gate 3 | summary, 7j | 1.01 | **number corrected** to 5796-5803, claim survives |
+| 256 KB at 97.6 percent of wire | 7j | 1.20 to 1.82 | **withdrawn** in 7m; honest 54 to 86 percent and unstable |
+| 1 MiB at 10792 to 13517 MiB/s | size sweep | 1.12 to 2.28 | **withdrawn** in 7m; honest 4874 to 5326 |
+| MiB/s column of the verify-cost table | 7i | bimodal by construction | **absolute values withdrawn**, the 3.18x paired ratio survives |
+
+The 4 MiB row is the only one that passes, and it passes because at 4 MiB the transfer is long
+enough that the consumer cannot reap a burst: mean and median gap agree to 1 percent. That is
+the precondition, and it is worth stating as a size rule rather than a per-claim one. **Below
+4 MiB, on this receive path, no median-derived rate in this document is trustworthy.** The
+correction is not always small: at 1 MiB the reported figure was 2.2x the honest one.
+
+**Group 2: built from a span, bytes divided by an elapsed duration. The fault does not apply.**
+
+Gate 3's 5843.23 MiB/s at 4 MB is `ib_write_bw`, which averages over its whole iteration count.
+It is not `ib_write_lat` inverted, and one sentence in 7i said it was; that attribution is
+corrected above. The copy-engine numbers in the E-series are timed copies of a known byte count:
+E1's ~52 GB/s wall, E3's ~102 GB/s SM kernel and the ~170 GB/s it would need to pay for itself,
+the ~10 GB/s frame-build copy inside `grpc_direct_client_send`, and the 33,000 to 58,000 MB/s at
+4 MB. All of those divide bytes by a measured duration and none of them invert a percentile. They
+stand as written.
+
+`gap_audit.sh` and the `mib_s` column of `transport_cell.sh` are now both span-derived, so
+anything produced after commit `e6141e5` is in this group by construction.
+
+**Group 3: rates whose construction is not recorded. Marked unverifiable, not left standing.**
+
+`presentation/HANDOFF.md` quotes 1.78 GB/s for the gRPC TCP baseline, 23.59 GB/s for shmem,
+5.775 GB/s for gRPC-Direct RDMA and ~5.785 GB/s for DAQiri, and calls the last two a tie. The
+tie is a sub-1-percent difference between two numbers whose construction is not written down
+anywhere and whose per-message data has not survived. That is not enough to support a tie
+claim in either direction. Either the deck reruns those two arms with the current harness,
+which now emits a span-derived rate, or the tie is dropped. The 23.59 GB/s shmem figure is far
+above anything a link can do and is a shared-memory number, so it is not affected by the link
+ceiling argument, but its construction is equally unrecorded.
+
+**What to do with a rate from now on.** Quote the span-derived figure, quote the mean and
+median gap next to it if they differ by more than a few percent, and compare against the
+5960 MiB/s payload ceiling rather than against Gate 3's 5843, which is itself a measurement
+with its own error bar and is not a physical limit.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
@@ -1754,7 +2000,10 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 
 | Script | What it does |
 |---|---|
-| `scripts/headline_sweep.sh` | **The headline artifact.** 9 sizes x 3 arms (base / optimized / DAQiri) x `REPS` reps (default 2), arms interleaved within each rep. Aborts if the server binary is missing, older than its source, or predates `--opt-stream`. Stamps the git SHA on every row. Writes `data/headline_runs.csv`. |
+| `scripts/headline_sweep.sh` | **The headline artifact.** 9 sizes x `ARMS` x `REPS` reps, arms interleaved within each rep. Arms are `base`, `opt`, `daq` and `extbuf`; the last is the RoCE loopback pair and is what makes Table B (7n) an interleaved measurement. Aborts if the server binary is missing, older than its source, or predates `--opt-stream`, and separately if the extbuf arm is selected without its binaries or without `192.168.20.1` on the box. `PACE`, `N` and `W` are variables rather than constants and `PACE` is stamped on every row; see 7n for why that matters. Writes `data/headline_runs.csv`. |
+| `scripts/run_tableB.sh`, `scripts/launch_tableB.sh` | Table B exactly as published in 7n: four arms, four sizes, 3 reps, `PACE=25`. The launcher exists because the driving workstation is PowerShell 5.1, which strips embedded double quotes and mangles `&` out of an ssh command line; keeping the metacharacters on the Spark side has already saved two lost runs. |
+| `scripts/pace_probe.sh` | Sweeps send pacing for the extbuf and DAQiri arms with the arms rotated inside each pace. This is the script that found extbuf's transform tripling between 100 and 400 us of pacing while DAQiri's held flat, which is what invalidated the first Table B. Run it before trusting any two arms compared at a pace neither was profiled at. |
+| `scripts/extbuf_warmup_probe.sh` | Holds the measured window at 200 messages and varies only the warmup, 50 to 20000. Used to rule warmup out as the cause of the pacing cliff. |
 | `scripts/headline_table.py` | Turns that CSV into the scoreboard, the cuFFT-vs-transport gap decomposition, and paired sign tests. |
 | `scripts/trio_probe.sh` | Arms cur/nl/st/af/all with a correctness pass. Interleaves if you pass `ARMS='cur all cur all cur all'`. |
 | `scripts/drop_probe.sh` | Delivery accounting: received, missing, gap events, mean run length, across paces. |
