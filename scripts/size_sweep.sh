@@ -51,10 +51,17 @@ SIZES="${SIZES:-4096 16384 262144 1048576 4194304}"
 REPS="${REPS:-3}"
 SLOTS="${SLOTS:-4}"
 MIN_SM_MHZ="${MIN_SM_MHZ:-2400}"
-OUT="${OUT:-data/size_sweep_s${SLOTS}.csv}"
+
+# Tag goes in every per-cell filename.  Without it a second sweep with different
+# arms silently overwrites the first sweep's cells, and the merged table is the
+# only surviving copy of numbers that took an hour to take.
+TAG="${TAG:-s${SLOTS}}"
+OUT="${OUT:-data/size_sweep_${TAG}.csv}"
 
 TIMED_ARMS="${TIMED_ARMS:-echo echo-cal stream-nv stream-inplace}"
-VERIFY_ARMS="${VERIFY_ARMS:-stream}"
+# No colon: an explicitly empty VERIFY_ARMS must stay empty and skip the pass,
+# whereas ${VERIFY_ARMS:-stream} would treat empty as unset and run it anyway.
+VERIFY_ARMS="${VERIFY_ARMS-stream}"
 
 if [ -z "${GITSHA:-}" ]; then
     GITSHA="$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)"
@@ -133,7 +140,7 @@ for B in $SIZES; do
     echo "  echo:   warm ${EWARM} then ${EMSG} measured"
     echo "=============================================================="
 
-    TOUT="data/ss_timed_${B}_s${SLOTS}.csv"
+    TOUT="data/ss_timed_${B}_${TAG}.csv"
     GITSHA="$GITSHA" REPS="$REPS" NPTS="$NPTS" SLOTS="$SLOTS" \
     WARM_MSGS="$WARM" MSGS="$MSG" ECHO_WARM="$EWARM" ECHO_MSGS="$EMSG" \
     MIN_SM_MHZ="$MIN_SM_MHZ" ARMS="$TIMED_ARMS" OUT="$TOUT" \
@@ -144,12 +151,20 @@ for B in $SIZES; do
     # not a distribution, so it does not need three reps.  Its rate comes back
     # NA because the server withholds it under --verify every; that is the
     # guard working, not the cell failing.
-    VOUT="data/ss_verify_${B}_s${SLOTS}.csv"
-    GITSHA="$GITSHA" REPS=1 NPTS="$NPTS" SLOTS="$SLOTS" \
-    WARM_MSGS="$WARM" MSGS="$MSG" \
-    MIN_SM_MHZ="$MIN_SM_MHZ" ARMS="$VERIFY_ARMS" OUT="$VOUT" \
-        bash scripts/transport_cell.sh 2>&1 | tee -a "$LOG"
-    [ -f "$ROOT/$VOUT" ] && CELLS="$CELLS $VOUT"
+    #
+    # Skippable.  The loopback sweep re-runs this driver with one timed arm and
+    # no verify arm, because its correctness was already established by the
+    # cross-machine verify pass at the same sizes: the spectrum does not depend
+    # on which box posted the buffer.  An empty ARMS would make transport_cell
+    # write a header and no rows, so skip the invocation rather than pass it.
+    if [ -n "$VERIFY_ARMS" ]; then
+        VOUT="data/ss_verify_${B}_${TAG}.csv"
+        GITSHA="$GITSHA" REPS=1 NPTS="$NPTS" SLOTS="$SLOTS" \
+        WARM_MSGS="$WARM" MSGS="$MSG" \
+        MIN_SM_MHZ="$MIN_SM_MHZ" ARMS="$VERIFY_ARMS" OUT="$VOUT" \
+            bash scripts/transport_cell.sh 2>&1 | tee -a "$LOG"
+        [ -f "$ROOT/$VOUT" ] && CELLS="$CELLS $VOUT"
+    fi
 done
 
 # ── merge ────────────────────────────────────────────────────────────────────
@@ -170,13 +185,13 @@ FIRST=$(echo $CELLS | awk '{print $1}')
 [ -n "$FIRST" ] || fail "no cells produced any output; see $LOG"
 
 {
-  head -1 "$ROOT/$FIRST" | sed 's/$/,resid,wire_us,pct_wire/'
+  head -1 "$ROOT/$FIRST" | sed 's/$/,resid,wire_us,pct_wire,pct_wire_mean/'
   for C in $CELLS; do
     tail -n +2 "$ROOT/$C"
   done | awk -F, -v OFS=, '
     function num(x) { return (x=="NA" || x=="" ) ? -1 : x+0 }
     {
-      e = num($10); f = num($11); g = num($12); b = num($3);
+      e = num($10); f = num($11); g = num($12); b = num($3); gm = num($22);
       resid = (e<0 || f<0) ? "NA" : sprintf("%.2f", e-f);
       wire  = (b<0)        ? "NA" : sprintf("%.3f", b/6127.0 + 1.81);
       # The echo arms serialise the sender: it posts, waits for the ack, then
@@ -186,7 +201,14 @@ FIRST=$(echo $CELLS | awk '{print $1}')
       # carries the cell size while the arm actually sent 64 points.
       pct = (g<=0 || b<0 || $1 ~ /^echo/) ? "NA" \
             : sprintf("%.1f", 100.0*(b/6127.0+1.81)/g);
-      print $0, resid, wire, pct;
+      # Against the MEAN gap, which is the one that corresponds to bytes over
+      # elapsed time. Read this column, not the one before it. pct_wire is the
+      # cadence while the pipeline is streaming smoothly; pct_wire_mean includes
+      # the stalls, and below 4 MiB the two differ by up to 5x because the
+      # cadence is punctuated rather than steady. Section 7m.
+      pctm = (gm<=0 || b<0 || $1 ~ /^echo/) ? "NA" \
+            : sprintf("%.1f", 100.0*(b/6127.0+1.81)/gm);
+      print $0, resid, wire, pct, pctm;
     }'
 } > "$ROOT/$OUT"
 

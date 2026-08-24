@@ -67,8 +67,29 @@ RSRV="${RSRV:-/tmp/extbuf_fft_server}"
 RCLI="${RCLI:-/home/admin/extbuf_p3/extbuf_fft_client}"
 RCLI_DIR="${RCLI_DIR:-/home/admin/extbuf_p3}"
 
+# The loopback client. Both endpoints on the Spark, both on 192.168.20.1, over
+# the same local RoCE device. This exists to match DAQiri's topology, because
+# DAQiri links libcudart and libcuda and therefore cannot run on the PXI, so
+# every DAQiri number in this project is Spark to Spark. Comparing a PXI-to-Spark
+# arm against a Spark-to-Spark one would repeat the loopback-against-wire error
+# this project has already retracted twice, so the comparison gets its own arm
+# with the same topology instead.
+LCLI="${LCLI:-/tmp/extbuf_fft_client}"
+LCLI_DIR="${LCLI_DIR:-/tmp}"
+
 MIN_SM_MHZ="${MIN_SM_MHZ:-2400}"
 BYTES=$((NPTS * 4))
+
+# The RoCE port enp1s0f0np0 reports 50000 Mb/s, checked on 2026-08-24 from
+# /sys/class/net/enp1s0f0np0/speed. That is 6250 bytes/us of signalling and
+# 5960 MiB/s of payload if the protocol were free. Gate 3 measured 6127
+# bytes/us, which is 98.0% of it, so 6127 is an EMPIRICAL line rate and not a
+# theoretical one. Both are carried here because a measured-against-theoretical
+# column needs the theoretical number, and because any cell that beats 5960 is
+# reporting something other than data crossing the wire.
+LINK_BYTES_US="${LINK_BYTES_US:-6250}"       # 50 Gb/s, theoretical
+LINK_MIB_S="${LINK_MIB_S:-5960}"             # same, as payload MiB/s
+MEAS_BYTES_US="${MEAS_BYTES_US:-6127}"       # Gate 3, measured
 
 # Streaming warmup, same sizing as Phase 4: Gate 3 measured 5843 MiB/s with a
 # 1.81 us floor, so one message costs bytes/6127 + 1.81 us.  Ask for four
@@ -110,21 +131,40 @@ fail () { echo "ABORT: $*" >&2; exit 1; }
 if [ "$RSRV" -ot "$ROOT/rdma/extbuf_fft_server.cu" ]; then
     fail "$RSRV is older than rdma/extbuf_fft_server.cu. Rebuild before measuring."
 fi
-ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" "test -x $RCLI" 2>/dev/null \
-    || fail "cannot reach $PXI or $RCLI is missing"
-# The client is the half that changed most in this pass, so a stale one on the
-# PXI would produce a run with no rtt column and no obvious reason why.
-ssh -o BatchMode=yes "$PXI" "$RCLI --help 2>&1 | grep -q -- --echo" \
-    || fail "$RCLI on the PXI has no --echo. Rebuild and copy it across."
-# Same reasoning for --gen. A stale client silently ignores an unknown flag in
-# some builds and would run copy mode while the CSV is labelled stream-inplace,
-# which is the exact class of silent disagreement that cost us Phase 4.
-case " $ARMS " in *\ stream-inplace\ *)
-    ssh -o BatchMode=yes "$PXI" "$RCLI --help 2>&1 | grep -q -- --gen" \
-        || fail "$RCLI on the PXI has no --gen, so stream-inplace would really be stream-nv. Rebuild and copy it across." ;;
+
+# Does this run need the PXI at all? stream-loopback does not, and probing the
+# PXI for it is not merely redundant: the --help check below has no
+# ConnectTimeout, so an unreachable PXI hangs a run that never needed it. That
+# happened on 2026-08-24 and cost a loopback sweep.
+NEED_PXI=0
+for A in $ARMS; do
+    [ "$A" = "stream-loopback" ] || NEED_PXI=1
+done
+
+if [ "$NEED_PXI" = 1 ]; then
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" "test -x $RCLI" 2>/dev/null \
+        || fail "cannot reach $PXI or $RCLI is missing"
+    # The client is the half that changed most in this pass, so a stale one on the
+    # PXI would produce a run with no rtt column and no obvious reason why.
+    ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" "$RCLI --help 2>&1 | grep -q -- --echo" \
+        || fail "$RCLI on the PXI has no --echo. Rebuild and copy it across."
+    # Same reasoning for --gen. A stale client silently ignores an unknown flag in
+    # some builds and would run copy mode while the CSV is labelled stream-inplace,
+    # which is the exact class of silent disagreement that cost us Phase 4.
+    case " $ARMS " in *\ stream-inplace\ *)
+        ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" "$RCLI --help 2>&1 | grep -q -- --gen" \
+            || fail "$RCLI on the PXI has no --gen, so stream-inplace would really be stream-nv. Rebuild and copy it across." ;;
+    esac
+    ping -c 2 -W 2 "$PXI_RDMA_IP" >/dev/null 2>&1 \
+        || fail "$PXI_RDMA_IP does not answer. The PXI reverts to a link-local address after a restart; run scripts/pxi_setip.sh."
+fi
+
+case " $ARMS " in *\ stream-loopback\ *)
+    [ -x "$LCLI" ] || fail "stream-loopback needs a client on the Spark at $LCLI. See section 7k."
+    if [ "$LCLI" -ot "$ROOT/rdma/extbuf_fft_client.cc" ]; then
+        fail "$LCLI is older than rdma/extbuf_fft_client.cc. Rebuild before measuring."
+    fi ;;
 esac
-ping -c 2 -W 2 "$PXI_RDMA_IP" >/dev/null 2>&1 \
-    || fail "$PXI_RDMA_IP does not answer. The PXI reverts to a link-local address after a restart; run scripts/pxi_setip.sh."
 
 # ── clock sampling ───────────────────────────────────────────────────────────
 CLK_PID=""
@@ -145,7 +185,13 @@ clk_peak () {
 
 cleanup () {
     pkill -9 -f extbuf_fft_server 2>/dev/null
-    ssh -o BatchMode=yes "$PXI" "pkill -9 -f extbuf_fft_client" >/dev/null 2>&1
+    pkill -9 -f extbuf_fft_client 2>/dev/null
+    # Same hazard as the preflight: this runs on every rep and from the EXIT
+    # trap, so an unreachable PXI would hang the run and then hang the cleanup.
+    if [ "$NEED_PXI" = 1 ]; then
+        ssh -o BatchMode=yes -o ConnectTimeout=8 "$PXI" \
+            "pkill -9 -f extbuf_fft_client" >/dev/null 2>&1
+    fi
     sleep 1
 }
 trap 'clk_peak >/dev/null 2>&1; cleanup' EXIT
@@ -182,19 +228,33 @@ run_one () {
         --csv "$scsv" --sha "$GITSHA" $sx ) >"$slog" 2>&1 &
     local spid=$!
     sleep 3
-    ssh -o BatchMode=yes "$PXI" \
-        "cd $RCLI_DIR && GRPC_DIRECT_RDMA_LOCAL=$PXI_RDMA_IP \
-         timeout 1200 ./extbuf_fft_client --host $SPARK_RDMA_IP --port $RPORT \
-         --npts $np --msgs $((wm + ms)) --warmup $wm \
-         --pace-us 0 --linger-ms 400 --csv $ccsv $cx" >"$clog" 2>&1
+    # Loopback puts the sender on this box, so the ssh hop, the PXI's CPU and
+    # the x86-to-aarch64 difference all leave the measurement. That is the
+    # point: it is the only configuration DAQiri can be run in.
+    if [ "$arm" = "stream-loopback" ]; then
+        ( cd "$LCLI_DIR" && GRPC_DIRECT_RDMA_LOCAL=$SPARK_RDMA_IP \
+          timeout 1200 "$LCLI" --host "$SPARK_RDMA_IP" --port "$RPORT" \
+          --npts "$np" --msgs $((wm + ms)) --warmup "$wm" \
+          --pace-us 0 --linger-ms 400 --csv "$ccsv" $cx ) >"$clog" 2>&1
+    else
+        ssh -o BatchMode=yes "$PXI" \
+            "cd $RCLI_DIR && GRPC_DIRECT_RDMA_LOCAL=$PXI_RDMA_IP \
+             timeout 1200 ./extbuf_fft_client --host $SPARK_RDMA_IP --port $RPORT \
+             --npts $np --msgs $((wm + ms)) --warmup $wm \
+             --pace-us 0 --linger-ms 400 --csv $ccsv $cx" >"$clog" 2>&1
+    fi
     wait $spid 2>/dev/null
     SM=$(clk_peak)
 
     # The sender's per-message CSV is the only place the frame-build and send
     # costs exist at full resolution, and the 2205 us question is a sender-side
     # question, so it comes back rather than staying on the PXI.
-    scp -o BatchMode=yes -q "$PXI:$ccsv" \
-        "$ROOT/data/$(basename "$ccsv")" 2>/dev/null || true
+    if [ "$arm" = "stream-loopback" ]; then
+        cp -f "$ccsv" "$ROOT/data/$(basename "$ccsv")" 2>/dev/null || true
+    else
+        scp -o BatchMode=yes -q "$PXI:$ccsv" \
+            "$ROOT/data/$(basename "$ccsv")" 2>/dev/null || true
+    fi
 
     E50=$(col_p50 "$scsv" 5 0.50)
     F50=$(col_p50 "$scsv" 6 0.50)
@@ -215,7 +275,20 @@ run_one () {
     RTT99=$(awk '/^echo rtt p50/{print $7; exit}' "$clog")
     GEN50=$(awk '/^frame build p50/{print $5; exit}' "$clog")
     SEND50=$(awk '/^send call p50/{print $5; exit}' "$clog")
-    MIBS=$(awk '/^sustained rate/{print $4; exit}' "$slog")
+    # NOT the server's "sustained rate" line.  That one is frame_bytes/gap_p50,
+    # the reciprocal of a MEDIAN, which is the sustained rate only if the
+    # cadence has one mode.  At 1 MiB it has two, roughly 30 us and roughly 290
+    # us, because arrivals are timestamped when they are reaped and a stalled
+    # consumer reaps a burst back to back.  The median then sits on the boundary
+    # and flips between reps, and it printed 13517 MiB/s on a 5960 MiB/s link.
+    # Section 7m.  Bytes over elapsed span cannot do that, so compute it here
+    # from the per-message gaps and let the server's line be.
+    MIBS=$(tail -n +3 "$scsv" 2>/dev/null | awk -F, '
+        $10 + 0 > 0 { s += $10; b = $3; ++k }
+        END { if (k > 0 && s > 0) printf "%.0f", k * b / s * 1e6 / (1024*1024) }')
+    GMEAN=$(tail -n +3 "$scsv" 2>/dev/null | awk -F, '
+        $10 + 0 > 0 { s += $10; ++k }
+        END { if (k > 0) printf "%.2f", s / k }')
     HOLD50=$(awk '/^credit return/{print $4; exit}' "$slog")
     RQ50=$(awk '/^credit return/{print $8; exit}' "$slog")
     BADACK=$(awk '/^bad acks/{print $4; exit}' "$clog")
@@ -225,15 +298,24 @@ run_one () {
     [ -n "${GEN50:-}" ] || GEN50=NA
     [ -n "${SEND50:-}" ] || SEND50=NA
     [ -n "${MIBS:-}" ]  || MIBS=NA
+    [ -n "${GMEAN:-}" ] || GMEAN=NA
     [ -n "${HOLD50:-}" ] || HOLD50=NA
     [ -n "${RQ50:-}" ]  || RQ50=NA
     [ -n "${BADACK:-}" ] || BADACK=0
     [ -n "${G50:-}" ]   || G50=NA
+
+    # The server withholds its rate under --verify every and --poison on,
+    # because either one costs this thread more per message than the wire time.
+    # That guard lives in the server, so honour it here rather than quietly
+    # recomputing a rate it deliberately refused to print.  handoff.md 7i.
+    case "$sx" in
+        *"--verify every"*|*"--poison on"*) MIBS=NA ;;
+    esac
 }
 
 # ── go ───────────────────────────────────────────────────────────────────────
 mkdir -p "$ROOT/data"
-echo "arm,npts,bytes,slots,rep,rtt_p50,rtt_p99,gen_p50,send_p50,e2e_p50,fft_p50,gap_p50,hold_p50,rq_p50,mib_s,n,verified,bad_ack,sm_mhz,result,gitsha" > "$OUT"
+echo "arm,npts,bytes,slots,rep,rtt_p50,rtt_p99,gen_p50,send_p50,e2e_p50,fft_p50,gap_p50,hold_p50,rq_p50,mib_s,n,verified,bad_ack,sm_mhz,result,gitsha,gap_mean" > "$OUT"
 
 echo "transport cell: ${BYTES} bytes (${NPTS} pts), ${SLOTS} slots, $REPS reps, sha $GITSHA"
 echo "  echo    warmup ${ECHO_WARM} then ${ECHO_MSGS} measured, serialised"
@@ -295,6 +377,21 @@ for R in $(seq 1 "$REPS"); do
         run_one "$ARM" "$R" "$NPTS" \
           "--poison off --verify off" "--gen inplace" \
           "$WARM_MSGS" "$MSGS" ;;
+      stream-loopback)
+        # Both endpoints on the Spark, same RoCE address, same local device.
+        # This is the DAQiri-comparable arm and nothing else. It is NOT a
+        # full-pipeline number: there is no PXI in it, so it does not measure
+        # data production through FFT complete across the link, and it must
+        # never appear in the same table as a PXI-to-Spark row without the
+        # topology stated in the caption.
+        #
+        # --gen inplace, because the loopback sender shares the Spark's memory
+        # bandwidth with the receiver and a 4 MiB memcpy per message would be
+        # charged to a resource the receiver is also using. copy mode here would
+        # measure the harness contending with itself.
+        run_one "$ARM" "$R" "$NPTS" \
+          "--poison off --verify off" "--gen inplace" \
+          "$WARM_MSGS" "$MSGS" ;;
       *) echo "unknown arm $ARM" >&2; continue ;;
     esac
 
@@ -319,11 +416,24 @@ for R in $(seq 1 "$REPS"); do
        && [ "${VERIF:-0}" -lt "${N:-0}" ] && [ "$RES" = OK ]; then
       RES=BADSPECTRUM
     fi
+    # Physical plausibility. enp1s0f0np0 reports 50000 Mb/s, so 6250 bytes/us is
+    # the hard ceiling and 5960 MiB/s is the arithmetic limit no configuration
+    # can beat. mib_s above is bytes over elapsed span, which cannot exceed the
+    # link without something being wrong upstream of the arithmetic, so this
+    # gate should now never fire. It stays because it did fire: the server's
+    # median-derived figure reported 10792 to 13517 MiB/s at 1 MiB on 2026-08-24
+    # and read as the best result in the table until someone divided by the link
+    # speed. Section 7m.
+    if [ "$RES" = OK ] && [ "${MIBS:-NA}" != NA ]; then
+      if [ "$(awk -v m="$MIBS" -v l="$LINK_MIB_S" 'BEGIN{print (m>l*1.02)?1:0}')" = 1 ]; then
+        RES=ABOVELINK
+      fi
+    fi
 
     printf "%-10s %-4s %-10s %-9s %-9s %-9s %-9s %-8s %-7s %s\n" \
       "$ARM" "$R" "${RTT50}" "${GEN50}" "${SEND50}" "${E50}" "${G50}" \
       "${MIBS}" "${SM:-NA}" "$RES"
-    echo "$ARM,$NPTS,$BYTES,$SLOTS,$R,$RTT50,$RTT99,$GEN50,$SEND50,$E50,$F50,$G50,$HOLD50,$RQ50,$MIBS,$N,$VERIF,$BADACK,${SM:-NA},$RES,$GITSHA" >> "$OUT"
+    echo "$ARM,$NPTS,$BYTES,$SLOTS,$R,$RTT50,$RTT99,$GEN50,$SEND50,$E50,$F50,$G50,$HOLD50,$RQ50,$MIBS,$N,$VERIF,$BADACK,${SM:-NA},$RES,$GITSHA,$GMEAN" >> "$OUT"
   done
 done
 

@@ -1505,6 +1505,177 @@ the more faithful arm, not just the faster one.
 Read Result 4 with this attached: its arithmetic was correct and its conclusion was one step
 short.
 
+## 7k. DAQiri needs a CUDA host on both ends, so PXI-to-Spark is not available (2026-08-24)
+
+The standing plan was to split `daqiri/bench_daqiri_roce_pipeline.cc` into client and server
+roles and run DAQiri PXI to Spark, retiring the loopback-against-wire comparison. That plan
+does not work, and the reason is not the role split.
+
+**The API was never the obstacle.** `rdma_set_header(BurstParams*, RDMAOpCode op_code,
+uintptr_t conn_id, bool is_server, int num_pkts, uint64_t wr_id, const std::string&
+local_mr_name)` at `~/daqiri/include/daqiri/common.h:915` takes `is_server` as a parameter, not
+as a property of the connection, and the `RDMAOpCode` enum at `types.h:80` offers `SEND` and
+`RECEIVE` to either side. `daqiri/config_roce_pipeline.yaml` already provisions
+`DATA_TX_GPU_SERVER`, `Server_TX_Queue`, `DATA_RX_GPU_CLIENT` and `Client_RX_Queue`, currently
+carrying a comment that they exist only to satisfy config validation. Both code sequences exist
+in the benchmark already, one in each worker. Unhardcoding the two addresses at lines 57 to 59
+and adding a `--role` flag is about half a day.
+
+**The obstacle is that DAQiri cannot run on the PXI.** Checked directly:
+
+| Check | Result |
+|---|---|
+| `ldd ~/daqiri/build/src/libdaqiri.so` | links `libcudart.so.13` and `libcuda.so.1` |
+| `ls -d /usr/local/cuda*` on the PXI | `NO_CUDA` |
+| `find / -name 'libdaqiri*' -o -name 'daqiri.h'` on the PXI | nothing |
+| PXI toolchain | `/usr/bin/cmake`, `/usr/bin/g++`, no `nvcc` |
+
+The PXIe-8881 has no GPU, no NVIDIA driver and no CUDA runtime. DAQiri's memory region kind in
+the RoCE config is `host_pinned`, which is `cudaHostAlloc`, so even a CUDA runtime installed on
+NI Linux RT with no NVIDIA device present would fail at the first allocation. Making DAQiri run
+on a GPU-less host means a CUDA-free host memory path inside a vendor library this project does
+not own.
+
+**So DAQiri requires a CUDA-capable host on both ends.** That is a property of the product, not
+of our harness, and it is the reason every DAQiri number in this project is Spark to Spark.
+
+**What is still buildable, and what it costs:**
+
+| Item | Estimate | Confidence |
+|---|---|---|
+| Role split: `--role server\|client`, unhardcode lines 57 to 59 | 0.5 day | Medium. The workers are already separate functions. |
+| Echo instrument on the DAQiri path plus a calibration arm | 0.5 to 1 day | Medium. The API and the config support it; untested. |
+| DAQiri PXI to Spark | **Not available** | **High. Checked directly, see the table above.** |
+
+Total 1 to 1.5 days for a **Spark-to-Spark DAQiri full-pipeline number**: data production
+through FFT complete, on one clock, in DAQiri's own topology. That is honest and useful if it
+is labelled, and it is not the cross-machine comparison. The reason the echo instrument is the
+bulk of the estimate is that DAQiri's clock currently starts after arrival, exactly as ours did
+before section 7h, so a full-pipeline figure needs the round-trip ack on the DAQiri path too.
+
+**What we did instead.** `stream-loopback` in `scripts/transport_cell.sh` puts both extbuf
+endpoints on the Spark at `192.168.20.1` over the same local RoCE device, matching DAQiri's
+topology exactly. That makes the DAQiri comparison same-topology and same-window without
+touching the vendor library. See Table B in section 7l.
+
+### 7l. Table B: extbuf loopback against DAQiri loopback, same box, same window (2026-08-24)
+
+**Topology, stated because the last two versions of section 7 were retracted for not stating
+it.** Both arms in this table are loopback on the Spark. DAQiri's
+`bench_daqiri_roce_pipeline.cc` hardcodes `SERVER_ADDR` and `CLIENT_ADDR` both to
+`192.168.20.1` and runs TX and RX as two threads in one process. `stream-loopback` runs
+`extbuf_fft_client` and `extbuf_fft_server` as two processes on that same address over the
+same local RoCE device. The PXI is not involved in either. Nothing here crosses a machine
+boundary, and no number in this table may be compared to a cross-machine number.
+
+**Window, identical by construction.** Both clocks start once the buffer has landed and stop
+after the transform. DAQiri takes `t_rx` when the RECEIVE completion is dequeued; extbuf takes
+`t0` when `receive_ext` returns and `t1` after the CUDA event gate. This is post-arrival
+processing latency for both. Time in flight is outside the window for both.
+
+Medians of 3 reps for extbuf (sha `loopback`, `sm_mhz` 2509 to 2548 on every row), against the
+2-rep DAQiri figures from the table in section 7 (sha `952b68a`). All microseconds.
+
+| size | extbuf e2e | DAQiri e2e | delta | extbuf resid | DAQiri resid |
+|---|---|---|---|---|---|
+| 16 KB | **9.63** | 11.70 | -2.07 | 4.83 | 5.13 |
+| 256 KB | **19.73** | 20.74 | -1.01 | 5.07 | 4.87 |
+| 1 MiB | 34.72 | **28.27** | +6.45 | 9.12 | 4.96 |
+| 4 MiB | 104.14 | **62.31** | +41.83 | 21.90 | 4.95 |
+
+Negative delta means extbuf is faster. It is a crossover, not a win: extbuf is ahead at the
+two small sizes by 1 to 2 us and behind at the two large ones, by 1.67x at 4 MiB. Anyone
+quoting this table at one size is quoting the opposite result to whoever quotes it at another,
+which is the reason it is printed at four sizes and not one.
+
+**Three limits on it, none of which are small.**
+
+First, the two arms were **not interleaved with each other**. Extbuf is 3 reps taken today,
+DAQiri is 2 reps taken on 2026-08-19 on a different build. Sections 7 version 1 and version 2
+were both retracted for exactly this, and a 6.8 us drift between two DAQiri runs is on the
+record there. The 1 and 2 us deltas at 16 KB and 256 KB are inside that drift and should be
+read as a tie. The 41.83 us at 4 MiB is not.
+
+Second, **the residual columns do not mean the same thing in the two arms.** Extbuf's residual
+is `e2e - fft.last_exec_us()`, and it grows 4.83 -> 5.07 -> 9.12 -> 21.90 with size while
+DAQiri's sits flat at 4.87 to 5.13. A residual that scales with payload is the signature of
+work that `last_exec_us` is not counting and the event gate is then waiting on, so the extbuf
+fft/residual split is an artefact of where the transform's own timer stops. The e2e column is
+unaffected by this and is the only column in the table that is like for like.
+
+Third, and it governs the 4 MiB row: **most of that 41.83 us is in the transform, not the
+transport.** Taking DAQiri's cuFFT term as `e2e - resid` gives 57.36 us at 4 MiB against
+extbuf's 82.24 us, a 43% difference on what should be the same transform on the same GPU at
+the same clock. Until that is reconciled the 4 MiB row is mostly reporting an FFT difference.
+The thing to check first is whether the two arms run the same transform at all, real-to-complex
+against complex-to-complex, since that alone would account for a factor of roughly this size.
+
+**What the table does establish.** The comparison the project was built around is now
+same-topology and same-window, and it can be run again interleaved in one sitting whenever the
+DAQiri arm is rebuilt, because both arms are now driven from `scripts/transport_cell.sh`. That
+was the blocker, and it is gone.
+
+### 7m. The sustained rate was one over a median, and it was never a rate (2026-08-24)
+
+`extbuf_fft_server.cu:866` computed the headline throughput as
+
+```
+mib_s = frame_bytes / gap_p50
+```
+
+That is not bytes over elapsed time. It is the reciprocal of the median inter-arrival, and it
+equals the sustained rate only when the cadence has a single mode. This was found because the
+1 MiB cells of the size sweep reported 10792 to 13517 MiB/s on a 50 Gb/s link whose payload
+ceiling is 5960, and because the same cell flipped between roughly 76 us and roughly 176 us
+across reps with nothing changed.
+
+Byte and message accounting were checked first and are correct: 19999 gaps for 20000 messages,
+`frame_bytes` 1048576. The fault is entirely in the statistic.
+
+Arrival timestamps are taken after `receive_ext` returns, not when the buffer lands. When the
+consumer stalls, everything that arrived during the stall is reaped back to back and gets
+timestamps about 26 us apart. At 1 MiB that is 40337 bytes/us, 6.5 times the link, so those
+gaps are consumer loop cost and not wire time. With 4 slots the pattern is roughly three short
+gaps then one long one, and the measured distribution matches: p25 32.6 us, p75 280.2 us, 51%
+of gaps below half the mean. The median then sits on the boundary between the two clusters and
+flips at random, which is the reported instability.
+
+`scripts/gap_audit.sh` recovers the honest rate from `gap_us` in the per-message CSVs, so no
+rebuild and no re-run were needed. `span = sum of gaps`, `rate = n * bytes / span`. `CSV=1`
+emits it for every cell at once; `data/honest_rates.csv` is that output for both sweeps.
+Field 3 of the per-message CSV is the frame length including the 256-byte header, so these
+rates are frame rates, not payload rates. That is 0.006% at 4 MiB and 6.25% at 4 KB, which
+matters only at the small end and only in the third significant figure.
+
+| arm | size | reported (1/median) | honest (bytes/span) | mean/median |
+|---|---|---|---|---|
+| stream-inplace | 4 KB | 340 to 345 | 242 to 263 | 1.30 to 1.43 |
+| stream-inplace | 16 KB | 1295 to 1314 | 1142 to 1253 | 1.05 to 1.14 |
+| stream-inplace | 256 KB | 5808 to 5842 | 3210 to 4864 | 1.20 to 1.82 |
+| stream-inplace | 1 MiB | 5779 to 11297 | 4950 to 5178 | 1.12 to 2.28 |
+| stream-inplace | 4 MiB | 5842 to 5864 | **5796 to 5803** | **1.01** |
+
+**Consequences, in order of how much they cost.**
+
+The 1 MiB row is **no longer excluded**. Its honest rate is 4874 to 5326 MiB/s across all six
+runs, every one under the ceiling and agreeing within 9%, against a 2.2x spread in the reported
+figures. The transport was never doing anything impossible. Five sizes can be reported, not
+four.
+
+The 256 KB line-rate claim is **withdrawn**. Reported 97.6% of wire, honest 54% to 86% and
+badly variable. The pipeline does not reach the wire at 256 KB.
+
+The 4 MiB line-rate claim **survives, and is now better supported than before.** At 4 MiB
+mean and median agree to 1%, so the median was never lying there, and the honest sustained
+rate of 5796 to 5803 MiB/s is 97.3% of the 5960 MiB/s theoretical payload ceiling. That is the
+one size where the cadence is smooth, because the 686 us wire time is large enough to swamp
+every stall the smaller sizes are punctuated by.
+
+**The guard.** `transport_cell.sh` now refuses any cell whose rate exceeds the link by more
+than 2% and marks it `ABOVELINK`. That would have caught this on the run that produced it.
+The deeper lesson is the one from 7i one layer further out: a median is not a rate, and an
+impossible number reads as the best result in the table rather than as the broken one.
+
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
 `CMAKE_CUDA_ARCHITECTURES` was hard-coded to **90** (Hopper) in both CMakeLists and both build
@@ -1643,11 +1814,11 @@ list they came from is what a reader would otherwise reconstruct.
    client removes the frame-build memcpy. 5878 MiB/s median against 4989, three of three, and
    `gap_p50` lands on the 685 us wire time. The pipeline is at line rate at 4 MiB and the
    framing question is answered: the 85 percent was the harness, not the transport.
-7. **DAQiri cross-machine.** Both DAQiri benchmarks are single-process loopback with both
-   endpoints on the same address, while the extbuf RDMA arm is genuinely PXI to Spark, so the
-   standing comparison is loopback against wire. Fixing it means splitting
-   `daqiri/bench_daqiri_roce_pipeline.cc` into real client and server roles, which is real work
-   rather than a flag. **This is now the top item.**
+7. ~~**DAQiri cross-machine.**~~ **Architecturally unavailable, established 2026-08-24. See 7k.**
+   DAQiri cannot run on the PXI at all, so PXI-to-Spark is not a matter of splitting roles. The
+   remaining option is a Spark-to-Spark DAQiri arm with the echo instrument, 1 to 1.5 days,
+   which buys a full-pipeline latency for DAQiri in its own topology but not a cross-machine
+   comparison. Everything needed to specify that work is in 7k.
 8. **Decide what to do about per-message verification.** 7j closed the cheap version of this:
    `detect_peaks` costs about 2400 us of the single consumer thread per message at 4 MiB and
    moving it out of the credit window changed nothing, so it cannot be made free by reordering.
