@@ -1250,6 +1250,45 @@ that stands.
   release-before-completion gate we control. Those are correctness and steady-state arguments,
   not microsecond arguments.
 
+### Candidate mechanism: it may be dirty lines, not registration. UNTESTED (2026-08-24)
+
+There is a reading that reconciles 7c, 7h and the Table B result in 7n, and it is worth naming so
+it can be tested or killed rather than rediscovered. **This is a hypothesis. No measurement in this
+document tests it.**
+
+7c writes the buffer, transforms it immediately, and repeats, into the **same buffer** every
+iteration. The lines are maximally dirty in CPU cache at the moment the GPU reads them, and they
+are re-dirtied every iteration. The real pipeline does neither: `extbuf_fft_server` cycles 4 slots
+and every arm in the Table B rotation runs at `PACE=25`, so by the time the GPU reads a slot those
+lines have plausibly been evicted to memory.
+
+If that is the mechanism, **the penalty belongs to recently CPU-dirtied memory, not to registered
+memory**, and `cudaHostRegister` makes the snoop of those dirty lines more expensive. One statement
+then covers all three results: large in a tight microbenchmark (7c), absent in a NIC-fed receiver
+where nothing is dirtied (7h), and absent between `opt` and `daq` in a paced, slot-cycling pipeline
+(7n, where they agree to 0.86 us despite `opt` having a CPU producer and registered memory).
+
+Two things already measured point the same way:
+
+- 7g's inversion. The penalty needs a CPU write to exist at all and flips sign without one.
+- **7q's incidental.** `single` (one buffer, re-transformed) is 3.8 and 10.1 us **slower** on the
+  transform than `cycle` (4 slots) while its CPU write is 5 to 9 us **faster**. Residency helps the
+  writer and costs the reader. That is the predicted signature, measured, and it was recorded as an
+  aside rather than as evidence for anything.
+
+**How to test it, cheapest first.** All three are variations on `fft/bench_fft_memsrc.cc` with the
+memory kind held fixed:
+
+1. Vary the delay between the write and the transform (0, 25, 100, 400 us). If the penalty decays
+   with delay, that is the answer.
+2. Vary the number of slots cycled (1, 2, 4, 16). Changes the working set rather than the time, so
+   it separates eviction-by-capacity from eviction-by-time.
+3. Add an explicit cache-clean arm: `dc cvac` over the written range before the transform. If the
+   penalty vanishes, it is dirty lines and nothing else.
+
+Half a day to a day. Until one of them runs, do not state this as the mechanism. State it as the
+reason 7c and 7h are not in contradiction.
+
 Full write-up, including what it costs the RDMA plan, in `rdma_transport_plan.md` §7.
 
 ## 7h. Phase 4, the 4 MB cell: the two provenances in the real receiver (2026-08-20)
@@ -1728,15 +1767,26 @@ it. Interleaved, 5 reps, n = 1048576, `--offset-bytes 256`, `ha_off` minus `host
 run to run spread. A 256 byte offset from a 2 MB aligned base costs nothing.
 
 **What the memory class does cost, measured inside the Table B rotation itself.** The `base`
-arm copies host to device and transforms from `cudaMalloc`'d memory; `opt`, `daq` and `extbuf`
-all transform in place from pinned host memory. At 4 MiB, one window, arms rotated:
+arm copies the payload into device scratch and transforms from `cudaMalloc`'d memory; `opt`,
+`daq` and `extbuf` all transform in place from pinned host memory. At 4 MiB, one window, arms
+rotated:
 
 | arm | cuFFT p50 | reads from |
 |---|---|---|
-| `base` | 47.78 | device memory, after an H2D copy |
+| `base` | 47.78 | device memory, after the realign copy |
 | `daq` | 64.13 | pinned host, mapped |
 | `opt` | 64.99 | pinned host, mapped |
 | `extbuf` | 78.40 | pinned host, mapped |
+
+> **Which copy, and which arms copy at all (corrected 2026-08-24).** This table and the paragraph
+> above it used to say `base` copies "host to device". It does not. `headline_sweep.sh` gives
+> `base` the flags `--zero-copy --no-zc-align`, so the payload is already a mapped host pointer
+> and the realign path copies it **device to device**, into scratch. `daq` runs `--zero-copy` and
+> `opt` runs `--zero-copy` with the align probe on, so **neither of them copies at all**. Section
+> 7i's sentence that "the gRPC and DAQiri paths transform `cudaMalloc`'d device memory after a
+> host-to-device copy" is true of the socket benchmark in `daqiri/bench_daqiri_pipeline.cc` and of
+> the copy-mode gRPC server, and is **not** true of the four arms in this table. Read 7i's sentence
+> as scoped to those, not to Table B.
 
 `opt` and `daq` land within 0.9 us of each other, which is the check that the ladder is real:
 two different transports, same memory class, same transform time. The isolated ladder in

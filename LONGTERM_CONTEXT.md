@@ -577,12 +577,22 @@ paced one. At 16 and 256 KB the residuals agree within 0.42 µs, so the whole ga
 is transform time rather than transport.
 
 The 4 MiB cuFFT terms are the memory-class ladder, measured in the same rotation: `base` 47.78
-reading from device memory after an H2D copy, `daq` 64.13 and `opt` 64.99 reading in place from
-pinned host memory, `extbuf` 78.40 also from pinned host. `opt` and `daq` agreeing to 0.9 µs is
-what makes the ladder credible. **Zero copy costs about 16 µs at 4 MiB against a device-resident
-transform**, and that is the architectural price, paid knowingly. Extbuf's further 14 µs is
-unexplained; both named candidates, stream mode and slot geometry, were tested and ruled out
-(handoff 7q), which locates it in the live pipeline rather than the memory layout.
+reading from device memory, `daq` 64.13 and `opt` 64.99 reading in place from pinned host memory,
+`extbuf` 78.40 also from pinned host. `opt` and `daq` agreeing to 0.9 µs is what makes the ladder
+credible. **Zero copy costs about 16 µs at 4 MiB against a device-resident transform**, and that is
+the architectural price, paid knowingly. Extbuf's further 14 µs is unexplained; both named
+candidates, stream mode and slot geometry, were tested and ruled out (handoff 7q), which locates it
+in the live pipeline rather than the memory layout.
+
+> **Which arms copy, stated because two sections of handoff.md disagreed about it (corrected
+> 2026-08-24).** `headline_sweep.sh` runs `daq` with `--zero-copy` and `opt` with `--zero-copy` and
+> no `--no-zc-align`, so **both transform pinned host memory in place and neither copies**. Only
+> `base` copies, because `--no-zc-align` forces the realign path, and **that copy is D2D**, from the
+> mapped shmem buffer into device scratch, **not H2D**. This paragraph previously said `base` read
+> device memory "after an H2D copy", which is wrong. `handoff.md` 7i also says the gRPC and DAQiri
+> paths transform device memory after an H2D copy; that sentence describes a different pair of
+> benchmarks and does not describe this table. `base` transforming 16 µs faster than `opt` and `daq`
+> is exactly the point: it is device-resident *because* it paid a 77 µs copy to get there.
 
 Caveat on one cell: the 16 KB `daq` figure rests on a single rep, the other two having tripped
 the clock gate at 2379 and 1560 MHz. Their raw values, 9.408 and 9.344, agree with the kept

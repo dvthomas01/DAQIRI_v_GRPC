@@ -42,6 +42,13 @@ numbers behind an interface teams already use. Three rules were set at the start
 throughout: keep the gRPC API structurally intact, put every optimization behind a flag so the
 unoptimized baseline stays measurable, and verify the spectrum before believing any speedup.
 
+**The two machines, since they come up constantly.** The receiving machine is an NVIDIA DGX Spark,
+called **the Spark** here. Its processor is a GB10, a Grace-Blackwell part that puts the CPU and the
+GPU on one coherent interconnect, which will matter a great deal later. The sending machine is an NI
+PXIe-8881 controller, called **the PXI**, which is the kind of box a real digitizer would plug into.
+It runs a realtime Linux and, importantly, has no GPU at all. Between them is a 50 Gb/s link running
+RoCE, RDMA over Converged Ethernet, which is RDMA carried on ordinary Ethernet hardware.
+
 The starting position was bad. On the same GPU, at a 4 MB payload, gRPC-Direct's post-arrival
 processing latency was roughly twice DAQiri's.
 
@@ -140,24 +147,29 @@ no effect, twice, under two different measurement disciplines. And `cudaHostRegi
 looked promising on paper, is refused outright by the GB10 driver.
 
 One infrastructure bug found here is worth carrying forward. The build was configured for `sm_90`,
-the compute capability of Hopper GPUs, while the GB10 in this machine is `sm_121`, so every custom
-kernel failed to launch silently, and cuFFT masked it because cuFFT ships its own compiled code. The
-first custom-kernel run "won" at 53.9 us while producing an all-zero spectrum. The correctness check
-is the only reason that did not become a published number.
+the compute capability of Hopper GPUs, while the GB10 in this machine reports `sm_121`. Compute
+capability is how CUDA identifies which GPU generation to compile for, and a mismatch is not an
+error at build time. So every custom kernel failed to launch silently, and cuFFT masked it because
+cuFFT ships its own compiled code for every supported generation. The first custom-kernel run "won"
+at 53.9 us while producing an all-zero spectrum. The correctness check is the only reason that did
+not become a published number.
 
 ## 4. Localizing what was left, and why the work changed direction
 
-After the fix, the picture had to be rebuilt, because the old measurements were no longer
-describing the current code. The rebuild was a 54-run sweep: nine payload sizes, three arms, two
-repetitions, with the arms run adjacently at each size so that any thermal drift hit all three
-roughly equally. The three arms were `base` (gRPC-Direct with both optimizations disabled), `opt`
-(gRPC-Direct with them on), and `daq` (DAQiri).
+After the fix, the picture had to be rebuilt, because the old measurements were no longer describing
+the current code. The rebuild was a 54-run sweep: nine payload sizes, three arms, two repetitions,
+with the arms run adjacently at each size so that any thermal drift hit all three roughly equally.
 
-At 4 MB: base 127.02 us, optimized 70.41 us, DAQiri 62.31 us. A **1.80x speedup** from the
-alignment fix and the stream, and a remaining gap of **8.10 us, about 13 percent**. Paired sign
-tests over all 18 cells came out 18 of 18 in both directions, at p = 7.6e-06: the optimization
-beats the baseline everywhere, and DAQiri still beats the optimized build everywhere. Both
-statements are solid and neither is close to the noise.
+The three arms get plain names here and keep them for the rest of the document. **gRPC baseline** is
+gRPC-Direct over shared memory with both optimizations disabled. **gRPC optimized** is the same path
+with them on. **DAQiri** is DAQiri over RoCE. In the scripts and the CSVs these are `base`, `opt`
+and `daq`, which is the only place those short names appear from here on.
+
+At 4 MB: gRPC baseline 127.02 us, gRPC optimized 70.41 us, DAQiri 62.31 us. A **1.80x speedup** from
+the alignment fix and the stream, and a remaining gap of **8.10 us, about 13 percent**. Paired sign
+tests over all 18 cells came out 18 of 18 in both directions, at p = 7.6e-06: the optimization beats
+the baseline everywhere, and DAQiri still beats the optimized build everywhere. Both statements are
+solid and neither is close to the noise.
 
 > [Source note: with only two repetitions, the "median" quoted throughout for this sweep is the
 > mean of two values. The sign tests are over all 18 size-by-rep cells and are unaffected, but the
@@ -202,12 +214,12 @@ mechanism.** The ladder only ever *read* the buffer, transforming the same bytes
 without anything writing to them first. Real pipelines always write first, because something has to
 put the data there. Adding a producer write before each transform separated the arms immediately:
 
-| arm | how it was built | write (us) | transform (us) |
-|---|---|---|---|
-| `hostalloc` | `cudaHostAlloc` | **56.75** | **53.22** |
-| `heapreg` | `malloc` + `cudaHostRegister` | 118.66 | 63.07 |
-| `shmreg` | `/dev/shm` + `cudaHostRegister` | 117.49 | 64.19 |
-| `hugereg` | verified 2 MB huge pages + `cudaHostRegister` | 114.53 | 66.91 |
+| how the buffer was obtained | CPU write (us) | GPU transform (us) |
+|---|---|---|
+| driver-allocated, `cudaHostAlloc` | **56.75** | **53.22** |
+| heap, then registered with `cudaHostRegister` | 118.66 | 63.07 |
+| shared memory in `/dev/shm`, then registered | 117.49 | 64.19 |
+| verified 2 MB huge pages, then registered | 114.53 | 66.91 |
 
 Driver-allocated memory was faster on both halves: about 2x on the CPU write and 10.94 us on the
 GPU transform at 4 MB, 15 of 15 repetitions, p = 6.104e-05. The three slow arms have nothing in
@@ -254,6 +266,39 @@ unregistration at teardown, a fixed slot pool, and a release-before-completion g
 control. Those are correctness and steady-state arguments, and they should not be dressed up as a
 latency argument.
 
+### A candidate mechanism, and it is a hypothesis rather than a finding
+
+There is a way of tying the two halves together that is worth having in your pocket, as long as it
+is labelled for what it is: **untested**.
+
+Look at how the fast harness measures. It writes the buffer, transforms it immediately, and repeats,
+into the same buffer every time. The cache lines are maximally dirty at the moment the GPU reads
+them, and the same lines are re-dirtied on every iteration. The real pipeline does neither of those
+things. It cycles across four slots and there is pacing between the write and the transform, so
+those lines have very likely been evicted to memory before the GPU gets there.
+
+If that is what is going on, then the penalty is not a property of registered memory at all. It is a
+property of **recently CPU-dirtied** memory, and registration makes the coherency snoop of those
+dirty lines more expensive. That single statement would explain both results at once: why the
+penalty is large in a tight microbenchmark, and why it vanishes in a paced pipeline.
+
+Two results already in hand point the same direction. The write-crossed experiment above shows the
+penalty needs a CPU write to exist at all, and inverts without one. And the slot-geometry probe
+turned up an incidental that is exactly the predicted signature: a single re-used buffer transforms
+**3.8 to 10.1 us slower** than cycling across four slots, while its CPU write is **5 to 9 us
+faster**. Keeping lines resident helps the writer and costs the reader, which is what a snoop cost
+looks like from both ends.
+
+What would test it, in rough order of cost. Hold the memory kind fixed and vary the delay between
+the write and the transform; if the penalty decays as the delay grows, the hypothesis is right.
+Separately vary how many slots are cycled, which changes the working set rather than the time. And
+most directly, flush the written lines explicitly after the write on the aarch64 side and see
+whether the penalty disappears. Any of the three would convert this paragraph into either a finding
+or a dead candidate.
+
+Until one of them is run, do not present this as the answer. Present it as the reason the two
+results are not actually in contradiction, and as the specific thing you would go and measure.
+
 ## 6. What the hardware allows, and what got built
 
 Running in parallel with the placement work was a more ambitious idea: stop reading the transform's
@@ -274,11 +319,11 @@ identical registration on device memory and was rejected with "Bad address". Tha
 more than the positive result alone, because it upgrades "we chose host memory" into "host memory is
 the only option this hardware offers".
 
-There is a consolation in the architecture. GB10 is a Grace-Blackwell part with a coherent
-CPU-to-GPU interconnect, and on it the host pointer returned by `cudaHostAlloc` and the device
-pointer returned by `cudaHostGetDevicePointer` are **the same address**, `0x32ee00000`. Host memory
-is not a staging area on this chip, it is memory the GPU reads natively. Landing in host memory is
-not second best, it is the design.
+There is a consolation in the architecture. The GB10's CPU and GPU share a coherent interconnect,
+and on it the host pointer returned by `cudaHostAlloc` and the device pointer returned by
+`cudaHostGetDevicePointer` are **the same address**, `0x32ee00000`. Host memory is not a staging
+area on this chip, it is memory the GPU reads natively. Landing in host memory is not second best,
+it is the design.
 
 The fabric itself was measured and found blameless, and that measurement contains one of the two
 corrections worth reading in full. Between the two machines is a 50 Gb/s RoCE link, RDMA over
@@ -328,8 +373,10 @@ and a single-message version at a small payload would have reported all-clear on
 race fully present.
 
 That work was then carried into gRPC-Direct proper, using easyrdma's external-buffer interface so
-the library writes into a pool we allocate rather than one it allocates. That arm is called `extbuf`
-throughout, and it is the deliverable: DAQiri's architecture, reached through the gRPC API.
+the library writes into a pool we allocate rather than one it allocates. That arm is the
+deliverable: DAQiri's architecture, reached through the gRPC API. This document calls it **gRPC over
+RDMA**. The scripts and the CSVs call it `extbuf`, short for external buffer, and that short name is
+not used again here.
 
 ## 7. Widening the window, and what it showed
 
@@ -403,12 +450,15 @@ even with a runtime installed. **DAQiri requires a CUDA-capable host on both end
 property of the product, not of this harness, and it is why every DAQiri number in the project is
 Spark-to-Spark loopback.
 
-Rather than compare loopback against wire, both arms were put on the same footing: the gRPC-Direct
-RDMA receiver was run in loopback on the Spark too, over the same local RoCE device, matching
-DAQiri's topology exactly. Then all four arms were run inside one rotation of one script, in one
-thermal window, at one message rate, three repetitions, 1000 measured messages after 500 warmup.
+Rather than compare loopback against wire, both arms were put on the same footing. **Loopback** here
+means both endpoints run on the Spark and talk to each other over the local RoCE device, so nothing
+crosses a machine boundary. DAQiri only works that way on this bench, so the gRPC-Direct RDMA
+receiver was run in loopback too, over the same device, matching DAQiri's topology exactly. Then all
+four arms were run inside one rotation of one script, in one thermal window, at one message rate,
+three repetitions, 1000 measured messages after 500 warmup. No number in the table below may be
+compared against a cross-machine number.
 
-| payload | base | opt | daq | extbuf |
+| payload | gRPC baseline | gRPC optimized | DAQiri | gRPC over RDMA |
 |---|---|---|---|---|
 | 16 KB | 15.74 | 11.38 | **9.46** | 10.74 |
 | 256 KB | 26.45 | 22.94 | **18.22** | 20.82 |
@@ -426,29 +476,29 @@ not thermal, and varying the warmup from 50 to 20,000 messages moved it by under
 a cold start. **The mechanism is unexplained and is a live open question.**
 
 The remaining gap at 4 MiB decomposes cleanly, and the decomposition is where the honest ending
-lives. Inside that same rotation the cuFFT times were: `base` 47.78 us reading from device memory,
-`daq` 64.13 and `opt` 64.99 reading in place from pinned host memory, and `extbuf` 78.40 also from
-pinned host.
+lives. Inside that same rotation the cuFFT times were: gRPC baseline 47.78 us reading from device
+memory, DAQiri 64.13 and gRPC optimized 64.99 reading in place from pinned host memory, and gRPC
+over RDMA 78.40 also from pinned host.
 
-The fact that `opt` and `daq` land within 0.9 us of each other is what makes the ladder credible.
-Those are two entirely different transports on the same class of memory, and they agree. Against
-them, `base` transforms 16 us faster, and the reason is that `base` has the alignment optimization
-*disabled*, so it copies the payload into device memory first and then transforms device-resident
-data. **That 16 us is the priced cost of zero-copy at 4 MiB.** Reading in place from host memory is
-slower for the transform than reading from device memory, and the pipeline pays it knowingly,
-because the alternative is a copy that costs 77 us. It is a deliberate trade, and it is now
-measured rather than assumed.
+The fact that gRPC optimized and DAQiri land within 0.9 us of each other is what makes the ladder
+credible. Those are two entirely different transports on the same class of memory, and they agree.
+Against them, the baseline transforms 16 us faster, and the reason is that the baseline has the
+alignment optimization *disabled*, so it copies the payload into device memory first and then
+transforms device-resident data. **That 16 us is the priced cost of zero-copy at 4 MiB.** Reading in
+place from host memory is slower for the transform than reading from device memory, and the pipeline
+pays it knowingly, because the alternative is a copy that costs 77 us. It is a deliberate trade, and
+it is now measured rather than assumed.
 
-That accounts for most of the remainder. What is left is `extbuf` sitting 14.27 us above the rung
-`daq` and `opt` share, and that number is **open**. It has been bounded rather than explained. Both
-named candidates were tested and eliminated: the CUDA stream mode was identical in both arms, and
-the slot geometry costs nothing, with a probe that reproduces the receiver's pool exactly showing
-that padding the slot stride to a 2 MB boundary costs 0.16 to 0.35 us and moving the payload off
-its 256-byte offset onto a page boundary gains 0.26 us. Because that probe reproduces the pool
-exactly and still lands on the correct rung, the 14 us is **not in the memory layout**. It is
-somewhere in the live pipeline: transforming while the network card writes other slots, or how the
-receive thread and the completion gate interleave. Narrower than it was, still unexplained, and
-nothing in any current claim depends on it.
+That accounts for most of the remainder. What is left is gRPC over RDMA sitting 14.27 us above the
+rung the other two share, and that number is **open**. It has been bounded rather than explained.
+Both named candidates were tested and eliminated: the CUDA stream mode was identical in both arms,
+and the slot geometry costs nothing, with a probe that reproduces the receiver's pool exactly showing
+that padding the slot stride to a 2 MB boundary costs 0.16 to 0.35 us and moving the payload off its
+256-byte offset onto a page boundary gains 0.26 us. Because that probe reproduces the pool exactly
+and still lands on the correct rung, the 14 us is **not in the memory layout**. It is somewhere in
+the live pipeline: transforming while the network card writes other slots, or how the receive thread
+and the completion gate interleave. Narrower than it was, still unexplained, and nothing in any
+current claim depends on it.
 
 So the ending, stated plainly. A real root cause was found and fixed, worth **1.80x** at 4 MB. The
 transport itself runs at **98.0 percent of line rate**, and the full pipeline sustains **97.3
@@ -460,27 +510,28 @@ zero-copy, and the last 14 us has been bounded out of the memory layout without 
 
 > [Source notes on this section, in descending order of how much they matter.
 >
-> **The largest tension between the documents.** The `cudaHostRegister` penalty of section 5
-> predicts that `opt`, which transforms iceoryx2 shared memory registered after the fact and does
-> have a CPU producer writing every buffer, should be 11 to 15 us slower at 4 MB than `daq`, which
-> uses driver-allocated memory. In the corrected table they agree to 0.86 us. An earlier sweep did
-> find `opt` slower on the transform in 18 of 18 cells, but that sweep is now attributed to the
-> pacing difference. No source document reconciles these. Either the penalty does not survive inside
-> the real pipeline, or the pacing correction absorbed it. Worth asking about; I would not assert
-> either way.
+> **The largest tension between the documents, and it now has a candidate.** The `cudaHostRegister`
+> penalty of section 5 predicts that gRPC optimized, which transforms iceoryx2 shared memory
+> registered after the fact and does have a CPU producer writing every buffer, should be 11 to 15 us
+> slower at 4 MB than DAQiri, which uses driver-allocated memory. In the corrected table they agree
+> to 0.86 us. An earlier sweep did find gRPC optimized slower on the transform in 18 of 18 cells, but
+> that sweep is now attributed to the pacing difference. No source document reconciles these. The
+> dirty-line hypothesis at the end of section 5 would reconcile them, since this table was taken at
+> 25 us of pacing with slot cycling on both arms, but that hypothesis is untested and should be
+> offered as a candidate rather than an explanation.
 >
-> **Spread.** At 4 MiB the three `extbuf` repetitions were 99.12, 94.14 and 77.55 us, so the
+> **Spread.** At 4 MiB the three gRPC over RDMA repetitions were 99.12, 94.14 and 77.55 us, so the
 > +25.17 us end-to-end delta is a median over a 21.5 us spread. The transform delta is much tighter,
 > 18.40, 14.27 and 14.21 us across the same repetitions, which is why the 14 us figure is quoted
 > with more confidence than the 25 us one. Separately, the 16 KB DAQiri cell rests on a single
 > repetition, the other two having tripped the clock gate; their raw values agree with the kept one,
 > so the row is not in doubt, but it is one sample.
 >
-> **A stale sentence.** `handoff.md` section 7i says the gRPC and DAQiri paths transform device
-> memory after a host-to-device copy, while section 7n's ladder has `opt` and `daq` transforming
-> pinned host memory in place. The script settles it: `daq` runs with `--zero-copy` and `opt`
-> without `--no-zc-align`, so both transform in place, and only `base` copies. The copy `base` makes
-> is device-to-device, not host-to-device.
+> **A stale sentence, since corrected in the source.** `handoff.md` section 7i says the gRPC and
+> DAQiri paths transform device memory after a host-to-device copy, which contradicts section 7n's
+> ladder. The script settles it: DAQiri runs with `--zero-copy` and gRPC optimized runs without
+> `--no-zc-align`, so both transform pinned host memory in place. Only the baseline copies, and that
+> copy is device-to-device, not host-to-device.
 >
 > **A missing comparison.** No full-pipeline, producer-to-spectrum number exists for DAQiri. The
 > 1364 us figure is gRPC-Direct only, unloaded, cross-machine. There is currently no full-pipeline
@@ -538,10 +589,16 @@ month.
 
 ## 10. What a follow-on would do
 
-**Explain the pacing cliff.** gRPC-Direct's transform triples between 100 and 400 us of send
-pacing while DAQiri's is flat. Clock and warmup are both eliminated. This is the highest-value open
-item because it is currently an uncontrolled variable in every comparison, and until it is
-understood, any table taken at an unprofiled pace is partly a report about the pace.
+**Test the dirty-line hypothesis.** Section 5 ends with a candidate mechanism that would reconcile
+the two memory-placement results: that the penalty belongs to recently CPU-dirtied lines rather than
+to registered memory. It is cheap to settle. Hold the memory kind fixed, vary the delay between the
+write and the transform and the number of slots cycled, and add an explicit cache flush arm. A day
+at most, and it either produces a clean transferable finding or kills the candidate.
+
+**Explain the pacing cliff.** gRPC-Direct's transform triples between 100 and 400 us of send pacing
+while DAQiri's is flat. Clock and warmup are both eliminated. This is the highest-value open item
+because it is currently an uncontrolled variable in every comparison, and until it is understood,
+any table taken at an unprofiled pace is partly a report about the pace.
 
 **Close the 14 us.** Both memory-layout candidates are eliminated and the isolated probe reproduces
 the receiver's pool without reproducing the cost, so the next place to look is the live pipeline:

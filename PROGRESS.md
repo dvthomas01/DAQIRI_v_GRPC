@@ -291,6 +291,15 @@ memory while gRPC and DAQiri transform device memory after an H2D copy, so `fft_
 confounded across paths. Both DAQiri benchmarks are also single-process loopback while the
 extbuf RDMA arm is genuinely cross-machine.
 
+> **Correction, 2026-08-24: the second side finding is scoped too widely as written.** It is true
+> of `daqiri/bench_daqiri_pipeline.cc` (the socket path) and of the copy-mode gRPC server. It is
+> **not** true of the four arms in the standing Table B. There, `headline_sweep.sh` runs `daq` with
+> `--zero-copy` and `opt` with the align probe on, so both transform pinned host memory **in place
+> with no copy**, and they agree to 0.9 µs at 4 MiB, which is what makes the memory-class ladder
+> credible rather than confounded. Only `base` copies, because `--no-zc-align` forces the realign
+> path, and that copy is **D2D into device scratch, not H2D**. See handoff 7n and the corrected
+> table in `LONGTERM_CONTEXT.md`.
+
 ### Phase 2 — the RDMA data path works, and the checker was validated first (2026-08-20, commit `7a49963`)
 
 The PXI RDMA-writes over RoCE into a `cudaHostAlloc`'d pool on the Spark and cuFFT transforms
