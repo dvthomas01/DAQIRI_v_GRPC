@@ -1571,59 +1571,7 @@ before section 7h, so a full-pipeline figure needs the round-trip ack on the DAQ
 **What we did instead.** `stream-loopback` in `scripts/transport_cell.sh` puts both extbuf
 endpoints on the Spark at `192.168.20.1` over the same local RoCE device, matching DAQiri's
 topology exactly. That makes the DAQiri comparison same-topology and same-window without
-touching the vendor library. See Table B in section 7l.
-
-### 7l. Table B: extbuf loopback against DAQiri loopback, same box, same window (2026-08-24)
-
-**Topology, stated because the last two versions of section 7 were retracted for not stating
-it.** Both arms in this table are loopback on the Spark. DAQiri's
-`bench_daqiri_roce_pipeline.cc` hardcodes `SERVER_ADDR` and `CLIENT_ADDR` both to
-`192.168.20.1` and runs TX and RX as two threads in one process. `stream-loopback` runs
-`extbuf_fft_client` and `extbuf_fft_server` as two processes on that same address over the
-same local RoCE device. The PXI is not involved in either. Nothing here crosses a machine
-boundary, and no number in this table may be compared to a cross-machine number.
-
-**Window, identical by construction.** Both clocks start once the buffer has landed and stop
-after the transform. DAQiri takes `t_rx` when the RECEIVE completion is dequeued; extbuf takes
-`t0` when `receive_ext` returns and `t1` after the CUDA event gate. This is post-arrival
-processing latency for both. Time in flight is outside the window for both.
-
-Medians of 3 reps for extbuf (sha `loopback`, `sm_mhz` 2509 to 2548 on every row), against the
-2-rep DAQiri figures from the table in section 7 (sha `952b68a`). All microseconds.
-
-| size | extbuf e2e | DAQiri e2e | delta | extbuf resid | DAQiri resid |
-|---|---|---|---|---|---|
-| 16 KB | **9.63** | 11.70 | -2.07 | 4.83 | 5.13 |
-| 256 KB | **19.73** | 20.74 | -1.01 | 5.07 | 4.87 |
-| 1 MiB | 34.72 | **28.27** | +6.45 | 9.12 | 4.96 |
-| 4 MiB | 104.14 | **62.31** | +41.83 | 21.90 | 4.95 |
-
-Negative delta means extbuf is faster. It is a crossover, not a win: extbuf is ahead at the
-two small sizes by 1 to 2 us and behind at the two large ones, by 1.67x at 4 MiB. Anyone
-quoting this table at one size is quoting the opposite result to whoever quotes it at another,
-which is the reason it is printed at four sizes and not one.
-
-**Three limits on it, none of which are small.**
-
-First, the two arms were **not interleaved with each other**. Extbuf is 3 reps taken today,
-DAQiri is 2 reps taken on 2026-08-19 on a different build. Sections 7 version 1 and version 2
-were both retracted for exactly this, and a 6.8 us drift between two DAQiri runs is on the
-record there. The 1 and 2 us deltas at 16 KB and 256 KB are inside that drift and should be
-read as a tie. The 41.83 us at 4 MiB is not.
-
-Second, **the residual columns do not mean the same thing in the two arms.** Extbuf's residual
-is `e2e - fft.last_exec_us()`, and it grows 4.83 -> 5.07 -> 9.12 -> 21.90 with size while
-DAQiri's sits flat at 4.87 to 5.13. A residual that scales with payload is the signature of
-work that `last_exec_us` is not counting and the event gate is then waiting on, so the extbuf
-fft/residual split is an artefact of where the transform's own timer stops. The e2e column is
-unaffected by this and is the only column in the table that is like for like.
-
-Third, and it governs the 4 MiB row: **most of that 41.83 us is in the transform, not the
-transport.** Taking DAQiri's cuFFT term as `e2e - resid` gives 57.36 us at 4 MiB against
-extbuf's 82.24 us, a 43% difference on what should be the same transform on the same GPU at
-the same clock. Until that is reconciled the 4 MiB row is mostly reporting an FFT difference.
-The thing to check first is whether the two arms run the same transform at all, real-to-complex
-against complex-to-complex, since that alone would account for a factor of roughly this size.
+touching the vendor library. See Table B in section 7l, and 7n for the corrected numbers.
 
 ### 7l. Table B: extbuf loopback against DAQiri loopback, same box, same window (2026-08-24)
 
@@ -1798,14 +1746,14 @@ costs about 16 us at 4 MiB, and that is the price of zero copy, paid knowingly.
 
 **So extbuf's 78.40 is the outlier and it is not explained.** Same plan, same n, same memory
 class, same timing method, same box, same window, same pace as `daq` and `opt`, and 14 us
-slower than both. The candidates left are the ones that were never differences in the FFT
-itself: `CuFFTExecutor fft(npts, own_stream)` with `own_stream = true` in extbuf against the
-default `false` in `daq` and `opt`, and extbuf's slot geometry, where `slot_bytes` is rounded
-to a multiple of 256 rather than to a page or a 2 MB boundary
-(`rdma/extbuf_fft_server.cu:404`), so consecutive slots put the payload at 256, 512, 768 and
-1024 bytes past a 2 MB boundary and no slot payload is page aligned. The `ha_off` probe only
-tested the first of those four offsets. Neither has been tested; both are cheap to test and
-neither should be quoted as the cause until one is.
+slower than both. Two candidates were named here that were never differences in the FFT
+itself: the stream mode passed to `CuFFTExecutor fft(npts, own_stream)`, and extbuf's slot
+geometry, where `slot_bytes` is rounded to a multiple of 256 rather than to a page or a 2 MB
+boundary (`rdma/extbuf_fft_server.cu:404`), so consecutive slots put the payload at 256, 512,
+768 and 1024 bytes past a 2 MB boundary and no slot payload is page aligned. The `ha_off`
+probe only tested the first of those four offsets.
+
+**Both have since been tested and both are ruled out. See 7q. The 14 us is still open.**
 
 
 ### 7m. The sustained rate was one over a median, and it was never a rate (2026-08-24)
@@ -1912,15 +1860,89 @@ anything produced after commit `e6141e5` is in this group by construction.
 5.775 GB/s for gRPC-Direct RDMA and ~5.785 GB/s for DAQiri, and calls the last two a tie. The
 tie is a sub-1-percent difference between two numbers whose construction is not written down
 anywhere and whose per-message data has not survived. That is not enough to support a tie
-claim in either direction. Either the deck reruns those two arms with the current harness,
-which now emits a span-derived rate, or the tie is dropped. The 23.59 GB/s shmem figure is far
-above anything a link can do and is a shared-memory number, so it is not affected by the link
-ceiling argument, but its construction is equally unrecorded.
+claim in either direction. The 23.59 GB/s shmem figure is far above anything a link can do and
+is a shared-memory number, so it is not affected by the link ceiling argument, but its
+construction is equally unrecorded.
+
+**The tie turned out to be worse than unverifiable, and the arithmetic says why.** 5.785 GB/s
+is 5518 MiB/s. Gate 3 measured this same fabric at **5518.37 MiB/s with the RoCE MTU
+misconfigured at 1024**, which `LONGTERM_CONTEXT.md` recorded in the same bullet where it
+called the figure a hardware ceiling. Both arms were resting on the same wall and the wall was
+a misconfiguration, not the hardware. Two transports agreeing when both are pinned to a shared
+artificial ceiling is not evidence that they perform alike. At MTU 4096 the same fabric does
+5843.23 MiB/s, 6.127 GB/s, 98.0 percent of the 6.25 GB/s line rate. The deck now says
+gRPC-Direct RDMA runs at 98 percent of line rate on a correctly configured fabric, which is a
+stronger claim than the tie and needs no DAQiri number to stand up. Fixed in
+`presentation/HANDOFF.md`, `presentation/build_technical_deck.ps1` slide 10, and
+`LONGTERM_CONTEXT.md`.
 
 **What to do with a rate from now on.** Quote the span-derived figure, quote the mean and
 median gap next to it if they differ by more than a few percent, and compare against the
 5960 MiB/s payload ceiling rather than against Gate 3's 5843, which is itself a measurement
 with its own error bar and is not a physical limit.
+
+### 7q. Both candidates for extbuf's 14 us are dead. The number stays open (2026-08-24)
+
+7o named two candidates and said neither should be quoted as the cause until one was tested.
+Both were tested, inside a half day, and neither survives. This is written up as a negative
+result on purpose: an open number with two candidates ruled out is a better handoff than an
+open number with two guesses attached to it.
+
+**Candidate 1, the stream mode, was wrong before it was tested.** 7o asserted that extbuf ran
+`own_stream = true` against `false` in the other two arms. That is backwards.
+`rdma/extbuf_fft_server.cu:315` declares `bool poison_on = true, verify_on = true, own_stream
+= false`, and line 336 shows `--own-stream` is the only thing that sets it true. The `extbuf`
+arm in `scripts/headline_sweep.sh` never passes that flag. **Both arms in the Table B rotation
+ran the same stream mode**, so the difference the candidate proposed did not exist. It is
+re-tested by measurement below anyway, because a candidate killed by reading is weaker than one
+killed by a number.
+
+**Candidate 2 was really two hypotheses, and a single arm would have confounded them.** The
+slot stride is one, and the working set is the other: extbuf cycles across four slots spanning
+16 MB of pool, while every isolated benchmark up to now re-transformed one resident buffer.
+`rdma/slotgeom_probe.cu` separates them. Four arms, rotated within each of 5 reps, 40 iterations
+per cell, n = 1048576, each arm writing its payload from the CPU before every transform so that
+no arm is measured on a buffer it did not dirty:
+
+| arm | pool | what it isolates |
+|---|---|---|
+| `single` | 1 buffer, payload at +256 | control, this is `ha_off` |
+| `cycle` | 4 slots x 4194560, payload at +256 | extbuf's geometry exactly |
+| `pad2m` | 4 slots padded to 2 MB, payload at +256 | cycling, stride realigned |
+| `cycle0` | 4 slots x 4194560, payload at +0 | cycling, offset removed |
+
+Medians of 5 reps, microseconds. Absolute values differ between the two runs because they are
+different processes and cross-process cuFFT times are not comparable; only the within-run
+differences are read.
+
+| run | `single` | `cycle` | `pad2m` | `cycle0` | stride effect | offset effect |
+|---|---|---|---|---|---|---|
+| `own_stream=false` | 56.90 | 53.12 | 53.15 | 53.63 | +0.35 | -0.26 |
+| `own_stream=true` | 71.23 | 61.12 | 61.28 | 60.86 | +0.16 | -0.26 |
+
+Padding the stride to 2 MB costs +0.35 and +0.16 us, and moving the payload off the 256-byte
+offset onto a page boundary gains 0.26 us in both runs. Every one of those is inside the noise
+of a single rep. **The slot geometry costs nothing.** Candidate 2 is dead, and the `ha_off`
+result from 7o now extends to all four live offsets rather than just the first.
+
+Candidate 1 is dead by measurement as well: `cycle` runs 53.12 with the shared stream and 61.12
+with its own, but `single` moves 56.90 to 71.23 across the same two runs, so the whole shift is
+the between-process clock state that 7o already warned about, not the stream mode. Within each
+run the stream mode is held constant across all four arms and cannot explain anything.
+
+**What the probe did establish, which is the useful part.** It reproduces extbuf's pool exactly,
+same allocation call, same stride, same offset, same four-slot cycle, and the transform lands on
+the pinned-host rung where `daq` and `opt` sit. Whatever costs extbuf 14 us is therefore **not in
+the memory layout**. It is in the live pipeline: something about transforming while the NIC is
+writing other slots, or about how the receive thread and the CUDA event gate interleave. That is
+a narrower place to look than 7o left it, and it is where the next person should look. It is not
+a claim, and nothing in the deck or the tables depends on it.
+
+An incidental result worth not losing: `single` is consistently **slower** than `cycle`, by 3.8
+and 10.1 us, while its CPU write is 5 to 9 us **faster**. Re-transforming one buffer keeps the
+lines dirty in CPU cache and the GPU pays to snoop them; cycling gives them time to write back.
+Any future single-buffer microbenchmark on this coherent part is measuring that, not the thing
+it thinks it is measuring.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 
@@ -2004,6 +2026,7 @@ pkill -9 -f bench_grpc_server; rm -rf /tmp/iceoryx2; rm -f /dev/shm/iox2_*; slee
 | `scripts/run_tableB.sh`, `scripts/launch_tableB.sh` | Table B exactly as published in 7n: four arms, four sizes, 3 reps, `PACE=25`. The launcher exists because the driving workstation is PowerShell 5.1, which strips embedded double quotes and mangles `&` out of an ssh command line; keeping the metacharacters on the Spark side has already saved two lost runs. |
 | `scripts/pace_probe.sh` | Sweeps send pacing for the extbuf and DAQiri arms with the arms rotated inside each pace. This is the script that found extbuf's transform tripling between 100 and 400 us of pacing while DAQiri's held flat, which is what invalidated the first Table B. Run it before trusting any two arms compared at a pace neither was profiled at. |
 | `scripts/extbuf_warmup_probe.sh` | Holds the measured window at 200 messages and varies only the warmup, 50 to 20000. Used to rule warmup out as the cause of the pacing cliff. |
+| `rdma/slotgeom_probe.cu`, `scripts/run_slotgeom.sh` | Reproduces extbuf's pool geometry in isolation and splits the slot-geometry question into stride, payload offset and working set, four arms rotated within each rep. Ruled out both candidates for extbuf's 14 us at 4 MiB, section 7q. Also the reason single-buffer FFT microbenchmarks on this part are suspect: re-transforming one buffer is slower than cycling, because the CPU write leaves lines dirty. |
 | `scripts/headline_table.py` | Turns that CSV into the scoreboard, the cuFFT-vs-transport gap decomposition, and paired sign tests. |
 | `scripts/trio_probe.sh` | Arms cur/nl/st/af/all with a correctness pass. Interleaves if you pass `ARMS='cur all cur all cur all'`. |
 | `scripts/drop_probe.sh` | Delivery accounting: received, missing, gap events, mean run length, across paces. |

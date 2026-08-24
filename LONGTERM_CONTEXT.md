@@ -1,10 +1,56 @@
 # Long-Term Context — Architectural Reference
 **Project:** DAQiri GPU FFT Pipeline Benchmark  
-**Updated:** 2026-08-21  
+**Updated:** 2026-08-24  
 **Precursor project:** gRPC / gRPC Direct benchmark — all 20 milestones complete 2026-07-08
 
 > **This file is committed now.** It was gitignored while `handoff_roce_2026-08-06.md`,
 > `presentation/HANDOFF.md` and `scripts/find_spark.sh` all pointed readers at it.
+
+---
+
+## Key findings (an uncontrolled treatment, 2026-08-24)
+
+These come from re-running a published comparison under conditions the original had left free.
+The result reversed at two of four sizes. That is the transferable part.
+
+- **A variable you did not choose is still a treatment.** The send pace was hardcoded at 400 µs
+  in the harness because that was the value it was written with. One arm degrades by 3x above
+  100 µs of pacing and the other does not move, so a table comparing them at 400 was measuring
+  the pace, not the transports. Nobody chose to vary it, which is exactly why nobody checked it.
+  **Every constant in a comparison harness is a treatment held at one level, and the ones you
+  never thought about are the ones held at an arbitrary level.**
+- **Two harnesses is a confound even when both are correct.** The retracted table paired numbers
+  from two different scripts run five days apart. Both scripts were right. The comparison was
+  not. The fix was not to make the scripts agree, it was to put every arm inside one rotation of
+  one script in one thermal window.
+- **Check the thing the previous writeup told you to check, even when you expect it to be
+  nothing.** The instruction was to verify both arms ran the same FFT. They did, which closed
+  that door, and the work of checking is what surfaced the pacing cliff. A negative result on the
+  named question can still be the cheapest route to the real one.
+- **Rule out candidates by measurement even when reading the source already killed them.** One
+  of the two candidates for the last open gap was refuted by a single line of source: the flag it
+  blamed was never passed. It was tested anyway. A candidate killed by reading is one
+  misunderstanding away from coming back.
+- **Write up an open number with its candidates ruled out.** Two eliminated candidates and an
+  unexplained 14 µs is a better handoff than an unexplained 14 µs with two guesses attached,
+  because the next person does not repeat the elimination. Negative results have to be recorded
+  or they get re-derived.
+- **A rate is bytes over a span, not bytes over a median gap.** `1/median` is a rate only when
+  the inter-arrival distribution is unimodal. On a burst-reaped receive path below 4 MiB it is
+  bimodal, the median sits in the fast mode, and the derived rate is fiction. Every rate claim in
+  the handoff was re-derived under this rule and two were withdrawn.
+- **A tie against a shared ceiling is not a result.** Two transports both measured at 5.78 GB/s
+  looked like equivalence. Both were pinned by a RoCE MTU misconfigured at 1024, and the same
+  file recorded the misconfiguration one clause away from calling the number a hardware ceiling.
+  **When two systems agree exactly, check what they have in common before concluding anything
+  about what makes them different.**
+- **Never compare GPU kernel times across processes.** The same arm measured 66.1 µs in a 6-arm
+  run and 59.1 µs in a 4-arm run minutes later, because the interleave cycle length changes the
+  clock state. Only within-rotation differences mean anything on this part.
+- **A single re-transformed buffer is not a neutral microbenchmark on a coherent part.** Cycling
+  across four buffers is 4 to 10 µs *faster* than re-transforming one, because re-writing the
+  same buffer keeps the lines dirty in CPU cache and the GPU pays to snoop them. The convenient
+  benchmark shape is measuring cache coherence, not the thing under test.
 
 ---
 
@@ -471,7 +517,16 @@ check cannot. Beware `4c:bb:47:2a:b7:*`: those are other DGX Sparks in the same 
 - (Historical: an earlier 192.168.10.x link on the 1G ports is obsolete after a room move.)
 - easyrdma built on BOTH arches (`core/` subdir only: `cmake .. -DCMAKE_BUILD_TYPE=Release; make`)
 - grpc-direct rebuilt with `--features rdma` on BOTH machines
-- **Hardware ceiling:** 5.785 GB/s = 92.6% of 50G line rate (1024-byte IB MTU / 1500-byte Ethernet MTU)
+- **Hardware ceiling: SUPERSEDED.** This file used to record 5.785 GB/s = 92.6% of 50G line
+  rate, and stated its own cause in the same breath: a 1024-byte IB MTU. That MTU was a
+  misconfiguration, found and fixed on 2026-08-19. The PXI boots at a 1500-byte Ethernet MTU,
+  which negotiates a 1024-byte RoCE MTU against the Spark's 4096, and a QP silently takes the
+  minimum with no error anywhere. Corrected ceiling, `ib_write_bw` PXI to Spark at 4 MB:
+  **5843.23 MiB/s = 6.127 GB/s = 98.0% of the 6.25 GB/s line rate** (handoff Gate 3, 7p).
+  The control that makes this attributable is the 2-byte case, which fits in one packet either
+  way and did not move: 1.81 vs 1.82 us.
+  Persist the fix with `ip link set dev enp117s0 mtu 9000` on the PXI; it dies on a reboot
+  **and** on a Spark carrier flap.
 
 ---
 
@@ -481,12 +536,57 @@ check cannot. Beware `4c:bb:47:2a:b7:*`: those are other DGX Sparks in the same 
 |---|---|---|
 | Localhost Echo (C++ interceptor) | grpc-direct shmem | **3.3 µs p50** (281× faster than std gRPC) |
 | Localhost Echo (native Rust floor) | grpc-direct shmem | 2.78 µs p50 |
-| Streaming throughput zero-copy | grpc-direct shmem | **23.59 GB/s** |
+| Streaming throughput zero-copy | grpc-direct shmem | 23.59 GB/s (construction unrecorded) |
 | RDMA Echo (machine-to-machine) | grpc-direct RDMA | **36.8 µs p50** (29× faster than TCP) |
-| RDMA throughput vs line rate | grpc-direct RDMA | **5.775 GB/s** (99.8% of ceiling) |
-| DAQiri RDMA loopback (Spark) | DAQiri RDMA | ~5.785 GB/s |
-| **grpc-direct RDMA vs DAQiri** | both | **< 1% delta** |
+| RDMA throughput vs line rate | grpc-direct RDMA | 5.775 GB/s, **at the MTU-1024 ceiling** |
+| ~~DAQiri RDMA loopback (Spark)~~ | ~~DAQiri RDMA~~ | ~~5.785 GB/s~~ **RETRACTED** |
+| ~~grpc-direct RDMA vs DAQiri~~ | ~~both~~ | ~~< 1% delta~~ **RETRACTED** |
 | Standard gRPC TCP baseline | TCP | 929–1086 µs Echo p50, 1.78 GB/s streaming |
+
+**Why the last two rows are struck out (2026-08-24).** 5.785 GB/s is 5518 MiB/s. Gate 3 later
+measured this fabric at 5518.37 MiB/s with the MTU misconfigured at 1024. Both arms were
+resting on the same wall, and the wall was a bug rather than the hardware, so agreeing to
+within 1% says nothing about either transport. Neither figure's construction was recorded and
+neither has surviving per-message data, so they cannot be recovered by reanalysis. The claim
+that replaces them needs no DAQiri number: **on a correctly configured fabric gRPC-Direct RDMA
+runs at 98.0% of line rate.** The 23.59 and 1.78 GB/s figures are not affected by the link
+ceiling, but their construction is equally unrecorded; rerun before leaning on them.
+See handoff 7p for the full audit of every rate claim in the project.
+
+---
+
+## The standing head-to-head (interleaved, 2026-08-24)
+
+This replaces every earlier extbuf-against-DAQiri table in this project, all of which paired
+arms from different scripts or different days. Here all four arms rotate inside one run of
+`scripts/headline_sweep.sh`, in one thermal window, at one message rate: `REPS=3`, 1000 measured
+messages after 500 warmup, `PACE=25`, `sm_mhz` gated at 2400. Post-arrival processing latency,
+e2e medians in microseconds. Both extbuf and DAQiri are loopback on the Spark, so nothing here
+crosses a machine boundary and none of it may be compared to a cross-machine number.
+
+| KB | base | opt | daq | extbuf |
+|---|---|---|---|---|
+| 16 | 15.744 | 11.376 | **9.456** | 10.736 |
+| 256 | 26.448 | 22.944 | **18.224** | 20.816 |
+| 1024 | 46.752 | 33.712 | **25.072** | 30.432 |
+| 4096 | 129.745 | 71.504 | **68.976** | 94.144 |
+
+**DAQiri is faster at every size.** The earlier "crossover", extbuf ahead at the two small sizes
+and behind at the two large ones, was an artefact of comparing an unpaced arm against a 400 µs
+paced one. At 16 and 256 KB the residuals agree within 0.42 µs, so the whole gap at those sizes
+is transform time rather than transport.
+
+The 4 MiB cuFFT terms are the memory-class ladder, measured in the same rotation: `base` 47.78
+reading from device memory after an H2D copy, `daq` 64.13 and `opt` 64.99 reading in place from
+pinned host memory, `extbuf` 78.40 also from pinned host. `opt` and `daq` agreeing to 0.9 µs is
+what makes the ladder credible. **Zero copy costs about 16 µs at 4 MiB against a device-resident
+transform**, and that is the architectural price, paid knowingly. Extbuf's further 14 µs is
+unexplained; both named candidates, stream mode and slot geometry, were tested and ruled out
+(handoff 7q), which locates it in the live pipeline rather than the memory layout.
+
+Caveat on one cell: the 16 KB `daq` figure rests on a single rep, the other two having tripped
+the clock gate at 2379 and 1560 MHz. Their raw values, 9.408 and 9.344, agree with the kept
+9.456, so the gate most likely fired on a sampler artefact rather than a real downclock.
 
 ---
 

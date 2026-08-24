@@ -1,6 +1,9 @@
 # PROGRESS — DAQiri GPU FFT Pipeline
 **Project:** NVIDIA DAQiri → GPU FFT Benchmark  
-**Updated:** 2026-08-21 late (**The pipeline runs at the wire, and the reason the earlier fix worked was not the reason given.** Two corrections to this morning's entry, both from paired measurement. First: 7i said the receiver's spectral check cost 3.18x because it held the slot inside the credit window. Moving it below the re-queue dropped `hold_us` from 2488 µs to 1.5 µs and **the rate did not move at all**. The credit window was never the mechanism. The receiver is one thread, `detect_peaks` costs about 2400 µs of it per message at 4 MiB, and the next receive waits on it wherever in the loop it sits. The 3.18x from the flag stands; the explanation for it is retracted. Second: removing the sender's own frame-build memcpy (`--gen inplace`) takes 4 MiB from 4989 to **5878 MiB/s median, three of three**, with an inter-arrival of 663-686 µs against a **685 µs wire time**. Gate 3 measured 5843 MiB/s. **The pipeline is at line rate.** The "85 percent of link" was the harness measuring its own memcpy, not a transport limit. The server now **withholds** the rate lines when `--poison on` or `--verify every` rather than printing them with a caveat. handoff.md §7j.)
+**Updated:** 2026-08-24 (**Pacing was an uncontrolled treatment, and Table B was wrong because of it.** Checking whether extbuf and DAQiri ran the same FFT, which §7l had flagged as the first thing to check, found they do: same `CuFFTExecutor`, same R2C plan, same n, same memory class, and alignment ruled out by measurement rather than argument. So §7l's third limit is **withdrawn** and the 4 MiB gap is real. Checking it turned up the actual fault: extbuf's transform **triples** between 100 and 400 µs of send pacing while DAQiri's does not move, and `headline_sweep.sh` had `PACE` hardcoded at 400, inside one arm's degradation region and outside the other's. Table B was therefore an unpaced arm against a 400 µs paced arm. Re-run interleaved, all four arms in one rotation at `PACE=25`, **DAQiri is faster at every size and two rows change sign**: 16 KB goes from -2.07 to +1.28 and 256 KB from -1.01 to +2.59. The §7l crossover was an artefact of two harnesses. Separately, **every rate claim in the document was audited** against the mean/median rule: the 256 KB "97.6 percent of wire" and the 1 MiB 10792-13517 MiB/s are withdrawn, and the 4 MiB 5878 becomes 5796-5803. The **deck's 5.775 against 5.785 GB/s tie is retracted**: both numbers are Gate 3's fabric at a misconfigured 1024-byte MTU, so both arms were resting on the same artificial wall. At MTU 4096 the same fabric does 98.0 percent of line rate, which is what the deck says now. One number stays open, extbuf's 14 µs at 4 MiB, with **both named candidates tested and ruled out**. handoff.md §7n through §7q.)
+
+<!-- historical header line -->
+**Previously:** 2026-08-21 late (**The pipeline runs at the wire, and the reason the earlier fix worked was not the reason given.** Two corrections to this morning's entry, both from paired measurement. First: 7i said the receiver's spectral check cost 3.18x because it held the slot inside the credit window. Moving it below the re-queue dropped `hold_us` from 2488 µs to 1.5 µs and **the rate did not move at all**. The credit window was never the mechanism. The receiver is one thread, `detect_peaks` costs about 2400 µs of it per message at 4 MiB, and the next receive waits on it wherever in the loop it sits. The 3.18x from the flag stands; the explanation for it is retracted. Second: removing the sender's own frame-build memcpy (`--gen inplace`) takes 4 MiB from 4989 to **5878 MiB/s median, three of three**, with an inter-arrival of 663-686 µs against a **685 µs wire time**. Gate 3 measured 5843 MiB/s. **The pipeline is at line rate.** The "85 percent of link" was the harness measuring its own memcpy, not a transport limit. The server now **withholds** the rate lines when `--poison on` or `--verify every` rather than printing them with a caveat. handoff.md §7j. *The 5878 figure is corrected to 5796-5803 by the 2026-08-24 audit, §7p; it was one over a median gap, not a rate. The claim survives, but it now sits just under Gate 3's 5843 rather than over it.*)
 
 <!-- historical header line -->
 **Previously:** 2026-08-21 (**The pipeline has a transport number for the first time, and the sender's stall turned out to be ours.** Every latency figure this project produced before today started its clock after the data had landed. Post-to-FFT-complete from the PXI at 4 MiB is now measured at about **1364 µs unloaded**, by round-trip echo on the sender's single clock, because the two boxes' realtime clocks differ by 23.13 seconds and neither runs NTP. The 2205 µs the sender spent blocked per 4 MiB buffer was **the receiver's own spectral check holding the slot between the transform and the re-queue**: moving it out is worth **3.18x**, taking the path from 27 percent of line rate to **85 percent**. Slot depth is closed negative, 2 through 16 slots are one distribution. What limits it now is the sender's own CPU doing two 4 MiB host memcpys per message. Phase 4's cell ran with verification on, so **its throughput and blocked-send figures are contaminated and must not be quoted**; its latency columns are unaffected. handoff.md §7i.)
@@ -87,6 +90,91 @@ anyone else.
 ---
 
 ## Results Log
+
+### Phase 5f — pacing was a treatment nobody controlled, and Table B was wrong (2026-08-24, commit `db315ad` and follow-on)
+
+Four pieces of work, each one caused by the one before it. Full writeup in handoff.md §7n
+through §7q.
+
+**1. The cuFFT plan comparison came back the opposite of the way it was expected to.** §7l had
+told the next reader that a real-to-complex against complex-to-complex mismatch would account
+for the entire 4 MiB gap. It would have, and there is no mismatch. Both arms construct
+`CuFFTExecutor`: same `cufftPlan1d` R2C, batch 1, default strides, out of place, output to
+`cudaMalloc`'d device memory, one JIT warmup, plan built once. The sizes match once the units
+are checked, which needed doing rather than assuming, because DAQiri's `--bufsize` and extbuf's
+`--npts` are both in samples so 4 MiB is n = 1048576 in both. Alignment was ruled out by
+measurement: `ha_off` minus `hostalloc` at a 256-byte offset over 5 interleaved reps came out
+-0.10, -0.74, +0.58, -0.58, -1.73 µs, two of five positive. **§7l's third limit is withdrawn.**
+
+**2. That work exposed the fault.** A smoke test put extbuf at 42.06 µs e2e at 16 KB against
+9.63 in the published sweep. Warmup was eliminated first, `scripts/extbuf_warmup_probe.sh`
+holding the measured window at 200 messages and varying only the warmup: 39.50, 40.40, 40.46,
+41.78 µs for warmups of 50, 500, 2000, 20000. Then `scripts/pace_probe.sh`, arms rotated inside
+each pace, found the cause. Extbuf's transform **triples** between 100 and 400 µs of send pacing
+while DAQiri's holds flat, and `sm_mhz` was 2405 to 2548 in every cell so it is not the clock
+gate. `PACE` was hardcoded at 400 in `headline_sweep.sh`, inside one arm's degradation region
+and outside the other's. **The mechanism is unexplained and is now a first-class open question.**
+
+**3. Table B re-run interleaved. Two rows change sign.** The §7l blocker was not actually gone:
+`transport_cell.sh` never had a DAQiri arm, only `stream-loopback` had been added to it. Solved
+the other way, by adding an `extbuf` arm to `headline_sweep.sh`, which already rotated `base`,
+`opt` and `daq`. All four arms now run in one rotation, one thermal window, one message rate:
+`REPS=3`, 1000 measured after 500 warmup, `PACE=25`. e2e medians in µs, positive delta means
+DAQiri faster:
+
+| KB | base | opt | daq | extbuf | old §7l delta | new delta |
+|---|---|---|---|---|---|---|
+| 16 | 15.744 | 11.376 | **9.456** | 10.736 | -2.07 | **+1.28** |
+| 256 | 26.448 | 22.944 | **18.224** | 20.816 | -1.01 | **+2.59** |
+| 1024 | 46.752 | 33.712 | **25.072** | 30.432 | +6.45 | +5.36 |
+| 4096 | 129.745 | 71.504 | **68.976** | 94.144 | +41.83 | +25.17 |
+
+**DAQiri is faster at every size, and the §7l crossover was an artefact of two harnesses.** At
+16 and 256 KB the residuals are within 0.42 µs, so the whole gap at those sizes is transform
+time. `opt` against `daq` at 4 MiB is now 2.53 µs where the old table had 8.10, and since their
+cuFFT terms agree to 0.9 µs essentially all of what is left is residual, 6.51 against 4.85.
+One caveat carried: the 16 KB `daq` figure rests on one rep, the other two having tripped the
+`CLOCKLOW` gate at 2379 and 1560 MHz. Their raw values 9.408 and 9.344 agree with the kept
+9.456, so the gate probably fired on a sampler artefact, the 0.2 s peak sampler missing a short
+loaded window.
+
+**4. Every rate claim in the handoff was audited against the mean/median rule** (§7p). Three
+groups. Median-derived rates, where the fault applies: the 256 KB "97.6 percent of wire" and the
+1 MiB 10792-13517 MiB/s are **withdrawn**; the 4 MiB 5878 becomes 5796-5803, which still stands
+but now sits just under Gate 3's 5843 rather than over it; §7i's verify-cost absolute MiB/s is
+withdrawn while its 3.18x paired ratio survives, and its attribution is corrected from
+`ib_write_lat` to `ib_write_bw`. Span-derived rates are unaffected. **The rule: below 4 MiB on
+this receive path, no median-derived rate is trustworthy.**
+
+**5. The deck's tie is retracted, and the arithmetic says why.** The deck claimed gRPC-Direct
+RDMA at 5.775 GB/s against DAQiri at 5.785 and called it a tie. 5.785 GB/s is 5518 MiB/s, and
+Gate 3 measured this fabric at **5518.37 MiB/s with the RoCE MTU set to 1024**, which
+`LONGTERM_CONTEXT.md` recorded in the same bullet where it called the number a hardware ceiling.
+Both arms were resting on the same wall and the wall was a misconfiguration. Two transports
+agreeing while pinned to a shared artificial ceiling is not evidence they perform alike. At MTU
+4096 the same fabric does 5843.23 MiB/s, 6.127 GB/s, **98.0 percent of line rate**, which is
+what the deck says now and is a stronger claim than the tie was.
+
+**6. One number stays open, with both candidates ruled out** (§7q). At 4 MiB inside the rotation
+the memory-class ladder is `base` 47.78 from device memory, `daq` 64.13 and `opt` 64.99 from
+pinned host, `extbuf` 78.40 from pinned host. Zero copy costs about 16 µs at this size and that
+is paid knowingly; extbuf's extra 14 is not explained. §7o's first candidate was wrong before it
+was tested, `extbuf_fft_server.cu:315` defaulting `own_stream = false` with the harness never
+passing `--own-stream`, so both arms ran the same mode. The second was tested with
+`rdma/slotgeom_probe.cu`, which reproduces extbuf's pool exactly and splits the question into
+stride, payload offset and working set across four arms rotated within each of 5 reps. Padding
+the stride to 2 MB costs +0.35 and +0.16 µs; moving the payload off the 256-byte offset onto a
+page boundary gains 0.26 µs in both runs. **The slot geometry costs nothing.** Because the probe
+reproduces the pool exactly and still lands on the pinned-host rung, the 14 µs is **not in the
+memory layout**, which narrows it to the live pipeline. Written up as open on purpose: two
+candidates ruled out is a better handoff than two guesses.
+
+An incidental result from the probe, worth not losing: a single re-transformed buffer is
+consistently **slower** than cycling across four, by 3.8 and 10.1 µs, while its CPU write is 5
+to 9 µs faster. Re-transforming one buffer keeps the lines dirty in CPU cache and the GPU pays
+to snoop them. Single-buffer FFT microbenchmarks on this coherent part are measuring that.
+
+---
 
 ### Phase 5d/5e — the pipeline reaches the wire, and a mechanism is retracted (2026-08-21 late, commit `ceb03b3`)
 
@@ -439,6 +527,24 @@ DAQiri pinned MR **57.36** < iceoryx2 registered shmem **63.76** µs. `opt fft` 
 ladder that had been retracted: the retraction was right about the evidence being cross-run and
 wrong about the conclusion. Note `opt` vs `base` is **confounded** (two flags differ), so only
 `opt` vs `daq` is a clean placement comparison.
+
+> **Reconciled 2026-08-24, and one line of it no longer holds.** The interleaved Table B run
+> (handoff §7n) measures the same ladder at 4 MiB inside a single rotation with a fourth arm
+> added: `base` 47.78 from device memory, `daq` 64.13 and `opt` 64.99 from pinned host,
+> `extbuf` 78.40 from pinned host. The **shape reproduces**, which is the third independent
+> confirmation, and the device-to-pinned step is about 16 µs.
+>
+> What does not survive is `opt fft` slower than `daq fft`. That was 18/18 with p = 7.629e-06
+> at a time when the two arms were sent at different rates. At a matched `PACE=25` they land
+> within 0.9 µs of each other, and it is that agreement, two different transports on the same
+> memory class, that makes the ladder credible now. The sign test was real; it was measuring
+> the pacing difference, not the placement. **Never compare cuFFT times across processes or
+> runs**: the same `hostalloc` arm measured 66.1 µs in a 6-arm run and 59.1 µs in a 4-arm run
+> minutes later, because the interleave cycle length changes the clock state.
+>
+> The code read above, which concluded both arms build the same plan, is confirmed against
+> source in §7o and extended: same n once the units are checked (both harnesses take samples),
+> same output memory, and alignment ruled out by measurement.
 
 ### gRPC-Direct latency optimization — E2 alignment fix (2026-08-07)
 

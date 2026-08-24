@@ -1,0 +1,105 @@
+built
+
+=== own_stream=false (what both Table B arms actually ran) ===
+npts 1048576  payload 4194304  frame 4194560
+stride: server 4194560, padded 6291456
+own_stream false
+
+single  pool    4194560  base 0x32ee00000  payload0 % 2MB =   256  page-aligned NO
+cycle   pool   16778240  base 0x32f400000  payload0 % 2MB =   256  page-aligned NO
+pad2m   pool   25165824  base 0x330600000  payload0 % 2MB =   256  page-aligned NO
+cycle0  pool   16778240  base 0x331e00000  payload0 % 2MB =     0  page-aligned yes
+
+correctness: all arms transformed without error
+
+rep   arm     fft_p50    write_p50 
+----------------------------------------
+1     single  56.544     64.416    
+1     cycle   53.536     68.640    
+1     pad2m   53.152     70.560    
+1     cycle0  54.400     69.632    
+----------------------------------------
+2     cycle   53.120     70.368    
+2     pad2m   53.120     69.792    
+2     cycle0  53.952     69.792    
+2     single  59.168     58.368    
+----------------------------------------
+3     pad2m   53.120     68.160    
+3     cycle0  53.632     69.952    
+3     single  56.896     65.440    
+3     cycle   53.024     68.576    
+----------------------------------------
+4     cycle0  53.664     69.920    
+4     single  56.512     60.864    
+4     cycle   52.928     68.992    
+4     pad2m   53.632     68.800    
+----------------------------------------
+5     single  58.048     60.416    
+5     cycle   53.056     69.632    
+5     pad2m   53.792     68.960    
+5     cycle0  53.920     69.760    
+----------------------------------------
+
+median of 5 reps, us:
+  single    56.896
+  cycle     53.056
+  pad2m     53.152
+  cycle0    53.920
+
+  working set (cycle - single) :  -3.840
+  stride      (pad2m - cycle)  :  +0.096
+  offset      (cycle0 - cycle) :  +0.864
+
+DONE_SLOTGEOM
+
+=== own_stream=true (candidate 1, re-tested by measurement) ===
+npts 1048576  payload 4194304  frame 4194560
+stride: server 4194560, padded 6291456
+own_stream true
+
+single  pool    4194560  base 0x32ee00000  payload0 % 2MB =   256  page-aligned NO
+cycle   pool   16778240  base 0x32f400000  payload0 % 2MB =   256  page-aligned NO
+pad2m   pool   25165824  base 0x330600000  payload0 % 2MB =   256  page-aligned NO
+cycle0  pool   16778240  base 0x331e00000  payload0 % 2MB =     0  page-aligned yes
+
+correctness: all arms transformed without error
+
+rep   arm     fft_p50    write_p50 
+----------------------------------------
+1     single  69.888     67.072    
+1     cycle   68.128     71.168    
+1     pad2m   68.096     71.616    
+1     cycle0  68.096     70.912    
+----------------------------------------
+2     cycle   68.576     70.176    
+2     pad2m   68.064     71.040    
+2     cycle0  67.232     70.432    
+2     single  66.592     65.312    
+----------------------------------------
+3     pad2m   67.360     71.040    
+3     cycle0  68.224     69.856    
+3     single  67.136     66.048    
+3     cycle   68.320     70.656    
+----------------------------------------
+4     cycle0  67.584     69.984    
+4     single  67.872     65.056    
+4     cycle   68.320     70.080    
+4     pad2m   68.320     70.176    
+----------------------------------------
+5     single  66.944     65.824    
+5     cycle   67.968     69.280    
+5     pad2m   66.880     70.752    
+5     cycle0  67.904     69.888    
+----------------------------------------
+
+median of 5 reps, us:
+  single    67.136
+  cycle     68.320
+  pad2m     68.064
+  cycle0    67.904
+
+  working set (cycle - single) :  +1.184
+  stride      (pad2m - cycle)  :  -0.256
+  offset      (cycle0 - cycle) :  -0.416
+
+DONE_SLOTGEOM
