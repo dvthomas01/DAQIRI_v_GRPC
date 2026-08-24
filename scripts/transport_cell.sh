@@ -200,7 +200,16 @@ run_one () {
     F50=$(col_p50 "$scsv" 6 0.50)
     G50=$(col_p50 "$scsv" 10 0.50)
     N=$(tail -n +3 "$scsv" 2>/dev/null | wc -l)
-    VERIF=$(tail -n +3 "$scsv" 2>/dev/null | cut -d, -f9 | grep -c '^1$')
+    # Field 9 is the server's `ok`, and with --verify off the server sets it
+    # from frame_ok alone, so it reports "the header parsed" for every message.
+    # Counting it on an unverified arm produces a full verified column on a run
+    # that checked no spectra at all, which is a number somebody would quote.
+    # Emit NA unless this arm actually asked for the check.
+    case "$sx" in
+        *"--verify every"*)
+            VERIF=$(tail -n +3 "$scsv" 2>/dev/null | cut -d, -f9 | grep -c '^1$') ;;
+        *)  VERIF=NA ;;
+    esac
 
     RTT50=$(awk '/^echo rtt p50/{print $5; exit}' "$clog")
     RTT99=$(awk '/^echo rtt p50/{print $7; exit}' "$clog")

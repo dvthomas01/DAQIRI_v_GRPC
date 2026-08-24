@@ -562,9 +562,21 @@ int main(int argc, char** argv) {
                    frozen_regs = guard::regs;
 
     std::FILE* csv = nullptr;
+    std::vector<char> csv_buf;
     if (!csv_path.empty()) {
         csv = std::fopen(csv_path.c_str(), "w");
         if (!csv) { std::perror("fopen"); return 2; }
+        // A 64 MB stdio buffer, so the per-message row costs a memcpy and the
+        // run does its write()s at the end instead of every ~50 messages.
+        //
+        // This is in the consumer loop, below the re-queue, so it is charged to
+        // the arrival interval like everything else there. At 4 MiB a periodic
+        // write against a 685 us wire time is nothing. At 4 KB the wire time is
+        // 2.5 us and it is not: a flush landing every fiftieth message would
+        // show up as a p99 that is really a measure of stdio. Sized so that
+        // 200k rows at ~80 bytes never flush mid-run.
+        csv_buf.resize(64u << 20);
+        std::setvbuf(csv, csv_buf.data(), _IOFBF, csv_buf.size());
         // gap_us goes after ok rather than at the end, so that the existing
         // field positions the Phase 4 script cuts on (5, 6 and 9) do not move.
         std::fprintf(csv,

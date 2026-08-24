@@ -57,15 +57,27 @@
 // receive path's 85 percent of link is a transport limit or a harness limit,
 // and those are different claims.
 //
-// Build on the PXI:
+// Build on the PXI.  BOTH -L paths are required and so are both rpaths.
+// libgrpc_direct.so has an undeclared dependency on libeasyrdma.so.1, so
+// omitting the second -L links cleanly right up to the point where ld reports
+// twelve undefined easyrdma_* symbols and exits.  g++ removes the output file
+// before it links, so a failed link DESTROYS the working binary sitting there.
+// The comment here was missing that -L until 2026-08-24 and did exactly that.
 //   g++ -O2 -std=c++17 -o extbuf_fft_client extbuf_fft_client.cc signal_gen.cc \
 //       -I. -I$HOME/grpc-direct/include \
-//       -L$HOME/grpc-direct/target/release -lgrpc_direct -pthread
+//       -L$HOME/grpc-direct/target/release -lgrpc_direct \
+//       -L$HOME/easyrdma/core/build -leasyrdma \
+//       -Wl,-rpath,$HOME/grpc-direct/target/release \
+//       -Wl,-rpath,$HOME/easyrdma/core/build \
+//       -pthread
+//
+// With both rpaths baked in, LD_LIBRARY_PATH is no longer needed at run time.
+// Check with: ldd extbuf_fft_client | grep -E 'easyrdma|grpc_direct'
+// Both must resolve.  Neither should say "not found".
 //
 // Run (GRPC_DIRECT_RDMA_LOCAL is required cross-machine; without it the client
 // binds to the remote address and cannot connect):
 //   GRPC_DIRECT_RDMA_LOCAL=192.168.20.2 \
-//   LD_LIBRARY_PATH=$HOME/grpc-direct/target/release \
 //   ./extbuf_fft_client --host 192.168.20.1 --port 18800 --npts 4096 --msgs 200
 
 #include "rdma_contract.h"
