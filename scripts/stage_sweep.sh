@@ -140,8 +140,16 @@ run_cell () {   # run_cell <arm> <size> <rep>
             --verify off > "$log" 2>&1 &
         local sp=$!
         sleep 3
+        # The client's --msgs is the TOTAL it sends and its --warmup only says
+        # which of those it declines to time. The server's --msgs is the count
+        # it wants AFTER its own warmup. So the client has to be asked for
+        # W + N or the server records only N - W rows and ends on its linger
+        # timer. This was passing --msgs $N, which is why the extbuf cells in
+        # the first stage sweep show n=500 against 1000 for every other arm:
+        # a short run, not a lossy one. headline_sweep.sh had this right.
         ( cd /tmp && GRPC_DIRECT_RDMA_LOCAL=$RDMA_IP timeout 300 $EXCLI \
-            --host $RDMA_IP --port 18851 --npts "$size" --warmup $W --msgs $N \
+            --host $RDMA_IP --port 18851 --npts "$size" --warmup $W \
+            --msgs $((W + N)) \
             --pace-us $PACE --linger-ms 400 --gen inplace ) >> "$log" 2>&1
         wait $sp 2>/dev/null
         e2e=$(col_p50 "$csv" 5); fft=$(col_p50 "$csv" 6)

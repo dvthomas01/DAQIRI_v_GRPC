@@ -1805,6 +1805,115 @@ probe only tested the first of those four offsets.
 
 **Both have since been tested and both are ruled out. See 7q. The 14 us is still open.**
 
+> **7r has since shrunk this number and changed its character.** Measured with a full length run
+> against a 12 repetition DAQiri median, the transform gap is about 5 us rather than 14, and on the
+> GPU side extbuf's kernels are slightly *faster* than DAQiri's. What extbuf has is dead time
+> between kernels, 17.36 us against 9.6 us. It is not transforming more slowly.
+
+
+### 7r. Two of our own tables disagreed, and three repetitions was the reason (2026-08-25)
+
+Table B (7n) puts `opt` and `daq` within **0.86 us** on the 4 MiB transform. A later stage sweep
+(`data/stage_runs.csv`) puts them **12.99 us** apart, 3 of 3, with non-overlapping ranges. Same
+`N=1000`, same `W=500`, same `PACE=25`, same 3 reps, same rotation. One of them had to be wrong.
+
+The obvious suspect was that `bench_daqiri_roce_pipeline` was rebuilt between the two, to add the
+stage timers. Two things argued against it before any new data was taken. Pairing the two tables rep
+by rep, `opt` minus `daq` is +0.03, +0.86, +14.72 in Table B and +2.53, +14.08, +13.15 in the stage
+sweep: **six positive differences out of six**, but split into a cluster near zero and a cluster
+near 14. And `base`, `opt` and `extbuf` were **not** rebuilt, yet moved -2.92, +6.37 and -7.26 us
+between the same two sweeps.
+
+**The experiment.** `scripts/settle_sweep.sh`, 4 MiB only, 12 reps, four arms rotated through all
+four positions inside the rep so that arm is not confounded with position. `daqpre` is the
+pre-stage-timing source reconstructed by `scripts/strip_stage_timing.py` and built through the same
+CMake target by `scripts/build_daq_pre.sh`, the original binary and its object file having both been
+overwritten and the source having been untracked before `035d8e8`. `daqoff` is the current binary
+with the timers compiled in but not enabled, `daqon` the same binary with `--stage-timing`, and
+`opt` the gRPC optimized arm exactly as Table B ran it. Rows in `data/settle_runs.csv`, analyzer
+`scripts/settle_table.py`.
+
+| comparison | median | positive | p (sign) | verdict |
+|---|---|---|---|---|
+| `daqoff` minus `daqpre` | -1.86 | 5 of 12 | 0.77 | the rebuild is inert |
+| `daqon` minus `daqoff` | -0.16 | 5 of 11 | 1.00 | the timers cost nothing |
+| `opt` minus DAQiri, transform | **+4.32** | 9 of 12 | 0.15 | real but small |
+| `opt` minus DAQiri, e2e | **+6.12 to +6.55** | 9 to 12 of 12 | 0.15 to 0.0005 | real |
+
+DAQiri here is the per-rep median of the three interchangeable `daq` arms. Position effect across
+the four slots in a rep: **1.50 us**, so the fixed order every earlier sweep used was not the fault.
+
+**The actual finding is about the noise floor.** At 4 MiB the single cell standard deviation is
+**4.4 us** and the standard deviation of the paired within-rep difference is **5.5 us**. A median of
+three therefore carries about 4 us of standard error, and the difference of two such medians about
+5.6 us. Table B's 0.86 and the stage sweep's 13.15 are 2.2 standard errors apart, which is an
+ordinary outcome, especially since we went looking at it *because* it was extreme. **Neither table
+was wrong. Both were under-powered.** No difference below about 8 us at 4 MiB is resolvable with
+three repetitions, however tight the three values look.
+
+Consequences. The stage sweep's claim that 87 percent of the `opt` gap is kernel time survives in
+direction but not in size: the gap is about 6 us end to end of which about 4 us is transform. The
+7c prediction of 11 to 15 us is still too large. And the dirty-line hypothesis loses most of its
+motivation, because the contradiction it was invented to reconcile was largely sampling noise.
+
+**Standing rule from this.** Three reps is enough to establish a sign, not a magnitude. Anything at
+4 MiB that a conclusion rests on gets twelve, with the arm order rotated.
+
+
+### 7s. The RDMA arm waits, it does not work harder (2026-08-25)
+
+The stage timers say extbuf's transform costs more CUDA-event time than DAQiri's. CUDA events cannot
+say whether that is more kernel work or more dead time. Nsight Systems can, and it does profile this
+binary, unlike `bench_grpc_server`.
+
+The obstacle was that the GPU-side table vanished at 4 MiB. It turns out to be a **launch count**
+threshold, not a payload size: at 16 KB, one kernel per message, 170 launches came back and 400 did
+not; at 4 MiB, three kernels per message, 105 launches came back and 150 did not. Walking the
+message count down until the table survives gets a capture. `scripts/nsys_extbuf_probe.sh`,
+`scripts/nsys_extbuf_walk.sh`, `scripts/nsys_kernel_probe.py`.
+
+At 4 MiB, 23 messages in steady state:
+
+| | kernel busy | CUDA-event | gap between kernels |
+|---|---|---|---|
+| DAQiri | 48.78 | 58.37 | 9.6 (16%) |
+| gRPC over RDMA | **44.28** | 61.63 | **17.36 (28%)** |
+
+Both run the same three kernels, which independently confirms 7o at the kernel level:
+`regular_fft_factor` twice, 23.55 and 13.91 us for extbuf against 40.29 us for DAQiri's pair, then
+`postprocess_kernel`, 6.82 against 8.45. **extbuf's kernels are slightly faster. All of its
+disadvantage is dead time between them.** The same shape holds at 16 KB: extbuf 2.67 us busy inside
+6.66 us of event time against DAQiri's 3.74 inside 4.74.
+
+That moves the open question off the transform entirely. Nothing that makes the memory slower to
+read can explain a result where the kernels are faster, so the remaining candidates are about what
+delays the next launch: the receive thread's interleaving with the completion gate, and transforming
+while the card writes other slots.
+
+Caveat. 23 messages, and Nsight Systems perturbs. Directional, not a precise figure.
+
+
+### 7t. The extbuf n=500 cells were a short run, not a lossy one (2026-08-25)
+
+Every extbuf cell in the first stage sweep recorded `n=500` against 1000 for the other arms, which
+looks like delivery loss and is not. The extbuf **client's** `--msgs` is the total it sends and its
+`--warmup` only says which of those it declines to time (`rdma/extbuf_fft_client.cc:340`). The
+**server's** `--msgs` is the count it wants *after* its own warmup (`extbuf_fft_server.cu:503`). So
+the client has to be asked for `W + N`. `headline_sweep.sh` had this right; `stage_sweep.sh` passed
+`--msgs $N`, the server ate 500 as warmup, recorded the remaining 500 and ended on its linger timer.
+The 500 rows are a complete contiguous tail, not a biased sample.
+
+It still mattered, because run length is a treatment for this arm. Re-run at the corrected count,
+3 reps, 4 MiB, `data/extbuf_fixed.csv`:
+
+| | n | e2e p50 | cuFFT p50 |
+|---|---|---|---|
+| short run, as first published | 500 | 84.61 | 71.14 |
+| corrected | 1000 | **77.95** | **65.06** |
+
+Both terms fall by about 6 us. The first stage sweep overstated the RDMA arm's cost, and its extbuf
+row should be read from `data/extbuf_fixed.csv` instead. Fixed in `scripts/stage_sweep.sh`.
+
 
 ### 7m. The sustained rate was one over a median, and it was never a rate (2026-08-24)
 

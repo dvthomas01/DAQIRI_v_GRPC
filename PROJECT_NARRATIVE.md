@@ -299,6 +299,32 @@ or a dead candidate.
 Until one of them is run, do not present this as the answer. Present it as the reason the two
 results are not actually in contradiction, and as the specific thing you would go and measure.
 
+> **Update 2026-08-25. The evidence now points away from this hypothesis, and the contradiction it
+> was invented to reconcile was mostly an artefact of taking three repetitions.**
+>
+> Two measurements changed the picture. The first is a 12 repetition sweep at 4 MiB with the arm
+> order rotated inside each repetition, `data/settle_runs.csv`. It puts gRPC optimized **4.32 us**
+> above DAQiri on the transform, 9 of 12 repetitions, sign test p = 0.15. Not the 0.86 us of the
+> corrected Table B and not the 12.99 us that a later three repetition sweep reported. The single
+> cell standard deviation at this size is **4.4 us**, and the standard deviation of the paired
+> within-repetition difference is **5.5 us**, so a median of three repetitions carries roughly 4 us
+> of standard error and two such medians can differ by 12 us without anything having changed. Both
+> of the earlier numbers were draws from the same distribution. The prediction of 11 to 15 us is
+> still too large, but the true value is not zero either, and there was never as much to reconcile
+> as it looked.
+>
+> The second is a direct test of the mechanism. If the penalty belongs to recently CPU-dirtied
+> lines, then an arm whose buffers are written by the network card and never touched by the CPU
+> should not pay it. gRPC over RDMA is exactly that arm. Profiled on the GPU side at 4 MiB it spends
+> **44.28 us** of kernel time against DAQiri's **48.78 us**, so it is not paying a snoop penalty on
+> the transform at all; it is doing slightly less GPU work and losing the time elsewhere. The
+> write-crossed experiment that pointed toward the hypothesis stands, but it lives in the isolated
+> ladder and has not reproduced anywhere in a real receiver.
+>
+> The three tests named above are still the right tests and are still unrun. They are now worth less
+> than they were, because the effect they would explain is about a third of the size that motivated
+> them, and because the one arm that should have exonerated itself under the hypothesis did.
+
 ## 6. What the hardware allows, and what got built
 
 Running in parallel with the placement work was a more ambitious idea: stop reading the transform's
@@ -500,6 +526,26 @@ the live pipeline: transforming while the network card writes other slots, or ho
 and the completion gate interleave. Narrower than it was, still unexplained, and nothing in any
 current claim depends on it.
 
+> **Update 2026-08-25. The 14 us is smaller than stated, and it is dead time rather than work.**
+>
+> Two corrections. First the size. The figure came from three repetitions, and at 4 MiB the single
+> cell standard deviation is 4.4 us, so three repetitions resolve nothing below about 8 us. Measured
+> again with a full length run, gRPC over RDMA transforms in **65.06 us** against a 12 repetition
+> DAQiri median of **60.19 us**, so the gap is closer to **5 us** than to 14.
+>
+> Second, and more useful, the GPU side now says what kind of time it is. Both arms run the same
+> three kernels. gRPC over RDMA spends **44.28 us** of kernel busy time inside **61.63 us** of
+> CUDA-event time, leaving **17.36 us** of gap between kernels. DAQiri spends **48.78 us** of busy
+> time inside **58.37 us**, leaving about **9.6 us** of gap. So the RDMA arm's kernels are, if
+> anything, slightly faster, and all of its disadvantage is dead time between them. The GPU is not
+> working harder. It is waiting more. That moves the open question from the transform to whatever
+> delays the next launch, which is consistent with the guess above about the receive thread and the
+> completion gate, and inconsistent with any explanation that makes the memory slower to read.
+>
+> This came from Nsight Systems, which drops the GPU-side table for this binary above roughly 200
+> kernel launches per session. The capture is therefore 23 messages, and it is directional rather
+> than a precise figure.
+
 So the ending, stated plainly. A real root cause was found and fixed, worth **1.80x** at 4 MB. The
 transport itself runs at **98.0 percent of line rate**, and the full pipeline sustains **97.3
 percent of the payload ceiling at 4 MiB and only at 4 MiB**: below that size the cadence goes
@@ -510,15 +556,24 @@ zero-copy, and the last 14 us has been bounded out of the memory layout without 
 
 > [Source notes on this section, in descending order of how much they matter.
 >
-> **The largest tension between the documents, and it now has a candidate.** The `cudaHostRegister`
-> penalty of section 5 predicts that gRPC optimized, which transforms iceoryx2 shared memory
-> registered after the fact and does have a CPU producer writing every buffer, should be 11 to 15 us
-> slower at 4 MB than DAQiri, which uses driver-allocated memory. In the corrected table they agree
-> to 0.86 us. An earlier sweep did find gRPC optimized slower on the transform in 18 of 18 cells, but
-> that sweep is now attributed to the pacing difference. No source document reconciles these. The
-> dirty-line hypothesis at the end of section 5 would reconcile them, since this table was taken at
-> 25 us of pacing with slot cycling on both arms, but that hypothesis is untested and should be
-> offered as a candidate rather than an explanation.
+> **The largest tension between the documents, and it is now resolved by repetition count rather
+> than by any mechanism.** The `cudaHostRegister` penalty of section 5 predicts that gRPC optimized,
+> which transforms iceoryx2 shared memory registered after the fact and does have a CPU producer
+> writing every buffer, should be 11 to 15 us slower at 4 MB than DAQiri, which uses
+> driver-allocated memory. The corrected table had them agreeing to 0.86 us and a later three
+> repetition sweep had them 12.99 us apart. Twelve repetitions with the arm order rotated put the
+> difference at **4.32 us on the transform, 9 of 12, p = 0.15**, and **6.1 to 6.6 us end to end**.
+> The single cell standard deviation is 4.4 us and the paired difference standard deviation is 5.5
+> us, which is enough to produce both of the earlier answers by chance. The prediction was too
+> large, the 0.86 was too small, and neither three repetition table was ever able to tell them
+> apart. See `data/settle_runs.csv` and `scripts/settle_table.py`.
+>
+> That sweep also cleared the two obvious ways the comparison could have been rigged. Rebuilding
+> `bench_daqiri_roce_pipeline` between the two tables changes nothing: the reconstructed
+> pre-change source, built from the same toolchain, differs from the current binary by a median of
+> -1.86 us, 5 of 12, p = 0.77. Enabling the stage timers costs nothing either, -0.16 us, 5 of 11,
+> p = 1.00. And the fixed arm order that every earlier sweep used was not a problem: with the order
+> rotated, the spread across positions within a repetition is 1.50 us.
 >
 > **Spread.** At 4 MiB the three gRPC over RDMA repetitions were 99.12, 94.14 and 77.55 us, so the
 > +25.17 us end-to-end delta is a median over a 21.5 us spread. The transform delta is much tighter,
@@ -526,6 +581,16 @@ zero-copy, and the last 14 us has been bounded out of the memory layout without 
 > with more confidence than the 25 us one. Separately, the 16 KB DAQiri cell rests on a single
 > repetition, the other two having tripped the clock gate; their raw values agree with the kept one,
 > so the row is not in doubt, but it is one sample.
+>
+> > **The confidence argument there was wrong, 2026-08-25.** Three values landing close together
+> > does not make their median accurate. It is what a sample of three from a wide distribution
+> > does a fair fraction of the time, and it is exactly how two of our own tables came to disagree
+> > by 12 us with nothing having changed between them. Twelve repetitions at 4 MiB give a single
+> > cell standard deviation of **4.4 us** and a paired difference standard deviation of **5.5 us**,
+> > so **no difference below about 8 us is resolvable with three repetitions**, tight looking or
+> > not. Every three repetition delta at 4 MiB in this document should be read that way, and the
+> > ones that carry weight should be re-taken at twelve. The 14.27 us has since been re-measured
+> > at about 5 us.
 >
 > **A stale sentence, since corrected in the source.** `handoff.md` section 7i says the gRPC and
 > DAQiri paths transform device memory after a host-to-device copy, which contradicts section 7n's
