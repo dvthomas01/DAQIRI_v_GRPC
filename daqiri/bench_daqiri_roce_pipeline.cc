@@ -297,7 +297,20 @@ static void roce_rx_pipeline_worker(
     UtilSampler*               sampler,
     // Written by the TX worker, one slot per message, same clock. See the TX
     // signature for why arrival index k pairs with send index k.
-    const std::vector<std::atomic<uint64_t>>& send_ts_ns)
+    const std::vector<std::atomic<uint64_t>>& send_ts_ns,
+    // Dump the first trace_rx arrivals to stderr. Exists to tell two very
+    // different causes of a large transport figure apart, because the age of a
+    // single message cannot distinguish them:
+    //   real burst delivery  -> d_rx collapses to ~0 for a run of messages
+    //   receiver simply behind -> d_rx stays near the send interval and `ahead`
+    //                             (slots the sender has already filled past
+    //                             this one) grows
+    int                        trace_rx,
+    // Busy-poll instead of sleeping between empty polls. The sleep below asks
+    // for 10 us, but nanosleep cannot deliver 10 us if the kernel's timer
+    // granularity is coarser, and an over-long sleep shows up as transport time
+    // that the network never spent. This flag exists to measure that.
+    bool                       rx_spin)
 {
     pin_to_core(RX_CPU);
 
@@ -395,6 +408,7 @@ static void roce_rx_pipeline_worker(
         rx_ready.store(true, std::memory_order_release);
 
         auto last_rx = std::chrono::steady_clock::now();
+        uint64_t prev_rx_ns = 0;
 
         while (rx_count.load(std::memory_order_relaxed) < n_expected) {
             if (stop.load(std::memory_order_acquire)) {
@@ -406,7 +420,8 @@ static void roce_rx_pipeline_worker(
             daqiri::BurstParams* completion = nullptr;
             if (daqiri::get_rx_burst(&completion, conn_id, /*server=*/true)
                     != daqiri::Status::SUCCESS || completion == nullptr) {
-                std::this_thread::sleep_for(std::chrono::microseconds(10));
+                if (!rx_spin)
+                    std::this_thread::sleep_for(std::chrono::microseconds(10));
                 continue;
             }
 
@@ -500,6 +515,28 @@ static void roce_rx_pipeline_worker(
                             t_rx.time_since_epoch()).count());
                     if (rx_ns > ts) wire_us = (rx_ns - ts) / 1000.0;
                 }
+            }
+
+            if (abs_count < trace_rx) {
+                const uint64_t rx_ns = static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        t_rx.time_since_epoch()).count());
+                // How many later messages the sender has already handed to the
+                // NIC. Large => the receiver is the bottleneck and the age is
+                // queueing. Zero => the sender has not even produced the next
+                // one, so a large age cannot be backlog.
+                int ahead = 0;
+                for (int k = abs_count + 1;
+                     k < static_cast<int>(send_ts_ns.size()) && ahead < 256; ++k) {
+                    if (send_ts_ns[k].load(std::memory_order_acquire) == 0) break;
+                    ++ahead;
+                }
+                std::fprintf(stderr,
+                             "[RXTRACE] i=%d d_rx=%.1f age=%.1f ahead=%d\n",
+                             abs_count,
+                             prev_rx_ns ? (rx_ns - prev_rx_ns) / 1000.0 : 0.0,
+                             wire_us, ahead);
+                prev_rx_ns = rx_ns;
             }
 
             BufferMetrics m;
@@ -596,6 +633,8 @@ int main(int argc, char** argv) {
     int  pace_us   = 0;
     int  rx_depth  = 128;
     int  tx_depth  = 128;
+    int  trace_rx  = 0;
+    bool rx_spin   = false;
 
     for (int i = 1; i < argc; ++i) {
         if      (!strcmp(argv[i], "--yaml")      && i+1 < argc) yaml_path = argv[++i];
@@ -607,6 +646,8 @@ int main(int argc, char** argv) {
         else if (!strcmp(argv[i], "--pace-us")   && i+1 < argc) pace_us   = std::atoi(argv[++i]);
         else if (!strcmp(argv[i], "--rx-depth")  && i+1 < argc) rx_depth  = std::atoi(argv[++i]);
         else if (!strcmp(argv[i], "--tx-depth")  && i+1 < argc) tx_depth  = std::atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--trace-rx")  && i+1 < argc) trace_rx  = std::atoi(argv[++i]);
+        else if (!strcmp(argv[i], "--rx-spin"))                  rx_spin   = true;
         else if (!strcmp(argv[i], "--out")       && i+1 < argc) out_path  = argv[++i];
     }
 
@@ -682,7 +723,7 @@ int main(int argc, char** argv) {
                        std::ref(stop), std::ref(rx_ready),
                        std::ref(rx_count), std::ref(rx_bytes_total),
                        std::ref(all_metrics), &logger, &sampler,
-                       std::cref(send_ts_ns));
+                       std::cref(send_ts_ns), trace_rx, rx_spin);
 
     std::thread tx_thr(roce_tx_worker,
                        buf_size, total_send, pace_us, tx_depth,
