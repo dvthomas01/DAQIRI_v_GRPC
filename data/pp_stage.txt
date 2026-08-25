@@ -1,0 +1,99 @@
+SKIPPED 17 of 24 reports:
+   pp_base_1048576_1.sqlite     no kernel table (process launched no CUDA work)
+   pp_base_1048576_2.sqlite     no kernel table (process launched no CUDA work)
+   pp_base_1048576_3.sqlite     no kernel table (process launched no CUDA work)
+   pp_base_4096_1.sqlite        no kernel table (process launched no CUDA work)
+   pp_base_4096_2.sqlite        no kernel table (process launched no CUDA work)
+   pp_base_4096_3.sqlite        no kernel table (process launched no CUDA work)
+   pp_daq_1048576_3.sqlite      only 3 steady-state cycles (need 5); 5 boundaries total
+   pp_extbuf_1048576_1.sqlite   no kernel table (process launched no CUDA work)
+   pp_extbuf_1048576_2.sqlite   no kernel table (process launched no CUDA work)
+   pp_extbuf_1048576_3.sqlite   no kernel table (process launched no CUDA work)
+   pp_extbuf_4096_3.sqlite      no kernel table (process launched no CUDA work)
+   pp_opt_1048576_1.sqlite      no kernel table (process launched no CUDA work)
+   pp_opt_1048576_2.sqlite      no kernel table (process launched no CUDA work)
+   pp_opt_1048576_3.sqlite      no kernel table (process launched no CUDA work)
+   pp_opt_4096_1.sqlite         no kernel table (process launched no CUDA work)
+   pp_opt_4096_2.sqlite         no kernel table (process launched no CUDA work)
+   pp_opt_4096_3.sqlite         no kernel table (process launched no CUDA work)
+
+==============================================================================
+PAYLOAD 1048576 samples = 4096 KB   (per-message medians, then median across reps)
+==============================================================================
+
+--- base   NO USABLE PROFILE ---
+
+--- opt   NO USABLE PROFILE ---
+
+--- daq   (2 reps, sync-end boundaries, 163 cycles/rep) ---
+  message cycle (wall, profiled)        318.82 us  [mean 679.73]
+  CONSUMER THREAD, one message:
+    blocked in CUDA sync                 49.02 us
+    spinning in CUDA query                0.00 us
+    enqueue / launch in CUDA             11.19 us
+    blocked in syscall (transport)      249.58 us
+    our own CPU code                      8.29 us
+    -- partition check, must be ~0        0.00 us
+  GPU, one message:
+    kernel busy                          48.78 us
+      regular_fft_factor                40.29 us  x2.0
+      postprocess_kernel                 8.45 us  x1.0
+    memcpy                                none
+  top syscalls outside CUDA:
+      nanosleep                        249.58 us  [mean 608.37]
+      writev                             0.00 us  [mean 0.22]
+  top CUDA APIs:
+      cudaEventSynchronize              49.02 us  x1.0
+      cuLaunchKernel                     7.79 us  x3.0
+      cudaEventRecord                    3.38 us  x2.0
+
+--- extbuf   NO USABLE PROFILE ---
+
+==============================================================================
+PAYLOAD 4096 samples = 16 KB   (per-message medians, then median across reps)
+==============================================================================
+
+--- base   NO USABLE PROFILE ---
+
+--- opt   NO USABLE PROFILE ---
+
+--- daq   (3 reps, sync-end boundaries, 163 cycles/rep) ---
+  message cycle (wall, profiled)         17.44 us  [mean 75.38]
+  CONSUMER THREAD, one message:
+    blocked in CUDA sync                  6.11 us
+    spinning in CUDA query                0.00 us
+    enqueue / launch in CUDA              5.66 us
+    blocked in syscall (transport)        0.00 us
+    our own CPU code                      5.62 us
+    -- partition check, must be ~0        0.00 us
+  GPU, one message:
+    kernel busy                           3.74 us
+      vector_fft_r2c                     3.74 us  x1.0
+    memcpy                                none
+  top syscalls outside CUDA:
+      nanosleep                          0.00 us  [mean 57.32]
+      writev                             0.00 us  [mean 0.21]
+  top CUDA APIs:
+      cudaEventSynchronize               6.11 us  x1.0
+      cudaEventRecord                    3.31 us  x2.0
+      cuLaunchKernel                     2.35 us  x1.0
+
+--- extbuf   (2 reps, sync-end boundaries, 325 cycles/rep) ---
+  message cycle (wall, profiled)         11.70 us  [mean 74.43]
+  CONSUMER THREAD, one message:
+    blocked in CUDA sync                  3.24 us
+    spinning in CUDA query                0.00 us
+    enqueue / launch in CUDA              5.45 us
+    blocked in syscall (transport)        0.00 us
+    our own CPU code                      2.21 us
+    -- partition check, must be ~0        0.00 us
+  GPU, one message:
+    kernel busy                           2.59 us
+      vector_fft_r2c                     2.59 us  x0.5
+    memcpy                                none
+  top syscalls outside CUDA:
+      futex                              0.00 us  [mean 59.98]
+  top CUDA APIs:
+      cudaEventRecord                    3.20 us  x1.5
+      cuLaunchKernel                     2.18 us  x0.5
+      cudaEventSynchronize               3.24 us  x1.0
