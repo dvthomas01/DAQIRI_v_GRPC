@@ -30,6 +30,7 @@
 
 #include <chrono>
 #include <thread>
+#include <algorithm>
 #include <cstring>
 #include <iostream>
 #include <string>
@@ -148,7 +149,14 @@ int main(int argc, char** argv) {
 #endif
 
     int sent = 0;
+    // Per-message cost of building the request the transport will carry. The
+    // signal itself is synthesised once outside the loop in every arm, so the
+    // comparable data-creation term is this: getting the samples into the
+    // buffer the transport reads from.
+    std::vector<double> fill_us;
+    fill_us.reserve(static_cast<size_t>(total_send));
     for (int i = 0; i < total_send; ++i) {
+        const auto f0 = std::chrono::steady_clock::now();
         pipeline_fft::BufferRequest req;
 
         // Populate float32 samples
@@ -172,6 +180,9 @@ int main(int argc, char** argv) {
             std::chrono::system_clock::now().time_since_epoch()).count();
         req.set_send_timestamp_ns(now_ns);
         req.set_seq_num(i);
+        fill_us.push_back(
+            std::chrono::duration<double>(
+                std::chrono::steady_clock::now() - f0).count() * 1e6);
 
         if (!writer->Write(req)) {
             std::cerr << "[client] Write failed at buffer " << i << "\n";
@@ -219,6 +230,17 @@ int main(int argc, char** argv) {
     std::cout << "  Sent          : " << sent << " / " << total_send << " buffers\n"
               << "  Elapsed       : " << elapsed_s << " s\n"
               << "  Client TX rate: " << total_mb_sent / elapsed_s << " MB/s\n\n";
+
+    // Drop the first 32 so arena growth and cold destination pages do not set
+    // the median. Printed rather than logged because the CSV is the server's
+    // and this number belongs to the client.
+    if (fill_us.size() > 64) {
+        std::vector<double> f(fill_us.begin() + 32, fill_us.end());
+        std::sort(f.begin(), f.end());
+        std::cout << "  payload fill p50 : " << f[f.size() / 2]
+                  << " us  (" << f.size() << " samples)\n";
+        std::cout.flush();
+    }
 
     // Server-computed summary is now in `summary`
     if (summary.buffers_received() == 0) {

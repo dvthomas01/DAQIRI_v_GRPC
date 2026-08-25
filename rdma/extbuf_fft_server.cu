@@ -579,9 +579,10 @@ int main(int argc, char** argv) {
         std::setvbuf(csv, csv_buf.data(), _IOFBF, csv_buf.size());
         // gap_us goes after ok rather than at the end, so that the existing
         // field positions the Phase 4 script cuts on (5, 6 and 9) do not move.
+        // transport_us is appended ahead of gitsha for the same reason.
         std::fprintf(csv,
                      "seq,slot,bytes,npts,e2e_us,fft_us,peak_hz,expect_hz,ok,"
-                     "gap_us,gitsha\n");
+                     "gap_us,transport_us,gitsha\n");
     }
 
     // ── the loop ─────────────────────────────────────────────────────────
@@ -592,6 +593,15 @@ int main(int argc, char** argv) {
     float    worst_err_hz = 0.0f, worst_seen_hz = 0.0f, worst_expect_hz = 0.0f;
     std::vector<double> e2e;
     e2e.reserve(msgs);
+
+    // One-way transport: the sender's clock reading, carried in the frame
+    // header, subtracted from ours at the moment receive_ext returns. Valid
+    // only when both ends share a host, because it is a raw CLOCK_MONOTONIC
+    // difference with no synchronisation. In the loopback sweeps they do. On a
+    // two-machine link the epochs are unrelated and this will be nonsense, so
+    // the field is left out of the summary when it comes back negative.
+    std::vector<double> transport;
+    transport.reserve(msgs);
 
     // Inter-arrival, measured on this box's clock only.
     //
@@ -685,6 +695,14 @@ int main(int argc, char** argv) {
 
         const uint32_t seq  = hdr->seq;
         const bool     last = (hdr->flags & kExtFlagLast) != 0;
+
+        // Both ends read the same CLOCK_MONOTONIC when they share a host, so
+        // this is a one-way wire time. Taken before the transform so nothing
+        // below is charged to it.
+        const double tx_us = (hdr->send_ts_ns != 0)
+            ? t0 - static_cast<double>(hdr->send_ts_ns) / 1000.0
+            : -1.0;
+        if (tx_us >= 0.0) transport.push_back(tx_us);
 
         // ── THE ORDERING RULE ────────────────────────────────────────────
         // The completion has been observed (receive_ext returned). Only now is
@@ -799,10 +817,10 @@ int main(int argc, char** argv) {
         }
 
         if (csv)
-            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%.3f,%s\n",
+            std::fprintf(csv, "%u,%zu,%zu,%d,%.3f,%.3f,%.1f,%.1f,%d,%.3f,%.3f,%s\n",
                          seq, slot, len, npts, t1 - t0, fft.last_exec_us(),
                          peak_hz, expect_hz, ok ? 1 : 0,
-                         gap.empty() ? 0.0 : gap.back(), git_sha.c_str());
+                         gap.empty() ? 0.0 : gap.back(), tx_us, git_sha.c_str());
 
         if (guard::allocs != frozen_allocs || guard::xlates != frozen_xlates ||
             guard::regs != frozen_regs) {
@@ -833,6 +851,21 @@ int main(int argc, char** argv) {
                     worst_seen_hz, worst_expect_hz);
     std::printf("e2e p50 / p99     : %.2f / %.2f us  (post-arrival, %zu samples)\n",
                 pct(0.50), pct(0.99), e2e.size());
+
+    // One-way transport, sender's send call to our receive_ext returning.
+    // Withheld rather than printed as a negative when the two ends did not
+    // share a clock, which is the two-machine case.
+    if (!transport.empty()) {
+        std::sort(transport.begin(), transport.end());
+        auto tpct = [&](double p) {
+            size_t i = static_cast<size_t>(p * (transport.size() - 1));
+            return transport[i];
+        };
+        if (tpct(0.50) >= 0.0)
+            std::printf("transport p50/p99 : %.2f / %.2f us  (send call -> "
+                        "receive_ext returned, %zu samples)\n",
+                        tpct(0.50), tpct(0.99), transport.size());
+    }
 
     // Inter-arrival and the rate it implies.
     //

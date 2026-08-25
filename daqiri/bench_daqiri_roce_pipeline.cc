@@ -40,6 +40,7 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <iostream>
@@ -129,7 +130,13 @@ static void roce_tx_worker(
     int                tx_depth,
     std::atomic<bool>& stop,
     std::atomic<bool>& rx_ready,   // set by RX once server is up + receives posted
-    std::atomic<int>&  tx_count)
+    std::atomic<int>&  tx_count,
+    // One slot per message. TX stores its clock reading here immediately before
+    // handing the work request to the NIC; RX reads the slot matching its own
+    // arrival index. Both workers are threads of one process, so this is one
+    // clock and the difference is a true one-way wire time with nothing to
+    // synchronise. RC preserves ordering, so arrival index k is send index k.
+    std::vector<std::atomic<uint64_t>>& send_ts_ns)
 {
     pin_to_core(TX_CPU);
 
@@ -169,6 +176,12 @@ static void roce_tx_worker(
     int      outstanding_send = 0;
     uint64_t send_wr_id       = 0x1234;
     int      sent             = 0;
+
+    // Per-message cost of putting the payload where the NIC will read it. This
+    // is the only work this arm does between having a signal and sending it,
+    // so it is the arm's data-creation term.
+    std::vector<double> fill_us;
+    fill_us.reserve(static_cast<size_t>(n_to_send));
 
     // Drain any available SEND completions to free transmit slots.
     auto drain_sends = [&]() {
@@ -212,10 +225,24 @@ static void roce_tx_worker(
         }
 
         auto* dst = static_cast<float*>(daqiri::get_packet_ptr(msg, 0));
+        const auto f0 = std::chrono::steady_clock::now();
         std::memcpy(dst, signal.data(), static_cast<size_t>(payload_bytes));
+        const auto f1 = std::chrono::steady_clock::now();
         daqiri::set_packet_lengths(msg, 0, {payload_bytes});
 
+        // Last statement before the NIC gets it, so nothing above is charged to
+        // transport. Written before the send, not after, because the receiver
+        // may observe the payload before send_tx_burst returns here.
+        if (sent < static_cast<int>(send_ts_ns.size()))
+            send_ts_ns[sent].store(
+                static_cast<uint64_t>(
+                    std::chrono::duration_cast<std::chrono::nanoseconds>(
+                        std::chrono::steady_clock::now().time_since_epoch()).count()),
+                std::memory_order_release);
+
         if (daqiri::send_tx_burst(msg) == daqiri::Status::SUCCESS) {
+            fill_us.push_back(
+                std::chrono::duration<double>(f1 - f0).count() * 1e6);
             ++outstanding_send;
             ++send_wr_id;
             ++sent;
@@ -232,6 +259,17 @@ static void roce_tx_worker(
     while (outstanding_send > 0 && std::chrono::steady_clock::now() < deadline) {
         drain_sends();
         std::this_thread::sleep_for(std::chrono::microseconds(50));
+    }
+
+    // Drop the first 32 so a cold destination page or a cold branch predictor
+    // does not set the median. Printed rather than logged because the CSV is
+    // the receiver's and this number belongs to the sender.
+    if (fill_us.size() > 64) {
+        std::vector<double> f(fill_us.begin() + 32, fill_us.end());
+        std::sort(f.begin(), f.end());
+        std::printf("[TX] payload fill p50 : %.3f us  (%zu samples)\n",
+                    f[f.size() / 2], f.size());
+        std::fflush(stdout);
     }
     stop.store(true, std::memory_order_release);
 }
@@ -256,7 +294,10 @@ static void roce_rx_pipeline_worker(
     std::atomic<uint64_t>&     rx_bytes_total,
     std::vector<BufferMetrics>& metrics_out,
     CsvLogger*                 logger,
-    UtilSampler*               sampler)
+    UtilSampler*               sampler,
+    // Written by the TX worker, one slot per message, same clock. See the TX
+    // signature for why arrival index k pairs with send index k.
+    const std::vector<std::atomic<uint64_t>>& send_ts_ns)
 {
     pin_to_core(RX_CPU);
 
@@ -445,6 +486,22 @@ static void roce_rx_pipeline_worker(
             const int  abs_count = rx_count.load(std::memory_order_relaxed);
             const bool in_warmup = (abs_count < warmup);
 
+            // One-way transport: TX's reading just before it posted this
+            // message, subtracted from ours the moment the completion came
+            // back. Zero means TX had not written the slot, which should not
+            // happen on an RC queue pair but is not worth aborting over.
+            double wire_us = 0.0;
+            if (abs_count < static_cast<int>(send_ts_ns.size())) {
+                const uint64_t ts =
+                    send_ts_ns[abs_count].load(std::memory_order_acquire);
+                if (ts != 0) {
+                    const uint64_t rx_ns = static_cast<uint64_t>(
+                        std::chrono::duration_cast<std::chrono::nanoseconds>(
+                            t_rx.time_since_epoch()).count());
+                    if (rx_ns > ts) wire_us = (rx_ns - ts) / 1000.0;
+                }
+            }
+
             BufferMetrics m;
             m.e2e_latency_us      = e2e_us;
             m.transfer_latency_us = transfer_us;
@@ -456,6 +513,8 @@ static void roce_rx_pipeline_worker(
             m.dropped_buffers     = 0;
             m.cpu_util_pct        = sampler ? sampler->cpu_pct() : 0.0f;
             m.gpu_util_pct        = sampler ? sampler->gpu_pct() : 0.0f;
+            m.wire_latency_us     = wire_us;
+            m.seq_num             = abs_count;
             if (!in_warmup) {
                 if (logger) logger->log(m);
                 metrics_out.push_back(m);
@@ -610,17 +669,25 @@ int main(int argc, char** argv) {
 
     const auto t_start = std::chrono::steady_clock::now();
 
+    // One slot per message, shared by the two workers. Sized to the full send
+    // count including warmup so the arrival index can address it directly.
+    std::vector<std::atomic<uint64_t>> send_ts_ns(
+        static_cast<size_t>(total_send));
+    for (auto& s : send_ts_ns) s.store(0, std::memory_order_relaxed);
+
     std::cerr << "[MAIN] launching RX + TX threads" << std::endl;
     std::thread rx_thr(roce_rx_pipeline_worker,
                        buf_size, total_send, warmup, zero_copy, stage_timing,
                        rx_depth,
                        std::ref(stop), std::ref(rx_ready),
                        std::ref(rx_count), std::ref(rx_bytes_total),
-                       std::ref(all_metrics), &logger, &sampler);
+                       std::ref(all_metrics), &logger, &sampler,
+                       std::cref(send_ts_ns));
 
     std::thread tx_thr(roce_tx_worker,
                        buf_size, total_send, pace_us, tx_depth,
-                       std::ref(stop), std::ref(rx_ready), std::ref(tx_count));
+                       std::ref(stop), std::ref(rx_ready), std::ref(tx_count),
+                       std::ref(send_ts_ns));
 
     tx_thr.join();
     rx_thr.join();

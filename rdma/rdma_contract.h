@@ -68,6 +68,15 @@ struct ExtFrameHeader {
     uint32_t seq;        // message number; selects the tone via payload_tone_hz
     uint32_t n_samples;  // floats that follow at kPayloadOffset
     uint32_t flags;      // bit 0 = last message of the run
+    // Sender's steady_clock reading, taken as late as it can be before the send
+    // call. The receiver subtracts it from its own steady_clock at the moment
+    // receive_ext returns, which gives one-way transport time. That subtraction
+    // is only meaningful when both ends are on ONE host, which is how the
+    // loopback sweeps run: Linux steady_clock is CLOCK_MONOTONIC and is shared
+    // across processes on a box. Across two machines there is no common epoch
+    // and this field must be ignored in favour of echo mode. Sits in the 240
+    // spare bytes ahead of kPayloadOffset, so the payload does not move.
+    uint64_t send_ts_ns;
 };
 
 inline constexpr uint32_t kExtMagic      = 0x44415149u;  // 'DAQI'

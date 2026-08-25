@@ -290,6 +290,11 @@ int main(int argc, char** argv) {
         const double g1 = now_us();
 
         const double s0 = now_us();
+        // As late as possible: anything between this and the send call is
+        // charged to transport, so it belongs on the near side of the clock.
+        hdr->send_ts_ns = static_cast<uint64_t>(
+            std::chrono::duration_cast<std::chrono::nanoseconds>(
+                std::chrono::steady_clock::now().time_since_epoch()).count());
         GrpcDirectPendingResponse* p =
             grpc_direct_client_send(cli, buf, frame_bytes);
         const double s1 = now_us();
