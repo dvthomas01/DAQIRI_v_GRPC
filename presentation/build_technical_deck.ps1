@@ -138,8 +138,9 @@ Add-Bullets $s 54 130 850 380 @(
  "Test configuration and measurement methodology",
  "Phase 1 results: transport benchmark (latency, throughput, RDMA)",
  "Phase 2 results: DAQiri vs gRPC-Direct GPU FFT pipeline",
+ "Part 3: closing the gap. Root cause, the remainder, the memory finding, and the RDMA receiver",
  "Open-issue analysis: large-payload delivery",
- "Risk, limitations, conclusions, verification status, and action items") 18 | Out-Null
+ "Risk, limitations, conclusions, verification status, and action items") 17 | Out-Null
 
 # =====================================================================
 # 3 - Objectives & Success Criteria
@@ -156,8 +157,10 @@ $sc = @(
  @("SC-1","Measure transport latency with a fair, repeatable method","MET"),
  @("SC-2","Show transport-only speedup with unchanged application API","MET (up to 281x)"),
  @("SC-3","Compare GPU-pipeline latency, DAQiri vs gRPC-Direct","MET (DAQiri faster all sizes)"),
- @("SC-4","Characterize delivery / drops across payload sizes","MET (128 KB drop found)"))
-Add-Table $s 54 276 850 150 5 3 $sc 3 | Out-Null
+ @("SC-4","Characterize delivery / drops across payload sizes","MET (128 KB drop found)"),
+ @("SC-5","Find and fix the cause of the large-payload gap","MET (1.80x at 4 MB)"),
+ @("SC-6","Localize whatever remains to a named component","MET (79 percent inside cuFFT)"))
+Add-Table $s 54 268 850 200 7 3 $sc 3 | Out-Null
 Add-Footnote $s "Verification status detailed on the conclusions slide."
 
 # =====================================================================
@@ -260,11 +263,12 @@ $s = New-Blank
 Add-Header $s "Phase 1 - RDMA vs Line Rate" "RESULTS / TRANSPORT"
 Add-Picture $s "$FIG\p1_rdma_linerate.png" 40 118 520 380 | Out-Null
 Add-Bullets $s 590 160 330 300 @(
- "gRPC-Direct RDMA: 5.775 GB/s, measured before the MTU was fixed",
- "That run was capped by a 1024-byte RoCE MTU, not by the API",
- "Same fabric at MTU 4096 does 6.127 GB/s = 98% of 50G line rate",
- "DAQiri comparison withdrawn pending a rerun; see handoff 7p") 15 | Out-Null
-Add-Footnote $s "Raw EasyRDMA one-directional throughput, PXI to Spark. The DAQiri figure this slide used to carry has been retracted."
+ "The first run measured 5.786 GB/s and was read as a fabric limit",
+ "It was a 1024-byte RoCE MTU, a misconfiguration, not the API",
+ "Same link at MTU 4096: 6.127 GB/s = 98.0% of 50G line rate",
+ "A 2-byte control did not move, which attributes the gain to the MTU",
+ "The old DAQiri bar is removed: it was the same misconfigured fabric") 15 | Out-Null
+Add-Footnote $s "Raw ib_write_bw, 4 MB, PXI writing into the Spark. The DAQiri tie this slide used to assert is retracted; see handoff 7p."
 
 # =====================================================================
 # 11 - Phase 2 zero-copy latency
@@ -315,6 +319,126 @@ Add-Bullets $s 640 150 290 320 @(
 Add-Footnote $s "128 KB = 32768 samples x 4 bytes = 131072 B (fits under configured max payload 131136 B)."
 
 # =====================================================================
+# PART 3 - Closing the gap. Six slides, 14a through 14f.
+# Every chart here is regenerated from a CSV in data/ by
+# scripts/make_part3_figs.py. No number on these slides is typed in by hand.
+# =====================================================================
+
+# ---------------------------------------------------------------------
+# 14a - Where the gap was, and how we found it
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "Where the Gap Was, and How We Found It" "PART 3 / LOCALIZING"
+Add-Picture $s "$FIG\p3_s1_residual_vs_payload.png" 34 116 560 390 | Out-Null
+Add-Bullets $s 614 138 310 350 @(
+ "Residual = end-to-end minus the measured transform time",
+ "A cost that does not change with payload is fixed overhead",
+ "A cost that grows with the byte count means something is touching every byte",
+ "DAQiri stays flat, 4.87 to 5.13 us, across a 256x range of payload",
+ "gRPC-Direct climbs to 81.88 us at 4 MB",
+ "The shape identified a per-byte cost before we knew what it was") 14 | Out-Null
+Add-Footnote $s "Source: data/headline_runs.csv, 9 payload sizes, 2 reps per cell. The 4 MB effect is roughly 20x the measured noise floor."
+
+# ---------------------------------------------------------------------
+# 14b - The root cause
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "Root Cause: an Alignment Test That Could Not Pass" "PART 3 / ROOT CAUSE"
+Add-Picture $s "$FIG\p3_s2_root_cause.png" 34 116 500 390 | Out-Null
+Add-Bullets $s 556 132 368 300 @(
+ "protobuf guarantees 8-byte alignment for its arena buffers",
+ "The zero-copy path tested for 16-byte alignment before using the buffer in place",
+ "Every message failed that test and took a staging copy that cuFFT never required",
+ "It hid because the timer around cudaMemcpyAsync read 3.5 us: that call only enqueues, so the cost landed outside the window being measured") 14 | Out-Null
+Add-Rect $s 556 446 368 62 $LightGrn | Out-Null
+Add-Text $s 570 456 340 44 "Copy measured directly: 77.01 us.  Residual gap predicted: 76.53 us.  Two independent measurements of the same cost." 13 $true $NIGrnD $alignLeft | Out-Null
+Add-Footnote $s "4 MB payload. DAQiri shown as a reference line, not a competitor: the claim on this slide is what the fix did to gRPC-Direct."
+
+# ---------------------------------------------------------------------
+# 14c - What was left, and where it lives
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "What Was Left, and Where It Lives" "PART 3 / THE REMAINDER"
+Add-Picture $s "$FIG\p3_s3_where_it_lives.png" 34 116 560 380 | Out-Null
+Add-Bullets $s 614 138 310 350 @(
+ "After the fix, gRPC-Direct is still about 8 us behind at 4 MB",
+ "Split that remainder into the part inside cuFFT and the part outside it",
+ "Kernel launch overhead does not depend on payload, so a remainder that grows with the byte count is not launch overhead",
+ "At 4 MB, 6.40 us of 8.10 us, about 79 percent, is inside cuFFT itself",
+ "Same GPU, same plan, same transform size. What differs is where the input buffer lives") 14 | Out-Null
+Add-Footnote $s "Source: data/headline_runs.csv, 2 reps per cell. The dips at 128 KB and 512 KB are rep-to-rep noise at that count, not structure."
+
+# ---------------------------------------------------------------------
+# 14d - The memory finding
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "The Memory Finding: a Result That Inverted" "PART 3 / SCOPING"
+Add-Picture $s "$FIG\p3_s4_memory.png" 34 112 540 340 | Out-Null
+Add-Bullets $s 592 128 332 300 @(
+ "Two ways to get host memory the GPU can read: allocated by cudaHostAlloc, or adopted by registering pages the process already owns",
+ "Adopted measured slower every way it was tried: 7.3 us in the chart at left, and 10.94 us in a separate 15-rep rotation across page sizes",
+ "Then the CPU write that filled the buffer was removed, and the sign inverted: adopted became 11.2 us faster",
+ "Confirmed in the real RDMA receiver, where the NIC writes and the CPU never touches the buffer: the two are indistinguishable, p = 1.0") 13 | Out-Null
+Add-Rect $s 34 462 890 48 $LightAmb | Out-Null
+Add-Text $s 48 472 862 32 "Both measurements were correct about what they measured. The error available here was carrying one of them into a configuration it had not measured, which is the configuration that ships." 13 $true $Charcoal $alignLeft | Out-Null
+Add-Footnote $s "Sources: data/memsrc_2x2_1048576.csv, data/memsrc_2x2_nowrite_1048576.csv, data/pagesize_rot.csv. 4 MiB payload. Error bars are distribution-free intervals of the median."
+
+# ---------------------------------------------------------------------
+# 14e - What got built. Data-path diagram, not a chart.
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "What Got Built: RDMA Straight into GPU-Readable Memory" "PART 3 / THE TRANSPORT"
+
+$bx = 42; $by = 150; $bw = 132; $bh = 62; $gap = 24
+Add-Rect $s $bx $by $bw $bh $Slate | Out-Null
+Add-Text $s ($bx+8) ($by+14) ($bw-16) 40 "PXI chassis`r(no CUDA)" 13 $true $White $alignCenter | Out-Null
+$x2 = $bx + $bw + $gap
+Add-Rect $s $x2 $by $bw $bh $NIGrnD | Out-Null
+Add-Text $s ($x2+8) ($by+14) ($bw-16) 40 "50G RoCE`rlink" 13 $true $White $alignCenter | Out-Null
+$x3 = $x2 + $bw + $gap
+Add-Rect $s $x3 $by $bw $bh $NIGrnD | Out-Null
+Add-Text $s ($x3+8) ($by+14) ($bw-16) 40 "NIC writes`rby DMA" 13 $true $White $alignCenter | Out-Null
+$x4 = $x3 + $bw + $gap
+Add-Rect $s $x4 $by ($bw+40) $bh $NIGreen | Out-Null
+Add-Text $s ($x4+8) ($by+8) ($bw+24) 50 "One host buffer:`rcudaHostAlloc + ibv_reg_mr" 12 $true $White $alignCenter | Out-Null
+$x5 = $x4 + $bw + 40 + $gap
+Add-Rect $s $x5 $by $bw $bh $Charcoal | Out-Null
+Add-Text $s ($x5+8) ($by+14) ($bw-16) 40 "cuFFT reads`rin place" 13 $true $White $alignCenter | Out-Null
+
+Add-Text $s 42 232 880 24 "No staging copy anywhere on this path. The NIC and the GPU address the same allocation." 14 $true $NIGrnD $alignLeft | Out-Null
+
+# Flow connectors, drawn after the boxes so they sit in the gaps between them.
+foreach($ax in @(($bx+$bw), ($x2+$bw), ($x3+$bw), ($x4+$bw+40))){
+    Add-Text $s $ax ($by+16) $gap 30 ">" 26 $true $Slate $alignCenter | Out-Null
+}
+
+Add-Bullets $s 42 274 430 230 @(
+ "GPUDirect RDMA is not available on GB10: unified memory means there is no separate GPU aperture for the NIC to target",
+ "Registering a cudaHostAlloc buffer with the NIC is the supported route on this hardware",
+ "The receiver runs the transform on a dedicated CUDA stream") 14 | Out-Null
+Add-Bullets $s 500 274 424 230 @(
+ "Measured at 98.0 percent of 50G line rate, once the RoCE MTU was corrected",
+ "Runs PXI to Spark. DAQiri cannot: it requires CUDA on both ends, and the PXI chassis has no GPU",
+ "That is a capability difference, not a latency difference") 14 | Out-Null
+Add-Footnote $s "Throughput from ib_write_bw, 4 MB writes, PXI to Spark. Latency numbers for this transport are on the next slide."
+
+# ---------------------------------------------------------------------
+# 14f - Where it ended
+# ---------------------------------------------------------------------
+$s = New-Blank
+Add-Header $s "Where It Ended: Four Arms at 4 MiB" "PART 3 / RESULT"
+Add-Picture $s "$FIG\p3_s6_four_arm_sat.png" 34 116 560 380 | Out-Null
+Add-Bullets $s 614 132 310 300 @(
+ "12 reps per arm, each arm rotated through all four running positions",
+ "Error bars are distribution-free intervals of the median, so the chart shows what the measurement can and cannot resolve",
+ "gRPC-Direct is 1.71x faster than it was, and now sits 6.96 us behind DAQiri (12 of 12 reps, interval 5.31 to 9.41 us)",
+ "That 6.96 us does not depend on how hard the arms are driven: the same test at an eight times lower offered rate gives 7.02 us",
+ "The before arm has the fastest transform because it reads device memory after paying a 77 us copy to get there") 13 | Out-Null
+Add-Rect $s 614 438 310 70 $LightAmb | Out-Null
+Add-Text $s 626 446 286 56 "Only the RDMA arm cares about offered rate: 23 us between the two pacing regimes, against under 2 us for every other arm." 12 $true $Charcoal $alignLeft | Out-Null
+Add-Footnote $s "Source: data/deck_4arm_4mib.csv, saturated regime. 4 MiB payload, 1000 messages per cell, SM clock gated at 2400 MHz and recorded per cell. The unsaturated regime was measured at the same rep count and is the sensitivity result quoted above."
+
+# =====================================================================
 # 15 - Open Issue Analysis
 # =====================================================================
 $s = New-Blank
@@ -341,14 +465,15 @@ $s = New-Blank
 Add-Header $s "Risk and Limitations" "MIL-STD RISK"
 $rk = @(
  @("Area","Limitation","Mitigation"),
- @("GPU clocks","Not lockable, >10x DVFS swing","Identical 400 us pacing; FFT p50 probe"),
- @("Transport","DAQiri run over TCP loopback socket engine, not flagship NIC-to-GPU","Documented; symmetric with gRPC"),
+ @("GPU clocks","Not lockable, >10x DVFS swing","Clocks warmed to 2400 MHz and recorded per cell"),
+ @("Topology","Part 3 arms all run same-box, DAQiri as an RC loopback","Same for every arm, which is what makes them comparable"),
+ @("Offered rate","The RDMA arm moves 23 us between pacing regimes; no other arm moves more than 2 us","Both regimes measured at 12 reps; the headline names the one it uses"),
  @("Delivery","128 KB drop on DAQiri (open)","Diagnostic plan defined; latency unaffected"),
- @("Scope","Loopback / same-host focus for GPU pipeline","Phase 1 covers cross-machine RDMA"))
-Add-Table $s 54 122 850 200 5 3 $rk 0 | Out-Null
-Add-Bullets $s 54 340 850 150 @(
+ @("Rep count","Slides on payload shape rest on 2 reps per cell","Rep count printed on those slides; 4 MiB conclusions use 12"))
+Add-Table $s 54 122 850 230 6 3 $rk 0 | Out-Null
+Add-Bullets $s 54 368 850 130 @(
  "Latency medians are robust to the drop (drops reduce sample count, not the median of delivered buffers)",
- "Throughput / reliability leg at 128 KB is the only affected result and is flagged as open") 15 | Out-Null
+ "Throughput and reliability at 128 KB is the only affected result and is flagged as open") 14 | Out-Null
 
 # =====================================================================
 # 17 - Conclusions & Verification Status
@@ -358,14 +483,17 @@ Add-Header $s "Conclusions and Verification Status" "CLOSURE"
 $cv = @(
  @("Finding","Status"),
  @("Transport swap gives up to 281x lower latency, same API","VERIFIED"),
- @("Zero-copy gives 3.9x throughput; RDMA within 1% of DAQiri","VERIFIED"),
- @("Both GPU paths remove the large CPU copy","VERIFIED"),
- @("DAQiri lower GPU-pipeline latency at all payloads","VERIFIED"),
+ @("Zero-copy gives 3.9x streaming throughput","VERIFIED"),
+ @("RDMA transport runs at 98.0 percent of 50G line rate","VERIFIED"),
+ @("Earlier claim that RDMA ties DAQiri at the fabric limit","RETRACTED - measured a misconfigured MTU"),
+ @("Large-payload root cause found and fixed: 1.80x at 4 MB","VERIFIED"),
+ @("Remaining gap to DAQiri at 4 MiB: 6.96 us, 12 of 12 reps","VERIFIED"),
+ @("Host memory choice is neutral when the CPU does not write","VERIFIED"),
  @("128 KB DAQiri delivery limit","OPEN - under analysis"))
-Add-Table $s 54 122 850 210 6 2 $cv 2 | Out-Null
-Add-Bullets $s 54 350 850 150 @(
- "Overall: transport, not compute, governs hardware-to-GPU latency; NI gRPC-Direct closes the gap to purpose-built DAQ",
- "One open item remains before full sign-off") 15 | Out-Null
+Add-Table $s 54 118 850 268 9 2 $cv 0 | Out-Null
+Add-Bullets $s 54 400 850 110 @(
+ "Transport, not compute, governs hardware-to-GPU latency. The remaining difference at 4 MiB is about 7 us and is located inside cuFFT, not in the API",
+ "One delivery item remains open before full sign-off") 14 | Out-Null
 
 # =====================================================================
 # 18 - Next Steps / Action Items
@@ -389,13 +517,13 @@ Add-Header $s "Backup - Aggregated Phase 2 Data (median of 5 trials)" "BACKUP"
 $dt = @(
  @("Payload","Pipeline / mode","Deliv","E2E p50 (us)","FFT p50 (us)","MB/s"),
  @("16 KB","DAQiri zero-copy","1000","10.22","5.15","1602"),
- @("16 KB","gRPC zero-copy","972","16.77","8.61","977"),
+ @("16 KB","gRPC-Direct zero-copy","972","16.77","8.61","977"),
  @("32 KB","DAQiri zero-copy","1000","11.94","6.85","2749"),
- @("32 KB","gRPC zero-copy","972","17.36","8.51","1888"),
+ @("32 KB","gRPC-Direct zero-copy","972","17.36","8.51","1888"),
  @("64 KB","DAQiri zero-copy","1000","14.22","9.15","4607"),
- @("64 KB","gRPC zero-copy","971","21.38","11.58","3066"),
+ @("64 KB","gRPC-Direct zero-copy","971","21.38","11.58","3066"),
  @("128 KB","DAQiri zero-copy","240","20.78","15.78","6316"),
- @("128 KB","gRPC zero-copy","973","26.48","15.52","4950"))
+ @("128 KB","gRPC-Direct zero-copy","973","26.48","15.52","4950"))
 Add-Table $s 54 118 850 330 9 6 $dt 4 | Out-Null
 Add-Footnote $s "Copy-mode rows and Phase 1 detail available in the project repository (data/ and README)."
 
