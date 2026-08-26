@@ -1,13 +1,122 @@
 # Short-Term Context — Active Sprint
-**Phase:** RDMA transport for gRPC-Direct: auditing what we already measured
-**Branch:** `grpc-direct-optimization` @ `db315ad`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
-**Updated:** 2026-08-24
+**Phase:** RDMA transport for gRPC-Direct: measuring the terms we had been leaving out
+**Branch:** `grpc-direct-optimization` @ `c046590`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
+**Updated:** 2026-08-26
 
 > **This file is committed now.** It was gitignored while tracked documents pointed at it.
 
+**Naming.** `base` is gRPC baseline, `opt` is gRPC optimized (shared memory), `daq` is DAQiri,
+`extbuf` is gRPC over RDMA. Scripts and CSV columns keep the short forms. Prose does not.
+
 ---
 
-## THE HEADLINE, 2026-08-24: pacing was an uncontrolled treatment, and Table B was wrong
+## THE HEADLINE, 2026-08-26: we measured two missing terms, over-read one of them, and found an optimization already in the tree
+
+Full writeup in `handoff.md` §7u, §7v and §7w. Three pieces, and the middle one is a retraction
+of a conclusion drawn from the first.
+
+**1. Every table this project has published measures a receiver window, and now two more terms
+exist.** §7u, commit `54559bb`. `fill` is the sender's own time writing the payload into the
+buffer it is about to hand the transport. `transport` is send timestamp to receive timestamp,
+measurable only because all three arms are single-box loopback and share a `CLOCK_MONOTONIC`.
+Two passes of 90 cells, paced and unsaturated. Three findings came out:
+
+- **gRPC optimized's shared-memory transport copies at about 1.8 GB/s marginal** while the same
+  process memcpys the same bytes at about 17 GB/s. Ten times slower, deterministic rather than
+  noisy (4 MiB spreads 2177 to 2756, ratio 1.27), and it scales with payload. **This is the
+  largest recoverable cost in the comparison.**
+- **gRPC over RDMA has a fixed transport floor of about 260 us**, identical at 16 and 64 KiB,
+  plus a receiver penalty of 20 to 27 us that appears only when paced. That is §7n's pacing
+  cliff, now measured at every size.
+- **DAQiri's transport term is flat in payload**: 4005 / 4020 / 4165 / 4384 / 4986 us while the
+  payload grows 256x.
+
+**The sweep itself is not loggable and its numbers must not be quoted.** Three sampling defects:
+gRPC optimized drops 78 to 197 of 1000 messages silently so the arms compare unequal windows;
+pass B confounds pacing with size for the RDMA arm; and `fill` is not comparable across arms
+because `grpc_direct_client_send` hides its copy inside the library while DAQiri exposes it.
+
+**2. A ranking was built on that transport column and it is retracted.** §7v, commit `6688440`.
+The column was summed into a TOTAL and the arms ranked on it, which put DAQiri last. Challenged
+on three points, right on all three. The topology is single-process RC loopback on one box, for
+every arm, and that has to be stated wherever the transport column appears. **On the receiver
+window, the metric every earlier table used, DAQiri wins 10 of 10 cells**, 6 of 6 reps each,
+p = 0.031, with the fastest transform in every cell. Nothing earlier was overturned; a new
+column was introduced and the ranking moved onto it. e2e was the right comparison all along.
+
+**And DAQiri's 4 ms is a cadence, not a cost.** `--trace-rx` shows the receiver idle for 5 to
+10 ms, then taking 12 to 19 messages at once and draining them at about 25 us each. The `ahead`
+counter climbing 1 to 12 across the gap proves the sender paced normally throughout, which the
+message-age column alone could never have shown. Four candidates each killed by experiment: the
+poll loop's 10 us sleep (`--rx-spin` is identical), zero-copy registration warm-up (stall rate
+flat at 21/20/18 across thirds), sender bursting (refuted by `ahead`), core collision (TX 11,
+RX 9, master 8, queues 16-19, no overlap). Gaps quantize in roughly 1 ms steps, so a timer below
+the application is what is left. **Throughput is unaffected**: burst size times period equals
+the offered rate exactly.
+
+**3. The dedicated-stream flag we set out to port was already there, defaulted off.** §7w,
+commit `c046590`. `--own-stream` in `extbuf_fft_server.cu` reaches the same
+`CuFFTExecutor(npts, own_stream)` constructor as the shared-memory server's `--opt-stream`, so
+it is the identical optimization. Line 315 defaults it false and **no sweep ever passed it**,
+which means every external-buffer figure in the handoff was taken without it. §7q read the same
+line, concluded correctly that both Table B arms ran the same mode, and stopped one step short.
+
+Paired A/B, 8 reps per size, order alternating, SM clock per cell:
+
+| payload | e2e off | e2e on | gain | helped | p |
+|---|---|---|---|---|---|
+| 16 KiB | 41.51 | 39.74 | **1.50** | 7/8 | 0.070 |
+| 1 MiB | 56.35 | 53.21 | 3.14 | 6/8 | 0.289 |
+| 4 MiB | 107.34 | 107.02 | -0.77 | 3/8 | 0.727 |
+
+Residual at 16 KiB is 1.10 us, 8 of 8, p = 0.008; pooled residual across all 24 pairs is 18 of
+24, p = 0.023. Small real win at 16 KiB, nothing resolvable at 4 MiB where §7r's noise floor
+swallows it. **The harness's own prediction was wrong in an instructive way**: `fft` moved with
+`residual`, which should be impossible for a host wait policy, and it is not clock drift and not
+stream isolation. `ev_start_` is enqueued before the cuFFT launch, so host submission latency
+falls inside the device-timed window, and a spinning thread submits faster than one just woken
+from a block. The saving splits across two columns as an artefact of event placement, so **e2e
+is the honest headline and residual understates it.**
+
+**Open decision:** flip `extbuf_fft_server.cu:315` to default on with a `--no-own-stream`
+escape hatch? Evidence supports it. Not taken, because it changes a default.
+
+**Next:** the shared-memory copy re-measured standalone, backpressure on that ring so counts
+match, and DAQiri Spark-to-Spark. §7u item 11 and 12, §7k.
+
+---
+
+## ALSO LANDED, 2026-08-25: three repetitions was never enough, and the RDMA arm waits rather than works
+
+`handoff.md` §7r, §7s, §7t. Recorded here because this file skipped the day.
+
+**Two of our own tables disagreed and neither was wrong.** Table B put gRPC optimized and DAQiri
+0.86 us apart at 4 MiB; the stage sweep put them 12.99 apart, same parameters. A 12-rep sweep
+with all four arms rotated through all four positions found the rebuild inert (-1.86, 5 of 12),
+the timers free (-0.16, 5 of 11), and the real gap about 6 us end to end of which about 4 is
+transform. **The single-cell standard deviation at 4 MiB is 4.4 us and the paired within-rep
+difference has 5.5.** A median of three carries about 4 us of standard error. **Nothing below
+about 8 us at 4 MiB is resolvable with three reps, however tight the three values look.**
+Standing rule: three reps establishes a sign, not a magnitude; anything a conclusion rests on
+gets twelve, with the order rotated.
+
+**Nsight says the RDMA arm's kernels are faster and all of its disadvantage is dead time.** At
+4 MiB, DAQiri 48.78 us kernel busy inside 58.37 of event time, gRPC over RDMA 44.28 inside
+61.63, so 28 percent gap against 16. Same three kernels in both, which confirms §7o at the
+kernel level. That moves the open 14 us off the transform entirely and onto whatever delays the
+next launch. §7w is a first instalment: submission latency after a blocking wait is one
+contributor to exactly that gap.
+
+**The `n=500` extbuf cells were a short run, not a lossy one.** The client's `--msgs` is the
+total sent and the server's is the count wanted after its own warmup, so the client has to be
+asked for `W + N`. Corrected, 4 MiB falls from 84.61 to 77.95 e2e and 71.14 to 65.06 cuFFT. The
+first stage sweep overstated the RDMA arm by about 6 us.
+
+---
+
+## PRIOR HEADLINE, 2026-08-24: pacing was an uncontrolled treatment, and Table B was wrong
+
+Still stands. Superseded only in the sense that later work sits on top of it.
 
 Full writeup in `handoff.md` §7n through §7q. Four things happened, in this order, and each one
 was caused by the one before it.
@@ -96,6 +205,13 @@ interleave. Narrower than it was, still open, and nothing in the deck depends on
 10.1 µs, while its CPU write is 5 to 9 µs faster. Re-transforming one buffer keeps lines dirty
 in CPU cache and the GPU pays to snoop them. Single-buffer FFT microbenchmarks on this coherent
 part are measuring that, not what they think.
+
+> **Update, 2026-08-25 and 2026-08-26.** The 14 µs is smaller than stated and is dead time
+> rather than work. §7r's noise floor takes the gap down to about 6 µs end to end, and §7s shows
+> the RDMA arm's kernels are actually *faster* while 28 percent of its event time is gap between
+> them. §7w then found that the stream mode, which §7q had ruled out as a difference between the
+> arms because neither passed the flag, is worth 1.50 µs of e2e at 16 KiB when it *is* passed.
+> That is not the 14 µs, but it is part of the dead time and it was sitting in the tree unused.
 
 **Next:** DAQiri cross-machine, still. The pacing mechanism. Both are in §7k and §7n.
 

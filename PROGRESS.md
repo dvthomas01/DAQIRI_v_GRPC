@@ -1,6 +1,12 @@
 # PROGRESS — DAQiri GPU FFT Pipeline
 **Project:** NVIDIA DAQiri → GPU FFT Benchmark  
-**Updated:** 2026-08-24 (**Pacing was an uncontrolled treatment, and Table B was wrong because of it.** Checking whether extbuf and DAQiri ran the same FFT, which §7l had flagged as the first thing to check, found they do: same `CuFFTExecutor`, same R2C plan, same n, same memory class, and alignment ruled out by measurement rather than argument. So §7l's third limit is **withdrawn** and the 4 MiB gap is real. Checking it turned up the actual fault: extbuf's transform **triples** between 100 and 400 µs of send pacing while DAQiri's does not move, and `headline_sweep.sh` had `PACE` hardcoded at 400, inside one arm's degradation region and outside the other's. Table B was therefore an unpaced arm against a 400 µs paced arm. Re-run interleaved, all four arms in one rotation at `PACE=25`, **DAQiri is faster at every size and two rows change sign**: 16 KB goes from -2.07 to +1.28 and 256 KB from -1.01 to +2.59. The §7l crossover was an artefact of two harnesses. Separately, **every rate claim in the document was audited** against the mean/median rule: the 256 KB "97.6 percent of wire" and the 1 MiB 10792-13517 MiB/s are withdrawn, and the 4 MiB 5878 becomes 5796-5803. The **deck's 5.775 against 5.785 GB/s tie is retracted**: both numbers are Gate 3's fabric at a misconfigured 1024-byte MTU, so both arms were resting on the same artificial wall. At MTU 4096 the same fabric does 98.0 percent of line rate, which is what the deck says now. One number stays open, extbuf's 14 µs at 4 MiB, with **both named candidates tested and ruled out**. handoff.md §7n through §7q.)
+**Updated:** 2026-08-26 (**Two terms every earlier table left out are now instrumented, a conclusion drawn from one of them is retracted, and an optimization we set out to port was already in the tree.** Every comparison this project has published measures a **receiver window**, starting the clock after the message is already in hand. `fill`, the sender's own write into the buffer it hands the transport, and `transport`, send timestamp to receive timestamp, now exist for all three arms. Three findings: gRPC optimized's **shared-memory transport copies at about 1.8 GB/s marginal while the same process memcpys the same bytes at about 17 GB/s**, deterministic and scaling with payload, which is the largest recoverable cost in the comparison; gRPC over RDMA has a **fixed 260 µs transport floor** plus a 20 to 27 µs receiver penalty that appears only when paced; and DAQiri's transport term is **flat in payload**, 4005 to 4986 µs while the payload grows 256x. **The sweep is not loggable and its numbers must not be quoted**: the shared-memory arm drops 78 to 197 of 1000 messages silently, pass B confounds pacing with size, and `fill` is not comparable across arms. **A ranking built on the transport column is retracted.** It summed a delivery cadence into a per-message total and put DAQiri last. On the receiver window, the metric every earlier table used, **DAQiri wins 10 of 10 cells**, 6 of 6 reps each, p = 0.031. DAQiri's 4 ms is a **cadence, not a cost**: the receiver idles 5 to 10 ms then takes 12 to 19 messages at once, throughput unaffected, with four candidate mechanisms each killed by experiment. Finally, `--opt-stream` needed no porting: **`--own-stream` was already in the external-buffer server and defaulted off**, so every RDMA figure in the handoff was taken without it. Turning it on is worth **1.50 µs of e2e at 16 KiB, 7 of 8 reps**, residual 1.10 µs at 8 of 8, p = 0.008; nothing resolvable at 4 MiB. handoff.md §7u, §7v, §7w.)
+
+<!-- historical header line -->
+**Previously:** 2026-08-25 (**Three repetitions was never enough, and the RDMA arm waits rather than works.** Two of our own tables put the same pair of arms 0.86 µs and 12.99 µs apart under identical parameters. A 12-rep rotation found the rebuild inert and the timers free, and measured the actual noise floor: **single-cell SD 4.4 µs at 4 MiB, paired within-rep SD 5.5 µs**, so a median of three carries about 4 µs of standard error. **Neither table was wrong; both were under-powered.** Standing rule: three reps establishes a sign, not a magnitude. Separately, Nsight shows gRPC over RDMA's **kernels are faster** than DAQiri's while **28 percent of its event time is gap between them** against 16 percent, which moves the open 14 µs off the transform entirely and onto whatever delays the next launch. And the `n=500` extbuf cells were a short run, not a lossy one: the client's `--msgs` is the total sent while the server's is the count wanted after warmup, and correcting it drops 4 MiB e2e from 84.61 to 77.95. handoff.md §7r, §7s, §7t.)
+
+<!-- historical header line -->
+**Previously:** 2026-08-24 (**Pacing was an uncontrolled treatment, and Table B was wrong because of it.** Checking whether extbuf and DAQiri ran the same FFT, which §7l had flagged as the first thing to check, found they do: same `CuFFTExecutor`, same R2C plan, same n, same memory class, and alignment ruled out by measurement rather than argument. So §7l's third limit is **withdrawn** and the 4 MiB gap is real. Checking it turned up the actual fault: extbuf's transform **triples** between 100 and 400 µs of send pacing while DAQiri's does not move, and `headline_sweep.sh` had `PACE` hardcoded at 400, inside one arm's degradation region and outside the other's. Table B was therefore an unpaced arm against a 400 µs paced arm. Re-run interleaved, all four arms in one rotation at `PACE=25`, **DAQiri is faster at every size and two rows change sign**: 16 KB goes from -2.07 to +1.28 and 256 KB from -1.01 to +2.59. The §7l crossover was an artefact of two harnesses. Separately, **every rate claim in the document was audited** against the mean/median rule: the 256 KB "97.6 percent of wire" and the 1 MiB 10792-13517 MiB/s are withdrawn, and the 4 MiB 5878 becomes 5796-5803. The **deck's 5.775 against 5.785 GB/s tie is retracted**: both numbers are Gate 3's fabric at a misconfigured 1024-byte MTU, so both arms were resting on the same artificial wall. At MTU 4096 the same fabric does 98.0 percent of line rate, which is what the deck says now. One number stays open, extbuf's 14 µs at 4 MiB, with **both named candidates tested and ruled out**. handoff.md §7n through §7q.)
 
 <!-- historical header line -->
 **Previously:** 2026-08-21 late (**The pipeline runs at the wire, and the reason the earlier fix worked was not the reason given.** Two corrections to this morning's entry, both from paired measurement. First: 7i said the receiver's spectral check cost 3.18x because it held the slot inside the credit window. Moving it below the re-queue dropped `hold_us` from 2488 µs to 1.5 µs and **the rate did not move at all**. The credit window was never the mechanism. The receiver is one thread, `detect_peaks` costs about 2400 µs of it per message at 4 MiB, and the next receive waits on it wherever in the loop it sits. The 3.18x from the flag stands; the explanation for it is retracted. Second: removing the sender's own frame-build memcpy (`--gen inplace`) takes 4 MiB from 4989 to **5878 MiB/s median, three of three**, with an inter-arrival of 663-686 µs against a **685 µs wire time**. Gate 3 measured 5843 MiB/s. **The pipeline is at line rate.** The "85 percent of link" was the harness measuring its own memcpy, not a transport limit. The server now **withholds** the rate lines when `--poison on` or `--verify every` rather than printing them with a caveat. handoff.md §7j. *The 5878 figure is corrected to 5796-5803 by the 2026-08-24 audit, §7p; it was one over a median gap, not a rate. The claim survives, but it now sits just under Gate 3's 5843 rather than over it.*)
@@ -79,6 +85,20 @@
 | P5d | Generate in place on the sender | **COMPLETE — AT THE WIRE** | `ceb03b3`. `--gen inplace` removes the frame-build memcpy: `gen_p50` 467→0.16 µs, **4989→5878 MiB/s median, 3/3, no overlap**. `gap_p50` 663–686 µs against a **685 µs wire time**; Gate 3 measured 5843 MiB/s. The transport is not the bottleneck and the 85 % was the harness. handoff.md §7j |
 | P5e | Was the credit window really the mechanism? | **COMPLETE — NO, RETRACTS P5b's REASON** | `detect_peaks` reads `d_out`, not the slot, so it was moved below the re-queue. `hold_us` **2488→1.5 µs** and the rate **did not move** (1611/1511/1576 vs 1561/1566/1458). One consumer thread; the next receive waits on the check wherever it sits. Extra slots cannot absorb it, which is also why P5c was flat. Server now **withholds** rate lines under `--verify every` or `--poison on` |
 | P6 | Release-before-completion race | **DROPPED** | Analytic property, and P5c showed the pipeline runs fine at the depth where the race is describable. Window arithmetic preserved in handoff.md §10 |
+| **Phase 8 — measuring the terms the receiver window left out** (branch `grpc-direct-optimization`) | | | |
+| S1 | Two tables disagreed under identical parameters | **COMPLETE — BOTH UNDER-POWERED** | `scripts/settle_sweep.sh`, 12 reps, 4 arms rotated through 4 positions. Rebuild inert (5/12), timers free (5/11). **Noise floor at 4 MiB: single-cell SD 4.4 µs, paired SD 5.5 µs.** Nothing below ~8 µs resolves on 3 reps. handoff.md §7r |
+| S2 | Is the RDMA arm's transform doing more work or waiting? | **COMPLETE — WAITING** | Nsight. Kernels are **faster** (44.28 vs 48.78 µs busy) inside **more** event time (61.63 vs 58.37). 28 % gap against 16 %. Same three kernels both arms. Moves the open 14 µs off the transform. handoff.md §7s |
+| S3 | The extbuf `n=500` cells | **COMPLETE — NOT LOSS** | Client `--msgs` is total sent, server's is count after its own warmup. Corrected: 4 MiB e2e 84.61 → **77.95**, cuFFT 71.14 → **65.06**. handoff.md §7t |
+| S4 | Instrument sender fill and transport for all three arms | **COMPLETE** | `54559bb`. `send_ts_ns` paired against a 0-based receive index; single-box loopback shares `CLOCK_MONOTONIC`. 2 passes x 90 cells. handoff.md §7u |
+| S4a | Shared-memory transport copy cost | **COMPLETE — LARGEST OPEN COST** | ~1.8 GB/s marginal against ~17 GB/s for the same memcpy in the same process. Deterministic (4 MiB p95/p05 = 1.27), scales with payload. **Needs re-taking standalone; the sweep it came from is not loggable** |
+| S4b | RDMA transport floor | **COMPLETE** | Fixed **~260 µs per message**, identical at 16 and 64 KiB, plus a 20-27 µs receiver penalty that appears **only when paced**. §7n's pacing cliff at every size |
+| S4c | Is the payload sweep loggable? | **COMPLETE — NO** | Shared-memory arm drops 78-197 of 1000 silently; pass B confounds pacing with size; `fill` not comparable across arms because one library hides its copy. **Do not quote these numbers** |
+| S5 | TOTAL-based ranking including transport | **RETRACTED** | `6688440`. Summed a delivery cadence into a per-message total. **On the receiver window DAQiri still wins 10/10 cells**, 6/6 reps each, p = 0.031, fastest transform in every cell. e2e was the right comparison. handoff.md §7v |
+| S5b | What is DAQiri's 4 ms transport figure? | **COMPLETE — A CADENCE** | `--trace-rx`, `--rx-spin`. Receiver idles 5-10 ms then takes 12-19 messages at once at ~25 µs each. `ahead` proves the sender paced normally. **Throughput unaffected.** Four mechanisms killed by experiment: poll-loop sleep, zero-copy warm-up, sender bursting, core collision. Timer below the application is what is left |
+| S6 | Port `--opt-stream` to the external-buffer server | **COMPLETE — ALREADY PRESENT** | `c046590`. `--own-stream` reaches the same `CuFFTExecutor(npts, own_stream)`. `extbuf_fft_server.cu:315` defaults it **off** and no sweep ever passed it, so **every RDMA figure in the handoff was taken without it**. §7q read the line and stopped one step short |
+| S6b | Does it help? | **COMPLETE — AT SMALL PAYLOADS** | 8 reps/size, order alternating. 16 KiB **1.50 µs e2e, 7/8**; residual 1.10 µs, **8/8, p = 0.008**. 1 MiB 3.14 µs but 6/8. 4 MiB nothing, buried by S1's noise floor. Pooled residual 18/24, p = 0.023 |
+| S6c | Why did `fft` move when only `residual` should? | **COMPLETE — EVENT PLACEMENT** | Not clock drift (per-pair deltas do not track), not stream isolation (no other CUDA work in the process). `ev_start_` is enqueued **before** the launch, so host submission latency falls inside the device-timed window. **`e2e` is the honest headline; `residual` understates it** |
+| S6d | Flip the `--own-stream` default | **OPEN DECISION** | Evidence supports on with a `--no-own-stream` escape hatch, matching the shared-memory server. Not taken: it changes a default |
 
 **Note on this file's status.** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md`
 were in `.gitignore` under "personal / local-only docs" while `handoff.md`,
@@ -90,6 +110,98 @@ anyone else.
 ---
 
 ## Results Log
+
+### Phase 8 — the receiver window was never the whole pipeline (2026-08-26, commits `54559bb`, `6688440`, `c046590`)
+
+Three pieces. The middle one retracts a conclusion drawn from the first. Full writeup in
+handoff.md §7u through §7w.
+
+**1. Two columns that should have existed from the start.** Every table this project has
+published starts its clock after the message is already in the receiver's hands. §7i said so in
+general terms and fixed it for one arm; this closes it for all three. `fill` is the sender's own
+time writing the payload into the buffer it is about to hand the transport. `transport` is send
+timestamp to receive timestamp, and it is only measurable because all three arms are single-box
+loopback, so both ends read the same `CLOCK_MONOTONIC`. That topology fact now has to appear
+wherever the column does.
+
+Pass B medians over 6 reps, microseconds:
+
+| payload | arm | fill | transport (p05..p95) | e2e | fft |
+|---|---|---|---|---|---|
+| 16 KiB | gRPC optimized | 0.70 | 25.6 (6..58) | 12.38 | 6.96 |
+| | gRPC over RDMA | 0.03 | 261.9 (100..581) | 32.97 | 17.18 |
+| | DAQiri | 0.45 | 4005 (600..8686) | 9.79 | 4.86 |
+| 256 KiB | gRPC optimized | 7.22 | 132.2 (108..161) | 23.18 | 17.58 |
+| | gRPC over RDMA | 0.04 | 356.3 (188..825) | 44.40 | 27.79 |
+| | DAQiri | 5.80 | 4165 (792..8864) | 18.29 | 13.58 |
+| 4 MiB | gRPC optimized | 207.91 | 2278 (2177..2756) | 75.18 | 67.79 |
+| | gRPC over RDMA | 0.68 | 1994 (1131..6277) | 101.98 | 79.14 |
+| | DAQiri | 103.94 | 4986 (899..12300) | 65.66 | 60.72 |
+
+The one figure worth keeping: **gRPC optimized's shared-memory transport runs at roughly
+1.8 GB/s marginal while the sender's own memcpy over the same bytes on the same box runs at
+about 17 GB/s.** Ten times slower, deterministic rather than noisy, and it scales with payload.
+It is the largest recoverable cost anywhere in this comparison.
+
+**And the sweep is not loggable.** Three sampling defects, none of them in the instrument: the
+shared-memory arm drops 78 to 197 of 1000 messages without saying so, so the arms compare
+unequal windows; pass B confounds pacing with size for the RDMA arm, which is the exact fault
+§7n was written about; and `fill` cannot be compared across arms because
+`grpc_direct_client_send` performs its copy inside the library where the harness cannot see it,
+reading 0.03 µs, while DAQiri hands the application the registered buffer and the same work
+reads 5.80. **These numbers must not be quoted.**
+
+**2. A ranking was built on the transport column, and it is retracted.** The column was summed
+into a TOTAL and the arms ranked on that, which put DAQiri last. It was challenged on three
+points and all three were right. The topology is single-process loopback for every arm. **On the
+receiver window, the metric every earlier table used, DAQiri wins 10 of 10 cells**, 6 of 6 reps
+in each, p = 0.031, with the fastest transform in every cell, so nothing established earlier was
+overturned. And e2e was the right comparison: summing a delivery cadence into a per-message
+pipeline total is the error.
+
+**DAQiri's 4 ms is a cadence.** The original claim, that completions arrive in bursts, was a
+guess from the shape of one number, and the age of a single message cannot distinguish a
+receiver that is behind from a sender that bursts from a path that batches. `--trace-rx` prints
+the inter-arrival gap, the age, and `ahead`, the count of send slots already published past the
+one being received. The receiver **idles 5 to 10 ms, then takes 12 to 19 messages at once and
+drains them at about 25 µs each**, and `ahead` climbing 1 to 12 across the gap proves the sender
+paced normally throughout. Four candidates killed by experiment: the poll loop's 10 µs sleep
+(`--rx-spin` is identical, p50 4001 vs 4262), zero-copy registration warm-up (stall rate flat at
+21/20/18 across thirds of the run), sender bursting (refuted by `ahead`), core collision (TX 11,
+RX 9, master 8, DAQiri queues 16-19). Gaps quantize in roughly 1 ms steps. **Throughput is
+unaffected**: burst size times period equals the offered rate exactly.
+
+**3. The optimization we set out to port was already in the tree.** The task was to bring
+`--opt-stream` across to the external-buffer server. `--own-stream` was already there, reaching
+the same `CuFFTExecutor(npts, own_stream)` constructor, so it is the identical change. Line 315
+defaults it off and no sweep ever passed it, which means **every external-buffer figure in the
+handoff was measured without it.** §7q had read the same line, concluded correctly that both
+Table B arms therefore ran the same mode, and stopped one step short of asking what happens when
+you turn it on.
+
+| payload | e2e off | e2e on | gain | helped | p |
+|---|---|---|---|---|---|
+| 16 KiB | 41.51 | 39.74 | **1.50** | 7/8 | 0.070 |
+| 1 MiB | 56.35 | 53.21 | 3.14 | 6/8 | 0.289 |
+| 4 MiB | 107.34 | 107.02 | -0.77 | 3/8 | 0.727 |
+
+Residual at 16 KiB is 1.10 µs, 8 of 8, p = 0.008; pooled across all 24 pairs, 18 of 24,
+p = 0.023. A small real win at small payloads and nothing at 4 MiB, where the transform is 82 µs
+and the pair-to-pair spread is ±14, so §7r's noise floor swallows it.
+
+**The harness predicted the wrong column and the correction is the useful part.** It was built
+expecting only `residual` to move, since `fft_us` is device-side `cudaEventElapsedTime` and a
+host wait policy cannot touch it. `fft` moved with `residual` in nearly every pair. Not clock
+drift: the per-pair SM clock deltas do not track the fft deltas, and the largest fft difference
+sits on a pair with zero clock difference. Not stream isolation: the only CUDA work in that
+process is the transform and the slot-lifetime event, both already on `fft.stream()`. The
+mechanism is that `ev_start_` is enqueued **before** the cuFFT launch, so host submission
+latency falls inside the device-timed window, and a spinning thread submits faster than one just
+woken from a block. **`residual` understates the effect and `e2e` is the honest headline.**
+
+This is also a partial answer to §7s, which found all of the RDMA arm's disadvantage sitting in
+dead time between kernels. Submission latency after a blocking wait is one contributor to that
+gap.
 
 ### Phase 5f — pacing was a treatment nobody controlled, and Table B was wrong (2026-08-24, commit `db315ad` and follow-on)
 

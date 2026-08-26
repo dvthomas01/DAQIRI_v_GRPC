@@ -1,10 +1,91 @@
 # Long-Term Context — Architectural Reference
 **Project:** DAQiri GPU FFT Pipeline Benchmark  
-**Updated:** 2026-08-24  
+**Updated:** 2026-08-26  
 **Precursor project:** gRPC / gRPC Direct benchmark — all 20 milestones complete 2026-07-08
 
 > **This file is committed now.** It was gitignored while `handoff_roce_2026-08-06.md`,
 > `presentation/HANDOFF.md` and `scripts/find_spark.sh` all pointed readers at it.
+
+---
+
+## Key findings (a cadence mistaken for a cost, 2026-08-26)
+
+These come from adding two columns to a comparison, over-reading one of them, and being
+challenged on it. The retraction is the transferable part.
+
+- **Know what a number is a number of before you put it in a total.** A new transport column was
+  summed into a per-message pipeline total and the arms were ranked on it. The column was not a
+  per-message cost, it was a delivery cadence: the receiver idles milliseconds and then takes a
+  dozen messages at once. Adding it to a total implies each message pays it, and no message
+  does. **Aggregation is a claim about the quantity's meaning, and it is made silently.**
+- **A dimensional check catches this for free.** The suspect column was flat while the payload
+  grew 256 times. A transport cost cannot be flat in payload. That single observation was
+  available before any of the diagnostic work and would have prevented the ranking.
+- **When someone challenges a result, investigate instead of defending it.** Three objections
+  were raised and all three were right, including one about the topology that had been true and
+  unstated for weeks. The cheapest way to find out you are wrong is to take the objection
+  seriously enough to test it.
+- **A retraction should say what still stands.** The ranking was withdrawn; the receiver-window
+  ordering it appeared to contradict was never contradicted at all, and it wins 10 of 10 cells.
+  A retraction that does not separate the two leaves readers assuming the whole thing collapsed.
+- **Per-message age is ambiguous between at least three mechanisms.** A falling sawtooth in
+  message age fits a receiver that is behind, a sender that bursts, and a path that batches
+  equally well. Separating them needs inter-arrival gaps *and* a counter of how far the sender
+  has already got. One instrument produced a story; two produced a fact.
+- **Rule candidates out by experiment even when you are confident.** Four mechanisms were
+  eliminated, each by a run rather than an argument: busy-polling instead of sleeping,
+  stall rate by third of the run, a sender-progress counter, and a core map. None of the four
+  arguments would have been as convincing as the four runs.
+- **Publish the loggability verdict alongside the data.** The sweep was correctly instrumented
+  and its sampling had three defects, so the numbers went into the repository with an explicit
+  do-not-quote note and the list of what would have to change. Data that is silently
+  untrustworthy is worse than data that is loudly untrustworthy.
+- **A column is only comparable across arms if the same work is visible to the harness in each.**
+  The sender-fill column read 0.03 µs for one transport and 5.80 for another, which looks like a
+  200x difference and is a difference in where the copy is attributed. One library copies inside
+  its send call; the other hands you the registered buffer to write into. Same work, different
+  side of the API.
+- **Defaults are treatments held at one level, which is the 2026-08-24 lesson with the constant
+  moved into the source.** An optimization was already compiled into the receiver, defaulted off,
+  and never once passed by a sweep. Every published figure for that arm was taken without it. The
+  earlier work had even read the line, and drew the correct but narrower conclusion that both
+  arms therefore matched, without asking what happens when it is on. **Ruling out a flag as a
+  *difference between* arms is not the same as ruling it out as an *improvement to* both.**
+- **When a metric you predicted could not move does move, that is information about your model
+  of the instrument.** A device-side event duration was expected to be immune to a host wait
+  policy and was not. Clock drift and stream interference were both checked and neither fit. The
+  start event is enqueued before the kernel, so host submission latency falls inside the
+  device-timed window. The apparent anomaly located a real property of the measurement.
+
+---
+
+## Key findings (measure the noise floor before trusting a gap, 2026-08-25)
+
+These come from two of our own tables disagreeing by 12 µs under identical parameters.
+
+- **Three tight values are not three precise values.** Two tables put the same pair of arms
+  0.86 µs and 12.99 µs apart, same sizes, same pacing, same rotation, three reps each. Neither
+  was wrong. The single-cell standard deviation at 4 MiB is 4.4 µs and the paired within-rep
+  difference has 5.5, so a median of three carries about 4 µs of standard error and the
+  difference of two such medians about 5.6. The two results are 2.2 standard errors apart, which
+  is ordinary, especially since they were compared *because* one looked extreme.
+  **Measure the noise floor once, explicitly, and then you know what your reps buy you.**
+- **Three reps establishes a sign, not a magnitude.** Anything a conclusion rests on gets twelve,
+  with the arm order rotated through all positions so that arm is not confounded with position.
+  The position effect here was 1.50 µs, so the fixed order earlier sweeps used was not the fault,
+  but that also had to be measured rather than assumed.
+- **When you suspect a rebuild changed something, test the rebuild.** The obvious explanation was
+  that adding timers to one binary slowed it. Reconstructing the pre-timer source and building it
+  through the same target showed the rebuild inert and the timers free. The obvious explanation
+  was wrong and cost one script to eliminate.
+- **CUDA event durations cannot tell you whether time is work or waiting; a profiler can.** The
+  arm with more event time turned out to have *faster* kernels and more dead space between them,
+  28 percent against 16. Nothing that makes memory slower to read can explain that, so an entire
+  class of hypotheses died at once. **Ask whether your slow number is more work or more waiting
+  before generating explanations for either.**
+- **When a contradiction dissolves, the hypothesis invented to reconcile it loses its
+  motivation too.** Most of the disagreement was sampling noise, so the elaborate mechanism
+  proposed to explain it no longer had anything to explain.
 
 ---
 
