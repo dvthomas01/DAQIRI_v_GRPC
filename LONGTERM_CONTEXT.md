@@ -365,8 +365,25 @@ measurement artifacts, and each one survived for a while because it was plausibl
   during network diagnosis on the PXI (`ssh-keyscan`, `nc`).
 - **`pgrep -f` matches the ssh command line that invoked it.** Use the bracket trick,
   `pgrep -af '[h]eadline_sweep'`, or you will conclude a finished run is still going.
+- **If one arm responds to a knob and the others do not, one setting of that knob is not a
+  measurement, it is a choice of winner.** The RDMA arm moves 23 µs between two offered rates
+  while no other arm moves 2. Run both levels, report both, and say which one the headline uses.
+- **Ruling a flag out as a *difference between arms* is not ruling it out as an *improvement to
+  both*.** `--own-stream` was correctly shown to be off in both arms of a comparison, and that
+  finding was allowed to stand in for "it does not matter", so no sweep ever passed it.
+- **A caption cannot undo a bar chart and a footnote cannot undo a slide headline.** A retracted
+  claim has to be removed from the graphic, not annotated beneath it.
+- **PowerShell 5.1 strips embedded double quotes off an ssh command line.** `MODES="sat unsat"`
+  arrives at bash as two words and the second runs as a command. Put remote environment in a
+  script file, scp it, and run it by path.
 
 ## Key findings (where the gRPC/DAQiri gap actually lives, 2026-08-18)
+
+> **Sizes updated 2026-08-26.** The 8.10 µs below is a two-rep figure. At twelve reps with all
+> four arms rotated and a stated pacing regime the gap is **6.96 µs**, 12 of 12, interval 5.31
+> to 9.41, and the alignment fix is worth **1.71x** rather than 1.80x. The shape of the finding
+> is unchanged: the residual problem is solved and what remains is mostly transform time.
+> handoff.md §7x.
 
 - **Decompose latency into `e2e − fft_exec` ("residual") before optimizing anything.** This
   located the original gap and it still structures everything. gRPC's residual is now flat at

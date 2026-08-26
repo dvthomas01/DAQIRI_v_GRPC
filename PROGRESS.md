@@ -1,6 +1,9 @@
 # PROGRESS — DAQiri GPU FFT Pipeline
 **Project:** NVIDIA DAQiri → GPU FFT Benchmark  
-**Updated:** 2026-08-26 (**Two terms every earlier table left out are now instrumented, a conclusion drawn from one of them is retracted, and an optimization we set out to port was already in the tree.** Every comparison this project has published measures a **receiver window**, starting the clock after the message is already in hand. `fill`, the sender's own write into the buffer it hands the transport, and `transport`, send timestamp to receive timestamp, now exist for all three arms. Three findings: gRPC optimized's **shared-memory transport copies at about 1.8 GB/s marginal while the same process memcpys the same bytes at about 17 GB/s**, deterministic and scaling with payload, which is the largest recoverable cost in the comparison; gRPC over RDMA has a **fixed 260 µs transport floor** plus a 20 to 27 µs receiver penalty that appears only when paced; and DAQiri's transport term is **flat in payload**, 4005 to 4986 µs while the payload grows 256x. **The sweep is not loggable and its numbers must not be quoted**: the shared-memory arm drops 78 to 197 of 1000 messages silently, pass B confounds pacing with size, and `fill` is not comparable across arms. **A ranking built on the transport column is retracted.** It summed a delivery cadence into a per-message total and put DAQiri last. On the receiver window, the metric every earlier table used, **DAQiri wins 10 of 10 cells**, 6 of 6 reps each, p = 0.031. DAQiri's 4 ms is a **cadence, not a cost**: the receiver idles 5 to 10 ms then takes 12 to 19 messages at once, throughput unaffected, with four candidate mechanisms each killed by experiment. Finally, `--opt-stream` needed no porting: **`--own-stream` was already in the external-buffer server and defaulted off**, so every RDMA figure in the handoff was taken without it. Turning it on is worth **1.50 µs of e2e at 16 KiB, 7 of 8 reps**, residual 1.10 µs at 8 of 8, p = 0.008; nothing resolvable at 4 MiB. handoff.md §7u, §7v, §7w.)
+**Updated:** 2026-08-26 late (**The 4 MiB comparison was re-run properly and it is what the deck draws. This supersedes every three-rep four-arm number in this project, including the corrected Table B.** Three things made the standing numbers unfit to present: §7r had already shown three reps at 4 MiB resolve a sign and not a magnitude; §7n had shown the RDMA arm's transform triples across the pacing range while DAQiri's does not move, so any single pacing value silently picks a winner and no table said which one it picked; and §7w had shown `--own-stream` defaulted off with no sweep ever passing it, so every RDMA figure was taken with one arm missing an optimization the other had. The replacement is **4 MiB only, four arms, 12 reps, each arm rotated through all four positions**, 1000 messages after 500 warmup, clock gated at 2400 MHz and recorded per row, RDMA arm with `--own-stream`, run twice at two offered rates that are never pooled. **Saturated: gRPC baseline 126.89, gRPC optimized 74.08, gRPC over RDMA 83.54, DAQiri 66.17.** Optimized against DAQiri is **+6.96 µs, 12 of 12, interval 5.31 to 9.41**, and the alignment fix is worth **1.71x**. **That gap does not depend on how hard the arms are driven**: the unsaturated run gives +7.02 for the same comparison. **Exactly one arm does depend on it.** gRPC over RDMA moves **+23.29 µs** between the two regimes while no other arm moves more than 2, and the 56 MHz clock difference accounts for at most 1.6 of it, so it is offered rate and not thermals. §7n's pacing cliff now has a magnitude and the mechanism is still open. One inversion worth keeping: **the baseline arm's transform is 16.91 µs faster than DAQiri's**, 12 of 12, because it reads device memory after paying a 77 µs copy to get there. Both decks were rebuilt on this data, part 3 is six new slides with every figure regenerated from CSV at draw time, and the **5.775 GB/s tie is retracted in all four places it appeared**. handoff.md §7x.)
+
+<!-- historical header line -->
+**Previously:** 2026-08-26 (**Two terms every earlier table left out are now instrumented, a conclusion drawn from one of them is retracted, and an optimization we set out to port was already in the tree.** Every comparison this project has published measures a **receiver window**, starting the clock after the message is already in hand. `fill`, the sender's own write into the buffer it hands the transport, and `transport`, send timestamp to receive timestamp, now exist for all three arms. Three findings: gRPC optimized's **shared-memory transport copies at about 1.8 GB/s marginal while the same process memcpys the same bytes at about 17 GB/s**, deterministic and scaling with payload, which is the largest recoverable cost in the comparison; gRPC over RDMA has a **fixed 260 µs transport floor** plus a 20 to 27 µs receiver penalty that appears only when paced; and DAQiri's transport term is **flat in payload**, 4005 to 4986 µs while the payload grows 256x. **The sweep is not loggable and its numbers must not be quoted**: the shared-memory arm drops 78 to 197 of 1000 messages silently, pass B confounds pacing with size, and `fill` is not comparable across arms. **A ranking built on the transport column is retracted.** It summed a delivery cadence into a per-message total and put DAQiri last. On the receiver window, the metric every earlier table used, **DAQiri wins 10 of 10 cells**, 6 of 6 reps each, p = 0.031. DAQiri's 4 ms is a **cadence, not a cost**: the receiver idles 5 to 10 ms then takes 12 to 19 messages at once, throughput unaffected, with four candidate mechanisms each killed by experiment. Finally, `--opt-stream` needed no porting: **`--own-stream` was already in the external-buffer server and defaulted off**, so every RDMA figure in the handoff was taken without it. Turning it on is worth **1.50 µs of e2e at 16 KiB, 7 of 8 reps**, residual 1.10 µs at 8 of 8, p = 0.008; nothing resolvable at 4 MiB. handoff.md §7u, §7v, §7w.)
 
 <!-- historical header line -->
 **Previously:** 2026-08-25 (**Three repetitions was never enough, and the RDMA arm waits rather than works.** Two of our own tables put the same pair of arms 0.86 µs and 12.99 µs apart under identical parameters. A 12-rep rotation found the rebuild inert and the timers free, and measured the actual noise floor: **single-cell SD 4.4 µs at 4 MiB, paired within-rep SD 5.5 µs**, so a median of three carries about 4 µs of standard error. **Neither table was wrong; both were under-powered.** Standing rule: three reps establishes a sign, not a magnitude. Separately, Nsight shows gRPC over RDMA's **kernels are faster** than DAQiri's while **28 percent of its event time is gap between them** against 16 percent, which moves the open 14 µs off the transform entirely and onto whatever delays the next launch. And the `n=500` extbuf cells were a short run, not a lossy one: the client's `--msgs` is the total sent while the server's is the count wanted after warmup, and correcting it drops 4 MiB e2e from 84.61 to 77.95. handoff.md §7r, §7s, §7t.)
@@ -99,6 +102,10 @@
 | S6b | Does it help? | **COMPLETE — AT SMALL PAYLOADS** | 8 reps/size, order alternating. 16 KiB **1.50 µs e2e, 7/8**; residual 1.10 µs, **8/8, p = 0.008**. 1 MiB 3.14 µs but 6/8. 4 MiB nothing, buried by S1's noise floor. Pooled residual 18/24, p = 0.023 |
 | S6c | Why did `fft` move when only `residual` should? | **COMPLETE — EVENT PLACEMENT** | Not clock drift (per-pair deltas do not track), not stream isolation (no other CUDA work in the process). `ev_start_` is enqueued **before** the launch, so host submission latency falls inside the device-timed window. **`e2e` is the honest headline; `residual` understates it** |
 | S6d | Flip the `--own-stream` default | **OPEN DECISION** | Evidence supports on with a `--no-own-stream` escape hatch, matching the shared-memory server. Not taken: it changes a default |
+| S7 | Re-take the 4 MiB comparison at a rep count that can carry a magnitude | **COMPLETE — SUPERSEDES EVERY 3-REP 4-ARM NUMBER** | `511e4fe`. `scripts/deck_4arm_4mib.sh`, 4 MiB only, 4 arms, **12 reps**, each arm rotated through all four positions, 1000 msgs after 500 warmup, clock gated and recorded per row, RDMA arm with `--own-stream`. Saturated: base 126.89, opt 74.08, extbuf 83.54, **daq 66.17**. `opt` minus `daq` **+6.96 µs, 12/12, interval 5.31 to 9.41**. Fix worth **1.71x**. handoff.md §7x |
+| S7a | Does the answer depend on the offered rate? | **COMPLETE — NOT FOR THE ARM THAT MATTERS** | Whole sweep run twice, saturated and at ~1/8 of the link, never pooled. `opt` minus `daq` is +6.96 saturated and **+7.02 unsaturated**, agreeing to 0.06 µs |
+| S7b | Does it depend on the offered rate for the RDMA arm? | **COMPLETE — YES, AND ONLY FOR THAT ARM** | extbuf moves **+23.29 µs** between regimes (83.54 → 106.82); base +1.99, opt -0.66, daq +0.85. The 56 MHz clock difference covers at most 1.6 µs of it. §7n's pacing cliff, sized at 4 MiB. **Mechanism still open** |
+| S7c | The deck rebuilt on this data | **COMPLETE** | Part 3 is six slides, every figure regenerated from CSV at draw time by `scripts/make_part3_figs.py`, error bars on every 4 MiB chart, plain-language arm names throughout. The **5.775 GB/s tie is retracted in all four places it appeared** |
 
 **Note on this file's status.** `PROGRESS.md`, `SHORTTERM_CONTEXT.md` and `LONGTERM_CONTEXT.md`
 were in `.gitignore` under "personal / local-only docs" while `handoff.md`,
@@ -110,6 +117,60 @@ anyone else.
 ---
 
 ## Results Log
+
+### Phase 8 — the 4 MiB comparison, re-taken at twelve reps (2026-08-26 late, commit `511e4fe`)
+
+Full writeup in handoff.md §7x. **This supersedes every three-rep four-arm number at 4 MiB in
+this project, including the corrected Table B further down this file.**
+
+Three earlier findings made the standing numbers unfit to present, and none of them had been
+acted on together. S1 established the noise floor: three reps at 4 MiB resolve a sign and not a
+magnitude, and the standing tables were three reps. §7n found the RDMA arm's transform triples
+across the pacing range while DAQiri's does not move, so any single pacing value silently picks
+a winner, and no table stated which one it had picked. S6 found `--own-stream` defaulted off
+with no sweep ever passing it, so every RDMA figure was taken with one arm missing an
+optimization the shared-memory arm had.
+
+The replacement is 4 MiB only, four arms, 12 reps, each arm rotated through all four positions
+inside the rep, 1000 messages after 500 warmup, clock gated at 2400 MHz with `sm_mhz` on every
+row, RDMA arm with `--own-stream`. The whole sweep runs twice, saturated at 25 µs pacing and
+unsaturated at about an eighth of the link. The two regimes are never pooled.
+
+Saturated. Medians of 12 in µs, with the 95 percent interval of the median:
+
+| arm | e2e | interval | cuFFT | residual |
+|---|---|---|---|---|
+| `base` gRPC baseline | 126.89 | 126.27 .. 127.44 | 44.90 | 81.94 |
+| `opt` gRPC optimized | 74.08 | 73.22 .. 74.67 | 67.41 | 6.64 |
+| `extbuf` gRPC over RDMA | 83.54 | 80.74 .. 86.74 | 70.83 | 12.86 |
+| `daq` DAQiri | **66.17** | 64.13 .. 69.02 | **61.36** | **4.82** |
+
+`opt` against `daq`, paired within rep, is **+6.96 µs, 12 of 12, interval 5.31 to 9.41**. The
+alignment fix is worth **1.71x** (126.89 / 74.08). Position effect across the four slots is
+1.6 µs, so the rotation was worth having and the slot is not the story.
+
+**The gap survives a change of regime.** Unsaturated, `opt` against `daq` is **+7.02 µs**. Two
+offered rates an eighth of the link apart agree to 0.06 µs, which is a stronger statement than
+either run makes alone.
+
+**One arm does not survive it.** `extbuf` moves **+23.29 µs** between the two regimes, 83.54 to
+106.82, while `base` moves +1.99, `opt` -0.66 and `daq` +0.85. The 56 MHz clock difference
+between the regimes is 2.3 percent and accounts for at most 1.6 µs, so this is offered rate and
+not thermals. That number is not a single number, it is a function of how hard you drive it, and
+any table quoting it has to say which regime it used. The mechanism is still open.
+
+**One inversion worth keeping.** `base`'s transform is **16.91 µs faster** than DAQiri's, 12 of
+12, because it reads device memory after paying a 77 µs copy to get there. That is the clearest
+single statement of what the alignment bug was doing.
+
+Both decks were rebuilt on this data. Part 3 of the technical deck is six slides, every figure
+regenerated from CSV at draw time by `scripts/make_part3_figs.py` rather than from hardcoded
+literals, error bars on every 4 MiB chart, plain-language arm names throughout. The 5.775 GB/s
+"tie with DAQiri at the fabric limit" is retracted in the figure, in the technical deck's RDMA
+slide and conclusions table, and in the business deck's slide 5 headline. Both sides of that
+comparison measured the same fabric pinned at MTU 1024.
+
+---
 
 ### Phase 8 — the receiver window was never the whole pipeline (2026-08-26, commits `54559bb`, `6688440`, `c046590`)
 
@@ -239,7 +300,12 @@ DAQiri faster:
 | 16 | 15.744 | 11.376 | **9.456** | 10.736 | -2.07 | **+1.28** |
 | 256 | 26.448 | 22.944 | **18.224** | 20.816 | -1.01 | **+2.59** |
 | 1024 | 46.752 | 33.712 | **25.072** | 30.432 | +6.45 | +5.36 |
-| 4096 | 129.745 | 71.504 | **68.976** | 94.144 | +41.83 | +25.17 |
+| 4096 | ~~129.745~~ | ~~71.504~~ | ~~**68.976**~~ | ~~94.144~~ | +41.83 | ~~+25.17~~ |
+
+> **The 4096 row is superseded by S7 / handoff.md §7x.** Three reps, and the extbuf arm running
+> without `--own-stream`. At twelve reps in the saturated regime: base 126.89, opt 74.08, extbuf
+> 83.54, daq 66.17, and the extbuf delta is +18.86 with an interval of 13.53 to 19.82. The three
+> smaller rows have not been re-run at twelve reps and are still three-rep numbers.
 
 **DAQiri is faster at every size, and the §7l crossover was an artefact of two harnesses.** At
 16 and 256 KB the residuals are within 0.42 µs, so the whole gap at those sizes is transform

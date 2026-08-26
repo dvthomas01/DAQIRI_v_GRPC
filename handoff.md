@@ -8,14 +8,23 @@
 
 ## 0. One-line status
 
-**Latest, 2026-08-26. Two terms that every earlier table left out are now instrumented, one
-conclusion drawn from them is retracted, and a flag we thought we would have to port turned out
-to already exist.** Sections 7u, 7v and 7w.
+**Latest, 2026-08-26. The 4 MiB comparison has been re-run at twelve reps with all four arms
+configured the same way and both pacing regimes measured, and it is what the deck now draws.**
+Section 7x. It supersedes every three-rep four-arm number at 4 MiB in this document. Earlier
+the same day: two terms every table left out are now instrumented, one conclusion drawn from
+them is retracted, and a flag we thought we would have to port turned out to already exist,
+sections 7u, 7v and 7w.
 
 Naming, because the short forms have caused confusion: `base` is **gRPC baseline**, `opt` is
 **gRPC optimized** (shared memory), `daq` is **DAQiri**, and `extbuf` is **gRPC over RDMA**
 (the external-buffer receive path). Scripts and CSV columns still use the short forms. Prose
-should not.
+should not. The deck uses gRPC-Direct (before), gRPC-Direct (optimized), gRPC-Direct over RDMA
+and DAQiri, and those names should be preferred anywhere a reader outside the project sees them.
+
+At 4 MiB, saturated, 12 reps each: gRPC baseline 126.89, gRPC optimized 74.08, gRPC over RDMA
+83.54, DAQiri 66.17. Optimized is **6.96 us** behind DAQiri, 12 of 12, interval 5.31 to 9.41,
+and the same comparison at an eighth of the offered rate gives 7.02. The RDMA arm is the only
+one that moves between the two regimes, by 23 us, against under 2 us for every other arm.
 
 Three things to carry forward. **The payload sweep in 7u is instrumented correctly but its
 results are not loggable and must not be quoted**, for reasons given at the end of that section.
@@ -27,8 +36,9 @@ candidate mechanisms were each ruled out by experiment.
 
 gRPC-Direct was 1.76x slower than DAQiri at 4 MB. We found the cause (an incorrect alignment
 assumption forcing an unnecessary GPU copy on 100% of messages), fixed it, and closed most of
-the gap. A dedicated CUDA stream took a little more. **At 4 MB the gap is now 8.10 us, about
-13%.** Roughly 80% of what remains is inside cuFFT rather than in transport.
+the gap. A dedicated CUDA stream took a little more. **At twelve reps the fix is worth 1.71x and
+the gap that remains is 6.96 us, about 11%.** Most of what remains is inside cuFFT rather than
+in transport.
 
 **The transform finding has been narrowed, and the headline it used to carry is withdrawn.**
 This document previously opened by saying we knew why the transform was slower and that owning
@@ -374,6 +384,12 @@ part-way through, and anyone reading this should know that rather than infer it.
 | `data/phase4_cell_1048576.csv` | 7h. The 4 MB Phase 4 cell, three arms x five reps, with `sm_mhz` and the git SHA on every row |
 | `data/gate1_caps.txt`, `data/gate3_fabric.txt`, `data/gate4_regmr.txt` | Raw gate output |
 | `data/gate5_extbuf.txt`, `data/gate5_reps.txt` | Gate 5 output and the three reps |
+| `scripts/deck_4arm_4mib.sh` | 7x. The twelve-rep four-arm 4 MiB sweep, both pacing regimes, arms rotated through all four positions, `--own-stream` on the RDMA arm |
+| `scripts/launch_deck_4arm.sh` | Launcher for it. Holds every env var internally because PowerShell strips quotes off multi-word values on an ssh command line. `SMOKE=1` for a one-rep dry run |
+| `scripts/deck_4arm_table.py` | Analyzer for it. Order-statistic intervals, paired within-rep differences, sign tests, position effect, clock range. Never pools the two pacing modes |
+| `data/deck_4arm_4mib.csv` | 7x rows. 96 cells. This is the source for every 4 MiB number in the deck |
+| `scripts/make_deck_figs.py`, `scripts/make_part3_figs.py` | The deck's figures. Part 3 reads every number from CSV at draw time rather than from literals |
+| `presentation/build_technical_deck.ps1`, `presentation/build_business_deck.ps1` | The two decks, built from PowerPoint COM. Rebuild after editing; the `.pptx` is a build artifact |
 
 ## 4. How we found the problem (the reasoning that mattered)
 
@@ -1727,12 +1743,17 @@ so any table taken there is partly a report about the pacing. `PACE` is now a va
 
 **Table B, corrected.** Medians of 3 reps, microseconds. Positive delta means DAQiri is faster.
 
+> **The 4 MiB row is superseded by 7x.** Three reps, no stated pacing regime, and the RDMA arm
+> running without `--own-stream`. At 12 reps in the saturated regime the delta is +18.86 with an
+> interval of 13.53 to 19.82, not +25.17. The three smaller rows have not been re-run at twelve
+> reps and are still three-rep numbers.
+
 | size | extbuf e2e | DAQiri e2e | delta | was, in 7l |
 |---|---|---|---|---|
 | 16 KB | 10.74 | **9.46** | +1.28 | -2.07 |
 | 256 KB | 20.82 | **18.22** | +2.59 | -1.01 |
 | 1 MiB | 30.43 | **25.07** | +5.36 | +6.45 |
-| 4 MiB | 94.14 | **68.98** | +25.17 | +41.83 |
+| 4 MiB | ~~94.14~~ | ~~**68.98**~~ | ~~+25.17~~ | +41.83 |
 
 **DAQiri is faster at every size.** The crossover in 7l was not real. Both small-size rows
 changed sign, which is the outcome 7l's own first limit warned about, and the 4 MiB gap fell
@@ -2059,6 +2080,11 @@ with its own error bar and is not a physical limit.
 
 ### 7q. Both candidates for extbuf's 14 us are dead. The number stays open (2026-08-24)
 
+> **Sized by 7x.** The number is no longer 14. At 4 MiB saturated, twelve reps, RDMA against
+> DAQiri is +9.07 us of cuFFT and +8.02 us of residual, and 7s located the cuFFT part in dead
+> time between kernels rather than in the kernels. The mechanism is still open. Note also that
+> the figures below were taken with `--own-stream` off, which 7w later found was the default.
+
 7o named two candidates and said neither should be quoted as the cause until one was tested.
 Both were tested, inside a half day, and neither survives. This is written up as a negative
 result on purpose: an open number with two candidates ruled out is a better handoff than an
@@ -2304,6 +2330,106 @@ blocking wait is one contributor to exactly that gap.
 `--no-own-stream` escape hatch, matching the shared-memory server's arrangement. The evidence
 supports it, never harmful and clearly positive at small payloads, but it changes a default and
 has not been taken.
+
+### 7x. Twelve reps, four arms, both pacing regimes, and the RDMA arm configured like the others (2026-08-26)
+
+Commit `511e4fe`. This supersedes every three-rep four-arm number at 4 MiB in this document,
+including Table B corrected in 7n, and it is what the deck now draws.
+
+**Why it was run.** Three separate things made the standing 4 MiB numbers unfit to present.
+7r established that three reps at 4 MiB resolve a sign and not a magnitude, and the standing
+tables were three reps. 7n found that the RDMA arm's transform triples between 100 and 400 us
+of pacing while DAQiri's does not move, so any single pacing value silently picks a winner and
+none of the tables said which one they had picked. And 7w found `--own-stream` defaulted off
+with no sweep ever passing it, so every RDMA figure in this document was taken with one arm
+missing an optimization the shared-memory arm had.
+
+**The design.** `scripts/deck_4arm_4mib.sh`, launched through `scripts/launch_deck_4arm.sh`.
+4 MiB only, four arms, 12 reps, each arm rotated through all four positions inside the rep so
+that arm is not confounded with slot, 1000 messages after 500 warmup, clock gated at 2400 MHz
+with `sm_mhz` recorded on every row. The whole thing runs twice: once saturated at `PACE=25`
+and once at an offered rate of about 780 B/us, roughly an eighth of the link, which works out
+to 5377 us between 4 MiB messages. The two regimes are never pooled. The RDMA arm gets
+`--own-stream`. Rows in `data/deck_4arm_4mib.csv`, analyzer `scripts/deck_4arm_table.py`,
+which reports order-statistic intervals of the median, paired within-rep differences and sign
+tests, and refuses to print a bare median.
+
+The launcher exists because PowerShell 5.1 strips embedded double quotes off an ssh command
+line, so `MODES="sat unsat"` arrives at bash as two words and the second one runs as a command.
+Put remote environment in a script file, scp it, run it by path.
+
+**Saturated, 25 us pacing.** Medians of 12 reps in microseconds, with the 95 percent interval
+of the median from order statistics.
+
+| arm | e2e p50 | interval | cuFFT p50 | residual |
+|---|---|---|---|---|
+| `base` gRPC baseline | 126.89 | 126.27 .. 127.44 | 44.90 | 81.94 |
+| `opt` gRPC optimized | 74.08 | 73.22 .. 74.67 | 67.41 | 6.64 |
+| `extbuf` gRPC over RDMA | 83.54 | 80.74 .. 86.74 | 70.83 | 12.86 |
+| `daq` DAQiri | **66.17** | 64.13 .. 69.02 | **61.36** | **4.82** |
+
+Paired within rep against DAQiri, positive meaning slower, all 12 of 12 with p < 0.001:
+
+| arm | e2e | interval | cuFFT | residual |
+|---|---|---|---|---|
+| `base` | +60.22 | 58.00 .. 62.14 | **-16.91** | +77.14 |
+| `opt` | +6.96 | 5.31 .. 9.41 | +5.20 | +1.82 |
+| `extbuf` | +18.86 | 13.53 .. 19.82 | +9.07 | +8.02 |
+
+Position effect on e2e pooled over arms: 78.40 / 77.18 / 77.60 / 76.80, so the rotation was
+worth having and no slot is worth more than about 1.6 us. SM clock 2457 to 2548, median 2480.
+Every cell n=1000.
+
+`base` over `opt` is 126.89 / 74.08 = **1.71x**, which is the speedup the alignment fix bought
+measured at a rep count that can carry it.
+
+**Unsaturated, 5377 us pacing.** Same 12 reps, same rotation.
+
+| arm | e2e p50 | interval | cuFFT p50 | residual |
+|---|---|---|---|---|
+| `base` | 128.88 | 126.34 .. 130.64 | 45.81 | 83.10 |
+| `opt` | 73.42 | 72.69 .. 76.05 | 66.14 | 7.26 |
+| `extbuf` | 106.82 | 102.22 .. 112.24 | 81.86 | 24.60 |
+| `daq` | **67.02** | 65.22 .. 68.78 | **62.06** | **4.96** |
+
+`opt` against DAQiri here is **+7.02** e2e, 12 of 12, against +6.96 in the saturated run. Two
+regimes an eighth of the link apart agree to 0.06 us, which is a stronger claim than either run
+makes alone. SM clock 2418 to 2431, median 2424.
+
+**What moves between the regimes.**
+
+| arm | saturated | unsaturated | shift |
+|---|---|---|---|
+| `base` | 126.89 | 128.88 | +1.99 |
+| `opt` | 74.08 | 73.42 | -0.66 |
+| `extbuf` | 83.54 | 106.82 | **+23.29** |
+| `daq` | 66.17 | 67.02 | +0.85 |
+
+7n's pacing cliff is now quantified at 4 MiB with the arm properly configured. The 56 MHz clock
+difference between the two regimes is 2.3 percent and accounts for at most about 1.6 us, so the
+23 us is offered rate and not thermals. **The RDMA arm's number is not a single number; it is a
+function of how hard you drive it, and any table quoting it has to say which regime it used.**
+No other arm has this property. It remains unexplained and stays the standing open question,
+now with a magnitude attached.
+
+**What this changes in earlier sections.**
+
+- 7n's corrected Table B 4 MiB row, `extbuf` 94.14 against DAQiri 68.98 for a delta of +25.17,
+  is superseded. Three reps, no stated pacing regime, and `--own-stream` off. The saturated
+  delta is +18.86 with an interval of 13.53 to 19.82.
+- 7q left `extbuf`'s 14 us at 4 MiB open with both named candidates ruled out. The number is
+  now 8.02 us of residual and 9.07 us of cuFFT against DAQiri in the saturated regime, and 7s
+  already located the cuFFT part in dead time between kernels rather than in the kernels.
+- 7r's noise-floor rule is what forced this run and is unchanged. Three reps establishes a
+  sign, twelve carries a magnitude.
+- 7w measured `--own-stream` at -0.77 us at 4 MiB, 3 of 8, so turning it on does not explain
+  any part of the difference between the old and new `extbuf` figures. It is here for arm
+  symmetry, not for the microseconds.
+
+**What it does not change.** DAQiri is faster than every gRPC arm at 4 MiB on every metric
+except one: `base`'s transform is 16.91 us **faster** than DAQiri's, because `base` reads
+device memory after paying a 77 us copy to get there. That inversion is real, it is 12 of 12,
+and it is the clearest single statement of what the alignment bug was actually doing.
 
 ## 8. A bug that made a failure look like a win (read this before adding kernels)
 

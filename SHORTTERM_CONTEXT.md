@@ -1,16 +1,73 @@
 # Short-Term Context — Active Sprint
 **Phase:** RDMA transport for gRPC-Direct: measuring the terms we had been leaving out
-**Branch:** `grpc-direct-optimization` @ `c046590`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
+**Branch:** `grpc-direct-optimization` @ `511e4fe`, pushed (cut from `main` @ 57ba6d3; `main` untouched)
 **Updated:** 2026-08-26
 
 > **This file is committed now.** It was gitignored while tracked documents pointed at it.
 
 **Naming.** `base` is gRPC baseline, `opt` is gRPC optimized (shared memory), `daq` is DAQiri,
-`extbuf` is gRPC over RDMA. Scripts and CSV columns keep the short forms. Prose does not.
+`extbuf` is gRPC over RDMA. Scripts and CSV columns keep the short forms. Prose does not. The
+deck uses gRPC-Direct (before), gRPC-Direct (optimized), gRPC-Direct over RDMA and DAQiri.
 
 ---
 
-## THE HEADLINE, 2026-08-26: we measured two missing terms, over-read one of them, and found an optimization already in the tree
+## THE HEADLINE, 2026-08-26 (late): the 4 MiB comparison was re-run properly, and it is what the deck draws
+
+Full writeup in `handoff.md` §7x, commit `511e4fe`. **This supersedes every three-rep four-arm
+number at 4 MiB in this project, including the corrected Table B in §7n.**
+
+Three separate things made the standing numbers unfit to present. §7r established that three
+reps at 4 MiB resolve a sign and not a magnitude, and the standing tables were three reps. §7n
+found the RDMA arm's transform triples between 100 and 400 µs of pacing while DAQiri's does not
+move, so any single pacing value silently picks a winner and no table said which one it picked.
+§7w found `--own-stream` defaulted off with no sweep ever passing it, so every RDMA figure was
+taken with one arm missing an optimization the shared-memory arm had.
+
+`scripts/deck_4arm_4mib.sh`. 4 MiB only, four arms, 12 reps, each arm rotated through all four
+positions inside the rep, 1000 messages after 500 warmup, clock gated at 2400 MHz and recorded
+per row, RDMA arm with `--own-stream`. Run twice, saturated at `PACE=25` and unsaturated at
+about an eighth of the link. The two regimes are never pooled.
+
+**Saturated.** Medians of 12, µs, with the 95 percent interval of the median:
+
+| arm | e2e | interval | cuFFT | residual |
+|---|---|---|---|---|
+| gRPC baseline | 126.89 | 126.27 .. 127.44 | 44.90 | 81.94 |
+| gRPC optimized | 74.08 | 73.22 .. 74.67 | 67.41 | 6.64 |
+| gRPC over RDMA | 83.54 | 80.74 .. 86.74 | 70.83 | 12.86 |
+| DAQiri | **66.17** | 64.13 .. 69.02 | **61.36** | **4.82** |
+
+Optimized against DAQiri, paired within rep: **+6.96 µs, 12 of 12, interval 5.31 to 9.41.**
+The alignment fix is worth **1.71x** (126.89 / 74.08). Position effect across the four slots is
+1.6 µs, SM clock 2457 to 2548.
+
+**The gap does not depend on how hard the arms are driven.** The unsaturated run gives +7.02 µs
+for the same comparison, against +6.96 saturated. Two regimes an eighth of the link apart agree
+to 0.06 µs, which is a stronger statement than either run makes alone.
+
+**One arm does depend on it, and only one.** Between the two regimes gRPC over RDMA moves
+**+23.29 µs** (83.54 to 106.82) while baseline moves +1.99, optimized -0.66 and DAQiri +0.85.
+The 56 MHz clock difference between regimes accounts for at most about 1.6 µs, so this is
+offered rate and not thermals. §7n's pacing cliff now has a magnitude at 4 MiB with the arm
+correctly configured. The mechanism is still open and this is the standing open question.
+
+**One inversion worth keeping.** The baseline arm's transform is **16.91 µs faster** than
+DAQiri's, 12 of 12, because it reads device memory after paying a 77 µs copy to get there. That
+is the clearest single statement of what the alignment bug was doing.
+
+**Both decks were rebuilt on this data.** Part 3 of the technical deck is six new slides, every
+figure regenerated from CSV at draw time by `scripts/make_part3_figs.py` rather than from
+hardcoded literals, plain-language arm names throughout, error bars on every 4 MiB chart. The
+5.775 GB/s "tie with DAQiri at the fabric limit" is retracted in all four places it appeared:
+the figure, the technical deck's RDMA slide and conclusions table, and the business deck's
+slide 5 headline. Both sides of that comparison measured the same fabric pinned at MTU 1024.
+
+**Next:** the shared-memory copy re-measured standalone, backpressure on that ring so counts
+match, DAQiri Spark-to-Spark, and a decision on `extbuf_fft_server.cu:315`.
+
+---
+
+## EARLIER THE SAME DAY, 2026-08-26: we measured two missing terms, over-read one of them, and found an optimization already in the tree
 
 Full writeup in `handoff.md` §7u, §7v and §7w. Three pieces, and the middle one is a retraction
 of a conclusion drawn from the first.
@@ -79,10 +136,8 @@ from a block. The saving splits across two columns as an artefact of event place
 is the honest headline and residual understates it.**
 
 **Open decision:** flip `extbuf_fft_server.cu:315` to default on with a `--no-own-stream`
-escape hatch? Evidence supports it. Not taken, because it changes a default.
-
-**Next:** the shared-memory copy re-measured standalone, backpressure on that ring so counts
-match, and DAQiri Spark-to-Spark. §7u item 11 and 12, §7k.
+escape hatch? Evidence supports it. Not taken, because it changes a default. §7x ran the RDMA
+arm with the flag on for arm symmetry, which does not settle the default.
 
 ---
 
