@@ -140,7 +140,7 @@ Set-Picture $s "$FIG\sc_p3_2_cause.png" 34 150 520 330
 Set-Body $s @(
  "The receiver checked whether each incoming buffer was aligned to 16 bytes, and copied it somewhere aligned when it was not.",
  "The library that packs the messages only ever gives 8-byte alignment, so the check failed on every single message.",
- "The FFT never needed 16. Removing the check removed the copy.",
+ "cuFFT accepts the 8-byte pointer anyway. The fix stops guessing and asks cuFFT directly whether it will take the buffer, so the copy only happens if it is ever really needed.",
  "It hid because the copy is asynchronous. The timer around it read 3.5 microseconds; the real 77 surfaced later, inside the wait for the FFT."
 ) 15
 

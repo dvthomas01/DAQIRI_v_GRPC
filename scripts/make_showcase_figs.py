@@ -95,7 +95,7 @@ def fig_linerate():
     """
     val = 5843.23 * MIB
     fig, ax = plt.subplots(figsize=(9.2, 5.4))
-    bars = ax.bar(["gRPC Direct over RDMA"], [val], width=0.30, color=NI_GREEN)
+    bars = ax.bar(["gRPC Direct over RDMA"], [val], width=0.52, color=NI_GREEN)
     ax.bar_label(bars, fmt="%.2f GB/s", padding=-34, fontsize=19,
                  fontweight="bold", color="white")
     ax.axhline(LINE_RATE_GBPS, color=CHARCOAL, ls="--", lw=1.8)
@@ -103,12 +103,15 @@ def fig_linerate():
                 (0.5, LINE_RATE_GBPS), xycoords=("axes fraction", "data"),
                 xytext=(0, 8), textcoords="offset points", ha="center",
                 fontsize=15, color=CHARCOAL)
+    # Percent label sized to sit fully inside the (now wider) bar so the white
+    # text does not spill onto the off-white slide and become unreadable.
     ax.annotate("%.1f%% of line rate" % (100.0 * val / LINE_RATE_GBPS),
-                (0, val), xytext=(0, -74), textcoords="offset points",
-                ha="center", fontsize=17, fontweight="bold", color="white")
+                (0, val), xytext=(0, -70), textcoords="offset points",
+                ha="center", fontsize=15, fontweight="bold", color="white")
     ax.set_ylabel("Sustained throughput, 4 MB buffers  (GB/s)")
     ax.set_ylim(0, LINE_RATE_GBPS * 1.22)
-    ax.set_xlim(-0.6, 0.6)
+    ax.set_xlim(-0.5, 0.5)
+    ax.set_xlabel("Cross-machine: instrument chassis \u2192 GPU host, over the 50G RDMA link")
     style_ax(ax)
     save(fig, "sc_linerate.png")
     print("  slide 5: %.3f GB/s, %.1f%% of line rate" %
@@ -185,6 +188,8 @@ def fig_cause():
                 arrowprops=dict(arrowstyle="<->", color=CHARCOAL, lw=2.2))
     ax.set_ylabel("Time for one 4 MB buffer to reach the GPU  (us)")
     ax.set_ylim(0, b * 1.2)
+    ax.set_xlabel("Same-machine test (local): gRPC Direct zero-copy, 4 MB payload",
+                  labelpad=10)
     style_ax(ax)
     save(fig, "sc_p3_2_cause.png")
     print("  cause: %.2f -> %.2f (%.2fx), DAQiri %.2f" % (b, o, b / o, d))
@@ -273,10 +278,10 @@ def fig_memory():
                     fontsize=16, fontweight="bold", color=CHARCOAL)
         ax.annotate("our pages are %s by %.1f us" %
                     ("slower" if d > 0 else "FASTER", abs(d)),
-                    (cx, max(vals) * 1.14), ha="center", fontsize=14,
+                    (cx, max(vals) * 1.30), ha="center", fontsize=14,
                     fontweight="bold", color=RED if d > 0 else NI_GREEN_D)
     ax.set_ylabel("FFT time  p50  (us)")
-    ax.set_ylim(0, max(vals) * 1.3)
+    ax.set_ylim(0, max(vals) * 1.52)
     style_ax(ax)
     fig.subplots_adjust(bottom=0.30)
     save(fig, "sc_p3_4_memory.png")
@@ -311,7 +316,7 @@ def fig_final():
                  color=CHARCOAL)
     ax.set_ylabel("Time for one 4 MB buffer to reach the GPU  (us)")
     ax.set_ylim(0, max(e) * 1.24)
-    ax.set_title("4 MB buffers, %d repetitions per bar" % len(by["base"]),
+    ax.set_title("Same-machine test \u2014 all four arms measured locally",
                  fontsize=15, color=SLATE, pad=14)
     style_ax(ax)
     save(fig, "sc_p3_6_final.png")
