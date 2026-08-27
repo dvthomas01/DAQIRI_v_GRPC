@@ -1,0 +1,97 @@
+%YAML 1.2
+---
+# No-root single-device RoCE RC loopback probe: server + client both on the one
+# already-assigned RoCE IP (192.168.20.1, dev rocep1s0f0, 50G). If DAQiri's
+# RDMA-CM accepts a same-device loopback QP here, Option B needs no root at all.
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "socket"
+    master_core: 8
+    debug: false
+    log_level: "info"
+
+    memory_regions:
+    - name: "DATA_RX_GPU_SERVER"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 64
+      buf_size: 1000000
+    - name: "DATA_TX_GPU_SERVER"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 64
+      buf_size: 1000000
+    - name: "DATA_TX_GPU_CLIENT"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 64
+      buf_size: 1000000
+    - name: "DATA_RX_GPU_CLIENT"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 64
+      buf_size: 1000000
+
+    interfaces:
+    - name: my_server
+      address: 192.168.20.1
+      socket_config:
+        mode: server
+        local_addr: "roce://192.168.20.1:4096"
+      roce_config:
+        transport_mode: RC
+      rx:
+        queues:
+        - name: "Server_RX_Queue"
+          id: 0
+          cpu_core: 19
+          batch_size: 1
+      tx:
+        queues:
+        - name: "Server_TX_Queue"
+          id: 0
+          cpu_core: 16
+          batch_size: 1
+    - name: my_client
+      address: 192.168.20.1
+      socket_config:
+        mode: client
+        local_addr: "roce://192.168.20.1"
+      roce_config:
+        transport_mode: RC
+      tx:
+        queues:
+        - name: "Client_TX_Queue"
+          id: 0
+          cpu_core: 17
+          batch_size: 1
+      rx:
+        queues:
+        - name: "Client_RX_Queue"
+          id: 0
+          cpu_core: 18
+          batch_size: 1
+
+rdma_bench_server:
+  cpu_core: 19
+  server_address: 192.168.20.1
+  server_port: 4096
+  message_size: 65536
+  rx_depth: 64
+  tx_depth: 64
+  send: true
+  receive: true
+  server: true
+
+rdma_bench_client:
+  cpu_core: 18
+  message_size: 65536
+  client_address: 192.168.20.1
+  server_address: 192.168.20.1
+  server_port: 4096
+  rx_depth: 64
+  tx_depth: 64
+  receive: true
+  send: true
+  server: false

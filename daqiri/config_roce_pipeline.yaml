@@ -1,0 +1,92 @@
+%YAML 1.2
+---
+# RoCE (RDMA RC) config for bench_daqiri_roce_pipeline — the TRUE zero-copy 4 MB
+# headline path. Single-process, single-device RC loopback on the one already-
+# assigned RoCE IP 192.168.20.1 (dev rocep1s0f0, 50G port enp1s0f0np0). Needs NO
+# root, NO netns: DAQiri's RDMA-CM connects a same-device loopback QP. RC
+# preserves message boundaries, so a whole payload (up to 4 MB) lands in one
+# page-aligned pinned buffer by scatter-gather DMA — cuFFT reads it in place with
+# zero copies and zero fragmentation.
+#
+#   RX thread = server  (rdma_get_server_conn_id, posts RECEIVEs, runs cuFFT)
+#   TX thread = client  (rdma_connect_to_server, posts SENDs of the signal)
+#
+# num_bufs must be >= the flow-control window (rx_depth/tx_depth, default 128 in
+# the benchmark) with headroom for in-flight processing. buf_size 4198400 covers
+# 1048576 samples x 4 B (4 MB) + header room. Pinned memory bound:
+# 256 * 4198400 * 4 MRs ~= 4.3 GB.
+daqiri:
+  cfg:
+    version: 1
+    stream_type: "socket"
+    master_core: 8
+    debug: false
+    log_level: "warn"
+
+    # Every MR is registered on ALL RDMA-device PDs, so total locked memory =
+    # sum(num_bufs) x buf_size x 4 devices. Keep this under `ulimit -l` (~15 GB).
+    # Only DATA_RX_GPU_SERVER (server receives) and DATA_TX_GPU_CLIENT (client
+    # sends) carry data in this single-direction pipeline; the other two exist
+    # only to satisfy config validation, so keep them tiny.
+    #   (192 + 8 + 192 + 8) x 4198400 x 4  ~= 6.7 GB registered.
+    memory_regions:
+    - name: "DATA_RX_GPU_SERVER"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 192
+      buf_size: 4198400
+    - name: "DATA_TX_GPU_SERVER"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 8
+      buf_size: 4198400
+    - name: "DATA_TX_GPU_CLIENT"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 192
+      buf_size: 4198400
+    - name: "DATA_RX_GPU_CLIENT"
+      kind: "host_pinned"
+      affinity: 0
+      num_bufs: 8
+      buf_size: 4198400
+
+    interfaces:
+    - name: my_server
+      address: 192.168.20.1
+      socket_config:
+        mode: server
+        local_addr: "roce://192.168.20.1:4096"
+      roce_config:
+        transport_mode: RC
+      rx:
+        queues:
+        - name: "Server_RX_Queue"
+          id: 0
+          cpu_core: 19
+          batch_size: 1
+      tx:
+        queues:
+        - name: "Server_TX_Queue"
+          id: 0
+          cpu_core: 16
+          batch_size: 1
+    - name: my_client
+      address: 192.168.20.1
+      socket_config:
+        mode: client
+        local_addr: "roce://192.168.20.1"
+      roce_config:
+        transport_mode: RC
+      tx:
+        queues:
+        - name: "Client_TX_Queue"
+          id: 0
+          cpu_core: 17
+          batch_size: 1
+      rx:
+        queues:
+        - name: "Client_RX_Queue"
+          id: 0
+          cpu_core: 18
+          batch_size: 1

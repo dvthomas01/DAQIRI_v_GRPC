@@ -36,13 +36,52 @@ RESULTS.md
 M9_REPORT.md
 ARCHITECTURE.md
 
-# PROGRESS.md, SHORTTERM_CONTEXT.md and LONGTERM_CONTEXT.md used to be listed
-# here. They were removed on 2026-08-20 because three tracked files pointed
-# readers at them (handoff.md, handoff_roce_2026-08-06.md, scripts/find_spark.sh
-# and presentation/HANDOFF.md), which made them handoff artifacts that nobody
-# outside this laptop could read. A document that is cited as authoritative and
-# is also unshareable is the worst of both. They are tracked now; once a file is
-# tracked, entries here no longer apply to it anyway.
+# Working notes and handoffs. These are written for me and for whoever picks the
+# project up, not for a reader of the repo. They quote lab host names, internal
+# addresses, dead ends and half-formed conclusions, and they go stale the moment
+# a run is repeated. Untracked on 2026-08-26. They are still in the history of
+# earlier commits; removing them from there is a separate job.
+PROGRESS.md
+SHORTTERM_CONTEXT.md
+LONGTERM_CONTEXT.md
+handoff.md
+handoff_roce_2026-08-06.md
+presentation/HANDOFF.md
+
+# Raw measurement data. Hundreds of per-run CSVs, large, and only meaningful
+# next to the notes that say how each was paced. The two exceptions below are
+# tracked on purpose: every chart in presentation/figs is generated from them,
+# so the figures have to be reproducible from a clone alone.
+data/*.csv
+data/nsight/*.csv
+!data/deck_4arm_4mib.csv
+!data/headline_runs.csv
+
+# Copies of NI and third-party source pulled onto this laptop off the Spark for
+# reference while working. Not ours to republish.
+data/*.h
+data/*.cc
+data/*.rs
+data/*.diff
+data/RDMA_TRANSPORT.md
+
+# Scratch capture from remote sessions: command output, host inventories,
+# build logs. Carries machine names and absolute paths. A few of these were
+# tracked before this rule existed and stay tracked; the rule is for new ones.
+data/*.out
+data/*.txt
+data/*.log
+
+# PROGRESS.md, SHORTTERM_CONTEXT.md and LONGTERM_CONTEXT.md were listed here,
+# then removed on 2026-08-20 because four tracked files pointed readers at them
+# (handoff.md, handoff_roce_2026-08-06.md, scripts/find_spark.sh and
+# presentation/HANDOFF.md), which made them handoff artifacts nobody outside
+# this laptop could read.
 #
-# The three above are genuinely local: finished reports on a finished phase,
-# cited only from PROGRESS.md, where the link is flagged as local-only.
+# On 2026-08-26 they went back to being untracked, along with the handoff files
+# that cited them. The 2026-08-20 argument only held while the handoffs were
+# public; now the whole set is local, so nothing tracked points at a file a
+# reader cannot open. scripts/find_spark.sh is the one loose end.
+#
+# Note that untracking does not remove them from earlier commits.
+

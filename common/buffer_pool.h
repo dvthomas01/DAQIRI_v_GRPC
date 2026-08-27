@@ -32,7 +32,7 @@ public:
                 for (int j = 0; j < i; ++j) cudaFree(slots_[j]);
                 throw std::runtime_error(
                     std::string("DeviceBufferPool: cudaMalloc failed: ")
-                    + cudaGetErrorString(err));
+                    + cudaGetErrorString(err)); 
             }
         }
     }

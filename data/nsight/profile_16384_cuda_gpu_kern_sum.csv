@@ -1,2 +1,0 @@
-Time (%),Total Time (ns),Instances,Avg (ns),Med (ns),Min (ns),Max (ns),StdDev (ns),Name
-100.0,2057280,350,5877.9,5824.0,5760,10144,357.5,"void vector_fft_symm_r2c<(unsigned int)16384, EPT<(unsigned int)32>, (unsigned int)1, (unsigned int)0, (padding_t)70, (twiddle_t)0, (loadstore_modifier_t)2, (layout_t)0, unsigned int, float>(kernel_arguments_t<T9>)"

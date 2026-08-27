@@ -16,14 +16,14 @@ daqiri:
     - name: "MEM_TX"
       kind: "host"
       affinity: 0
-      num_bufs: 4096
-      buf_size: 131136          # covers 32768 samples × 4 B
+      num_bufs: 1024
+      buf_size: 4198400        # covers 1048576 samples × 4 B (4 MB) + 4 KB header room
 
     - name: "MEM_RX"
       kind: "host"
       affinity: 0
-      num_bufs: 4096
-      buf_size: 131136
+      num_bufs: 1024
+      buf_size: 4198400        # covers 1048576 samples × 4 B (4 MB) + 4 KB header room
 
     interfaces:
     - name: "pipeline_server"
@@ -31,7 +31,7 @@ daqiri:
       socket_config:
         mode: server
         local_addr: "tcp://127.0.0.1:7778"
-        max_payload_size: 131136
+        max_payload_size: 4198400
       rx:
         queues:
         - name: "srv_rx_q"
@@ -55,7 +55,7 @@ daqiri:
         mode: client
         local_addr: "tcp://127.0.0.1:7779"
         remote_addr: "tcp://127.0.0.1:7778"
-        max_payload_size: 131136
+        max_payload_size: 4198400
       tx:
         queues:
         - name: "cli_tx_q"

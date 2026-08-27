@@ -1,4 +1,0 @@
-arm,size,rep,e2e_p50,fft_p50,lookup_p50,realign_p50,fftcall_p50,n,sm_mhz,pace_us,gitsha
-extbuf,1048576,1,87.361,74.400,NA,NA,NA,1000,2548,25,fixmsgs
-extbuf,1048576,2,77.953,64.992,NA,NA,NA,1000,2548,25,fixmsgs
-extbuf,1048576,3,76.144,65.056,NA,NA,NA,1000,2548,25,fixmsgs

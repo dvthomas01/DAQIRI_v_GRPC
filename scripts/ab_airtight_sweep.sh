@@ -69,12 +69,12 @@ run_grpc () {  # $1 BS  $2 MODE  $3 CSV
         rm -f /dev/shm/iox2_* 2>/dev/null || true
         rm -f "$CSV"
         sleep 1
-        timeout 60 "$GRPC_SERVER" --port "$PORT" --bufsize "$BS" --n-buffers "$N" \
+        timeout 120 "$GRPC_SERVER" --port "$PORT" --bufsize "$BS" --n-buffers "$N" \
             --warmup "$W" --out "$CSV" --transport shmem --one-shot $ZC \
             >/dev/null 2>&1 &
         local SPID=$!
         sleep 4
-        timeout 50 taskset -c ${CPU_FEED} \
+        timeout 100 taskset -c ${CPU_FEED} \
             "$GRPC_CLIENT" --server "localhost:$PORT" --transport shmem \
             --bufsize "$BS" --n-buffers "$N" --warmup "$W" --pace-us "$PACE" \
             >/dev/null 2>&1
@@ -86,7 +86,10 @@ run_grpc () {  # $1 BS  $2 MODE  $3 CSV
 }
 
 echo "=== AIRTIGHT A/B sweep  matched-pair  pace=${PACE}us  trials=${TRIALS}  N=${N} W=${W} ==="
-for BS in 4096 8192 16384 32768; do
+# Buffer sizes in float32 samples: 16 KB (4096) up to 4 MB (1048576).
+# Range chosen to cover the packet sizes expected from live hardware and to
+# probe where (if anywhere) each transport falls off past the old 128 KB stop.
+for BS in 4096 8192 16384 32768 65536 131072 262144 524288 1048576; do
     for MODE in copy zerocopy; do
         for TRIAL in $(seq 1 "$TRIALS"); do
             DCSV="data/ab_daqiri_${MODE}_${BS}_${TRIAL}.csv"
