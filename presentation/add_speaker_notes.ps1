@@ -103,20 +103,27 @@ $notes["inverted when I removed"] = @(
 )
 
 $notes["the card writes into memory"] = @(
- "[70 sec]",
+ "[95 sec]",
  "This is what I built.",
  "On this chip, GPUDirect, where the card writes straight into GPU memory, isn't available. So the supported route is one host buffer registered twice: once with the network card, once with CUDA. Same bytes, two owners.",
- "The card writes into it directly. cuFFT reads it where it landed. Nothing is staged anywhere.",
- "The part that matters commercially is the first box. The instrument chassis has no NVIDIA GPU in it. DAQiri needs CUDA at both ends, so DAQiri cannot make this trip at all. This path can, at 98 percent of line rate."
+ "The card writes into it directly. cuFFT reads it where it landed. Nothing is staged anywhere. On a machine without GPUDirect that is the shortest path there is. There is no version of this that copies less.",
+ "On the next slide this path measures about 9 microseconds behind the local shared memory one, and I would rather be the one who says why that is still the result I would keep.",
+ "It is the only one of the four that can cross a machine boundary. The other three need the sender and the receiver in the same box. Shared memory has no answer to 'the instrument is over there.'",
+ "And DAQiri needs CUDA at both ends. The instrument chassis has no NVIDIA GPU in it. So on the topology we actually ship, the comparison is not 83 against 66. It is 83 against not possible.",
+ "It reaches 98 percent of line rate, so the ceiling is the hardware's and not ours. Put a faster link under it and the same code follows the link up.",
+ "For scale: moving 4 megabytes across 50 gigabit takes about 670 microseconds on the wire. Nine microseconds of receive-side work is under 2 percent of that. On a real hop it is not the thing you would notice.",
+ "And it is built from ordinary supported pieces: RoCE, a standard memory registration, and cudaHostRegister. Nothing here depends on a driver trick, so somebody can maintain it after I leave."
 )
 
 $notes["Where it ended"] = @(
- "[80 sec]",
- "Four transports, 4 megabyte buffers, twelve repetitions each, and every transport ran in all four positions so nobody got the good slot.",
- "The whiskers are what the measurement can actually resolve. That matters, because the noise floor here is about 4 microseconds, which is why three repetitions would have told me nothing.",
- "gRPC Direct is 1.71 times faster than it started and sits about 7 microseconds behind DAQiri. It lost all twelve. I ran the whole test again at an eighth of the data rate and got 7 again, so that answer doesn't depend on how hard I drive it.",
- "One thing I can't explain yet: the RDMA arm moves 23 microseconds between those two rates and nothing else moves 2. That's the open question I'm handing over.",
- "And read the footnote out loud. All four run on one machine, so this is the software cost with the wire taken out."
+ "[95 sec]",
+ "Two charts. Left is one payload size with the full treatment. Right is all nine sizes, and only the two arms that take the same route into the GPU, because those are the pair where a difference tells you something.",
+ "Left first. Four transports, 4 megabyte buffers, twelve repetitions each, and every transport ran in all four positions so nobody got the good slot. The whiskers are what the measurement can actually resolve, which matters, because the noise floor here is about 4 microseconds. Three repetitions would have told me nothing.",
+ "gRPC Direct is 1.71 times faster than it started and sits about 7 microseconds behind DAQiri. It lost all twelve. I ran the whole test again at an eighth of the data rate and got 7 again, so that answer does not depend on how hard I drive it.",
+ "Now the right chart, and this is here because one payload size is a fair thing to object to. 4 megabytes could be the one width where those two happen to land like that. They do not. Across a 256-fold range the two track each other, from about 1 microsecond apart at 16 kilobytes to 8 apart at 4 megabytes. In percentage terms gRPC Direct stays within 5 to 16 percent of DAQiri the whole way.",
+ "If somebody asks why the RDMA bar is higher than the shared memory bar: it is the only arm that can leave the machine, and it is the only arm the instrument chassis can run, because that chassis has no NVIDIA GPU in it. Slower than a route you cannot take is still the fastest route available.",
+ "One thing I cannot explain yet: the RDMA arm moves 23 microseconds between those two data rates and nothing else moves 2. That is the open question I am handing over.",
+ "And read the footnote out loud. All four run on one machine, so this is software cost with the wire taken out."
 )
 
 $notes["Summary"] = @(

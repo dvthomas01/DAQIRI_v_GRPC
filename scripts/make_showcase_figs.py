@@ -63,6 +63,11 @@ FLAT = {k: v.replace("\n", " ") for k, v in NAME.items()}
 MIB = 1048576.0 / 1e9   # MiB/s -> GB/s
 LINE_RATE_GBPS = 6.25   # 50 Gb/s
 
+# Slide 13 carries two charts side by side. They only read as a pair if they
+# are drawn at the same size, so both use these and the slide places them in
+# equal boxes.
+PAIR_W, PAIR_H = 8.4, 5.6
+
 
 def style_ax(ax):
     ax.grid(axis="y", color="#D8DCE0", lw=0.8)
@@ -308,20 +313,74 @@ def fig_final():
     lo = [m - c[0] for m, c in zip(e, ci)]
     hi = [c[1] - m for m, c in zip(e, ci)]
     colors = [SLATE, AMBER, AMBER_D, NI_GREEN]
-    fig, ax = plt.subplots(figsize=(9.5, 5.6))
+    fig, ax = plt.subplots(figsize=(PAIR_W, PAIR_H))
     bars = ax.bar([NAME[a] for a in order], e, 0.55, color=colors,
                   yerr=[lo, hi], capsize=7,
                   error_kw=dict(ecolor=CHARCOAL, lw=1.7))
-    ax.bar_label(bars, fmt="%.1f", padding=14, fontsize=17, fontweight="bold",
+    ax.bar_label(bars, fmt="%.1f", padding=14, fontsize=16, fontweight="bold",
                  color=CHARCOAL)
     ax.set_ylabel("Time for one 4 MB buffer to reach the GPU  (us)")
     ax.set_ylim(0, max(e) * 1.24)
-    ax.set_title("Same-machine test \u2014 all four arms measured locally",
-                 fontsize=15, color=SLATE, pad=14)
+    ax.set_title("At 4 MB, all four arms", fontsize=17, color=CHARCOAL,
+                 fontweight="bold", pad=14)
     style_ax(ax)
     save(fig, "sc_p3_6_final.png")
     print("  final: " + ", ".join("%s=%.2f" % (FLAT[a], v)
                                   for a, v in zip(order, e)))
+
+
+# ---------------------------------------------------------------------------
+# Part 3, slide 6, right-hand chart: the two closest arms, across payload size
+# ---------------------------------------------------------------------------
+def fig_sweep():
+    """
+    The bar chart next to this one is one payload size. That invites a fair
+    objection: 4 MB could be the one size where the two happen to land where
+    they do. This answers it by walking the whole range.
+
+    Only the two shared-memory arms are drawn. They are the pair that is
+    genuinely like for like, since both take the same route into the GPU, so a
+    difference between them is a difference in the receive path and nothing
+    else. The RDMA arm belongs to a different comparison and is not on here.
+
+    Source is headline_runs.csv, the interleaved 54-run sweep, not the payload
+    sweep in data/payload_runs_paced25.csv, which is documented as not loggable
+    and must not be quoted.
+    """
+    by = defaultdict(lambda: defaultdict(list))
+    for r in rows("headline_runs.csv"):
+        by[r["arm"]][int(r["kb"])].append(float(r["e2e_p50"]))
+    kbs = sorted(by["opt"])
+    fig, ax = plt.subplots(figsize=(PAIR_W, PAIR_H))
+    for arm, color, marker in (("opt", AMBER, "o"), ("daq", NI_GREEN, "s")):
+        y = [median(by[arm][k]) for k in kbs]
+        ax.plot(kbs, y, marker=marker, ms=8, lw=2.6, color=color,
+                label=FLAT[arm], zorder=3)
+        for k in kbs:
+            ax.plot([k] * len(by[arm][k]), by[arm][k], marker=".", ls="none",
+                    ms=6, color=color, alpha=0.45, zorder=2)
+    o = [median(by["opt"][k]) for k in kbs]
+    d = [median(by["daq"][k]) for k in kbs]
+    gaps = [a - b for a, b in zip(o, d)]
+    ax.annotate("gap %.1f us" % gaps[-1], (kbs[-1], (o[-1] + d[-1]) / 2),
+                textcoords="offset points", xytext=(-12, 0), ha="right",
+                va="center", fontsize=15, fontweight="bold", color=CHARCOAL)
+    ax.annotate("gap %.1f us" % gaps[0], (kbs[0], d[0]),
+                textcoords="offset points", xytext=(8, -6), ha="left",
+                va="top", fontsize=15, fontweight="bold", color=CHARCOAL)
+    ax.set_xscale("log", base=2)
+    ax.set_xticks(kbs)
+    ax.set_xticklabels([str(k) for k in kbs], fontsize=12)
+    ax.set_xlabel("Payload per buffer  (KB)")
+    ax.set_ylabel("Time for one buffer to reach the GPU  (us)")
+    ax.set_ylim(0, max(o) * 1.30)
+    ax.set_title("Across payload size, the two closest arms", fontsize=17,
+                 color=CHARCOAL, fontweight="bold", pad=14)
+    ax.legend(frameon=False, loc="upper left")
+    style_ax(ax)
+    save(fig, "sc_p3_6_sweep.png")
+    print("  sweep: gap %.2f us at %d KB rising to %.2f us at %d KB"
+          % (gaps[0], kbs[0], gaps[-1], kbs[-1]))
 
 
 def main():
@@ -332,6 +391,7 @@ def main():
     fig_remainder()
     fig_memory()
     fig_final()
+    fig_sweep()
     print("Showcase figures written to: %s" % OUT)
 
 
