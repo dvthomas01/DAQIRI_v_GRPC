@@ -66,11 +66,13 @@ foreach ($s in $deck.Slides) {
 if (-not $target) { throw "no slide with a 'Where it ended' headline" }
 "slide {0}: {1}" -f $target.SlideIndex, $target.Shapes.Item("TextBox 3").TextFrame.TextRange.Text
 
-# Clear whatever pictures are on it now, plus the right-hand body text, whose
-# column the second chart is taking over. Its content moves to the notes page.
+# Clear only the shapes this script owns. It deliberately does not sweep every
+# picture off the slide: if something else gets added here later, deleting it
+# because it happens to be a picture is not this script's business.
+$mine = @("ChartFinal", "ChartSweep", "Picture 8", "TextBox 7")
 $doomed = @()
 foreach ($sh in $target.Shapes) {
-  if ($sh.Type -eq 13 -or $sh.Name -eq "TextBox 7") { $doomed += $sh }
+  if ($mine -contains $sh.Name) { $doomed += $sh }
 }
 foreach ($sh in $doomed) { "  removed: " + $sh.Name; $sh.Delete() }
 

@@ -23,6 +23,14 @@ tmp_*
 /tmp/
 *.log
 
+# PowerPoint. The lock files are Office's; the backups are add_speaker_notes.ps1
+# dumping the notes pages as they stood before a run, so a script can never take
+# hand-written notes away without leaving a copy on disk.
+~$*.pptx
+presentation/notes_backup/
+presentation/Intern_showcase_Dami_backup_*.pptx
+data/_recover/
+
 # Personal / local-only docs (not for the shared repo)
 RESULTS.md
 M9_REPORT.md
