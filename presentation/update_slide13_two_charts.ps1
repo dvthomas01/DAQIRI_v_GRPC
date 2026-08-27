@@ -86,7 +86,7 @@ if (-not $note) {
 $note.Left = 34; $note.Top = 456; $note.Width = 890; $note.Height = 66
 $note.TextFrame.WordWrap = -1
 $note.TextFrame.TextRange.Text = @"
-Left: 12 repetitions per bar, whiskers are a 95% confidence interval on the median. Right: a separate nine-size run, 2 repetitions each, so its 4 MB values sit a few microseconds below the bars. Read it for shape.
+Left: 12 repetitions per bar, whiskers are a 95% confidence interval on the median. Right: a separate nine-size run, 2 repetitions each, which is why its 4 MB points read 70.4 and 62.3 rather than 74.1 and 66.2. Read it for shape.
 All four arms run on one machine, so these are receive-side software costs. Time on the wire is not in these numbers.
 Open item: across a 200-fold change in data rate the RDMA arm moves 23 microseconds and nothing else moves 2.
 "@ -replace "`r`n", "`r"
