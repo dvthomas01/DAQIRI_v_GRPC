@@ -116,11 +116,13 @@ $notes["the card writes into memory"] = @(
 )
 
 $notes["Where it ended"] = @(
- "[95 sec]",
+ "[100 sec]",
  "Two charts. Left is one payload size with the full treatment. Right is all nine sizes, and only the two arms that take the same route into the GPU, because those are the pair where a difference tells you something.",
  "Left first. Four transports, 4 megabyte buffers, twelve repetitions each, and every transport ran in all four positions so nobody got the good slot. The whiskers are what the measurement can actually resolve, which matters, because the noise floor here is about 4 microseconds. Three repetitions would have told me nothing.",
  "gRPC Direct is 1.71 times faster than it started and sits about 7 microseconds behind DAQiri. It lost all twelve. I ran the whole test again at an eighth of the data rate and got 7 again, so that answer does not depend on how hard I drive it.",
- "Now the right chart, and this is here because one payload size is a fair thing to object to. 4 megabytes could be the one width where those two happen to land like that. They do not. Across a 256-fold range the two track each other, from about 1 microsecond apart at 16 kilobytes to 8 apart at 4 megabytes. In percentage terms gRPC Direct stays within 5 to 16 percent of DAQiri the whole way.",
+ "Now the right chart, and this is here because one payload size is a fair thing to object to. 4 megabytes could be the one width where those two happen to land like that. They do not. Across a 256-fold range gRPC Direct stays between 5 and 16 percent behind DAQiri, with no size where it falls off.",
+ "Do not read across the two charts. They are separate runs. The right one has 2 repetitions per point where the left has 12, and its 4 MB values land a few microseconds lower. It is on the slide for its shape, not its decimals.",
+ "If somebody subtracts the two bar labels and gets 7.9 while the headline says 7: the headline is the paired difference. All four arms run inside the same repetition, so I take opt minus DAQiri within each repetition and then the median of those twelve differences, which is 6.96. Subtracting two independent medians gives 7.91. The paired one is the right statistic for this design and it is the smaller of the two, so I am not flattering myself with it.",
  "If somebody asks why the RDMA bar is higher than the shared memory bar: it is the only arm that can leave the machine, and it is the only arm the instrument chassis can run, because that chassis has no NVIDIA GPU in it. Slower than a route you cannot take is still the fastest route available.",
  "One thing I cannot explain yet: the RDMA arm moves 23 microseconds between those two data rates and nothing else moves 2. That is the open question I am handing over.",
  "And read the footnote out loud. All four run on one machine, so this is software cost with the wire taken out."

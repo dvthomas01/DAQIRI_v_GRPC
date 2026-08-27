@@ -361,11 +361,20 @@ def fig_sweep():
                     ms=6, color=color, alpha=0.45, zorder=2)
     o = [median(by["opt"][k]) for k in kbs]
     d = [median(by["daq"][k]) for k in kbs]
-    gaps = [a - b for a, b in zip(o, d)]
-    ax.annotate("gap %.1f us" % gaps[-1], (kbs[-1], (o[-1] + d[-1]) / 2),
+    # Labelled as a percentage, not in microseconds, and the reason is worth
+    # writing down. This chart shares a slide with the 4 MiB bar chart, which is
+    # a different run. Subtracting that chart's two bar labels gives 7.9 us;
+    # subtracting this chart's 4 MB points gives 8.1; and the slide headline
+    # says 7, which is the paired median difference. Three numbers within one
+    # microsecond of each other, from three correct calculations, is a slide
+    # that gets argued with. So the only microsecond gap on the slide is the one
+    # on the left, and this chart makes its point in percent instead, which is
+    # the right unit for a claim about shape across a 256-fold range anyway.
+    pct = [100.0 * (a - b) / b for a, b in zip(o, d)]
+    ax.annotate("%.0f%% behind" % pct[-1], (kbs[-1], (o[-1] + d[-1]) / 2),
                 textcoords="offset points", xytext=(-12, 0), ha="right",
                 va="center", fontsize=15, fontweight="bold", color=CHARCOAL)
-    ax.annotate("gap %.1f us" % gaps[0], (kbs[0], d[0]),
+    ax.annotate("%.0f%% behind" % pct[0], (kbs[0], d[0]),
                 textcoords="offset points", xytext=(8, -6), ha="left",
                 va="top", fontsize=15, fontweight="bold", color=CHARCOAL)
     ax.set_xscale("log", base=2)
@@ -379,8 +388,9 @@ def fig_sweep():
     ax.legend(frameon=False, loc="upper left")
     style_ax(ax)
     save(fig, "sc_p3_6_sweep.png")
-    print("  sweep: gap %.2f us at %d KB rising to %.2f us at %d KB"
-          % (gaps[0], kbs[0], gaps[-1], kbs[-1]))
+    print("  sweep: %.0f%% behind at %d KB, %.0f%% behind at %d KB "
+          "(%.2f and %.2f us)"
+          % (pct[0], kbs[0], pct[-1], kbs[-1], o[0] - d[0], o[-1] - d[-1]))
 
 
 def main():
